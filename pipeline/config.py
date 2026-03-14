@@ -69,6 +69,12 @@ class Config:
         if not self.hook_point:
             self.hook_point = f"blocks.{self.target_layer}.hook_resid_post"
         self.output_dir = Path(self.output_dir)
+        # Fallback to CPU if CUDA not available
+        if self.device == "cuda":
+            import torch
+            if not torch.cuda.is_available():
+                print("WARNING: CUDA not available, falling back to CPU")
+                self.device = "cpu"
 
     @property
     def catalog_path(self) -> Path:

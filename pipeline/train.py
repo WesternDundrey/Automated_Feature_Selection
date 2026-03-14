@@ -136,10 +136,13 @@ def train_supervised_sae(
     x_flat = activations.reshape(-1, d_model)
     y_flat = labels.reshape(-1, n_supervised)
 
-    # Train/test split
-    split_idx = int(cfg.train_fraction * x_flat.shape[0])
-    x_train, x_test = x_flat[:split_idx], x_flat[split_idx:]
-    y_train, y_test = y_flat[:split_idx], y_flat[split_idx:]
+    # Train/test split (shuffled to avoid distribution shift from document order)
+    n_total = x_flat.shape[0]
+    perm = torch.randperm(n_total)
+    split_idx = int(cfg.train_fraction * n_total)
+    train_idx, test_idx = perm[:split_idx], perm[split_idx:]
+    x_train, x_test = x_flat[train_idx], x_flat[test_idx]
+    y_train, y_test = y_flat[train_idx], y_flat[test_idx]
 
     print(f"Training data: {x_train.shape[0]:,} vectors, "
           f"Test data: {x_test.shape[0]:,} vectors")
@@ -237,9 +240,35 @@ def train_supervised_sae(
               f"sparse={epoch_sparse/n:.5f}  hier={epoch_hier/n:.5f}  R2={r2:.3f}  "
               f"lr={current_lr:.2e}")
 
+        # Validation on held-out data
+        sae.eval()
+        val_recon = 0.0
+        val_sup = 0.0
+        val_batches = 0
+        with torch.no_grad():
+            for i in range(0, x_test.shape[0], cfg.batch_size):
+                xv = x_test[i : i + cfg.batch_size].to(cfg.device)
+                yv = y_test[i : i + cfg.batch_size].to(cfg.device)
+                recon_v, sup_pre_v, _, _ = sae(xv)
+                val_recon += F.mse_loss(recon_v, xv).item()
+                val_sup += F.binary_cross_entropy_with_logits(
+                    sup_pre_v, yv, pos_weight=pos_weight
+                ).item()
+                val_batches += 1
+        sae.train()
+        val_r2 = 1.0 - (val_recon / val_batches) / baseline_mse
+        print(f"           val_recon={val_recon/val_batches:.5f}  "
+              f"val_sup={val_sup/val_batches:.5f}  val_R2={val_r2:.3f}")
+
         if epoch == 1 and r2 < 0.5:
             print("  WARNING: R^2 < 0.5 after epoch 1. "
                   "Consider reducing lambda_sup or increasing warmup_steps.")
+
+        # Mid-training checkpoint every 5 epochs
+        if epoch % 5 == 0 and epoch < cfg.epochs:
+            ckpt_path = cfg.output_dir / f"supervised_sae_epoch{epoch}.pt"
+            torch.save(sae.state_dict(), ckpt_path)
+            print(f"  Checkpoint saved: {ckpt_path}")
 
     # Save
     sae_cpu = sae.cpu()

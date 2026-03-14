@@ -15,6 +15,7 @@ Usage:
 
 import asyncio
 import json
+import logging
 import re
 import time
 from pathlib import Path
@@ -22,6 +23,8 @@ from pathlib import Path
 import anthropic
 import torch
 from tqdm.auto import tqdm
+
+logger = logging.getLogger(__name__)
 
 from .config import Config
 
@@ -37,15 +40,18 @@ def prepare_corpus(model, cfg: Config) -> torch.Tensor:
     dataset = load_dataset(cfg.corpus_dataset, split=cfg.corpus_split, streaming=True)
 
     sequences = []
-    for example in tqdm(dataset, desc="Tokenizing", total=cfg.n_sequences):
+    pbar = tqdm(total=cfg.n_sequences, desc="Tokenizing")
+    for example in dataset:
         text = example.get("text", "")
         if len(text.strip()) < 80:
             continue
         ids = tokenizer.encode(text)
         if len(ids) >= cfg.seq_len:
             sequences.append(ids[: cfg.seq_len])
+            pbar.update(1)
         if len(sequences) >= cfg.n_sequences:
             break
+    pbar.close()
 
     tokens = torch.tensor(sequences, dtype=torch.long)
     print(f"  Corpus: {tokens.shape[0]} sequences x {tokens.shape[1]} tokens")
@@ -106,16 +112,29 @@ def build_annotation_prompt(
 
 
 def _extract_json_object(text: str) -> dict | None:
-    """Extract the first JSON object from text, handling nested braces."""
-    # Find the first '{' and match braces
+    """Extract the first JSON object from text, handling nested braces and strings."""
     start = text.find("{")
     if start == -1:
         return None
     depth = 0
+    in_string = False
+    escape = False
     for i in range(start, len(text)):
-        if text[i] == "{":
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
             depth += 1
-        elif text[i] == "}":
+        elif c == "}":
             depth -= 1
             if depth == 0:
                 try:
@@ -149,9 +168,11 @@ async def annotate_sequence_async(
             last_err = None
             for attempt in range(cfg.annotation_max_retries):
                 try:
+                    # Scale max_tokens with feature count: ~30 tokens per feature
+                    max_toks = max(500, len(chunk) * 30)
                     response = await client.messages.create(
                         model=cfg.annotation_model,
-                        max_tokens=500,
+                        max_tokens=max_toks,
                         messages=[{"role": "user", "content": prompt}],
                     )
                     text = response.content[0].text.strip()
@@ -169,7 +190,13 @@ async def annotate_sequence_async(
                     if attempt < cfg.annotation_max_retries - 1:
                         delay = cfg.annotation_retry_base_delay * (2 ** attempt)
                         await asyncio.sleep(delay)
-            # All retries exhausted → labels stay zero (safe default)
+            else:
+                # All retries exhausted → labels stay zero (safe default)
+                logger.warning(
+                    "Annotation failed for seq %d, chunk %d-%d after %d retries: %s",
+                    seq_idx, chunk_start, chunk_start + len(chunk),
+                    cfg.annotation_max_retries, last_err,
+                )
 
     return seq_idx, labels
 
@@ -204,8 +231,9 @@ async def annotate_corpus_async(
     t0 = time.time()
     completed = 0
 
-    # Process in waves to show progress
+    # Process in waves, saving partial results after each wave
     wave_size = 100
+    partial_path = cfg.output_dir / "annotations_partial.pt"
     for wave_start in range(0, N, wave_size):
         wave_end = min(wave_start + wave_size, N)
         tasks = [
@@ -227,8 +255,14 @@ async def annotate_corpus_async(
         print(f"  {completed}/{N} sequences  "
               f"({rate:.1f} seq/s, ETA {eta:.0f}s, {total_pos} positives)")
 
+        # Save partial results after each wave (crash recovery)
+        torch.save(all_labels, partial_path)
+
     elapsed = time.time() - t0
     total_pos = int(all_labels.sum().item())
+    # Remove partial checkpoint on success
+    if partial_path.exists():
+        partial_path.unlink()
     print(f"\nAnnotation complete in {elapsed:.1f}s")
     print(f"  Total positives: {total_pos}")
 
@@ -259,20 +293,39 @@ def annotate_corpus(
 # ── Propagate group labels ──────────────────────────────────────────────────
 
 def propagate_group_labels(annotations: torch.Tensor, features: list[dict]) -> torch.Tensor:
-    """Set group feature labels = OR of children's labels."""
+    """Set group feature labels = OR of children's labels.
+
+    Processes groups bottom-up (leaf-ward groups first) so nested hierarchies
+    propagate correctly: sub-group labels are computed before parent groups.
+    """
     feat_id_to_idx = {f["id"]: i for i, f in enumerate(features)}
 
-    for idx, feat in enumerate(features):
-        if feat["type"] == "group":
-            child_idxs = [
-                feat_id_to_idx[f["id"]]
-                for f in features
-                if f.get("parent") == feat["id"]
-            ]
-            if child_idxs:
-                annotations[:, :, idx] = (
-                    annotations[:, :, child_idxs].max(dim=-1).values
-                )
+    # Build parent→children map
+    children_of: dict[int, list[int]] = {}
+    for f in features:
+        if f.get("parent") and f["parent"] in feat_id_to_idx:
+            parent_idx = feat_id_to_idx[f["parent"]]
+            children_of.setdefault(parent_idx, []).append(feat_id_to_idx[f["id"]])
+
+    # Topological sort: compute depth of each group (max distance to a leaf)
+    group_idxs = [i for i, f in enumerate(features) if f["type"] == "group"]
+
+    def depth(idx: int) -> int:
+        kids = children_of.get(idx, [])
+        group_kids = [k for k in kids if features[k]["type"] == "group"]
+        if not group_kids:
+            return 0
+        return 1 + max(depth(k) for k in group_kids)
+
+    # Process shallowest (closest to leaves) first
+    group_idxs.sort(key=depth)
+
+    for idx in group_idxs:
+        child_idxs = children_of.get(idx, [])
+        if child_idxs:
+            annotations[:, :, idx] = (
+                annotations[:, :, child_idxs].max(dim=-1).values
+            )
 
     return annotations
 

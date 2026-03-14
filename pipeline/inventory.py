@@ -26,6 +26,39 @@ from tqdm.auto import tqdm
 from .config import Config
 
 
+def _extract_json_object(text: str) -> dict | None:
+    """Extract the first JSON object from text, handling nested braces and strings."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
 # ── Pretrained SAE wrapper ──────────────────────────────────────────────────
 
 class PretrainedSAE:
@@ -250,27 +283,37 @@ def collect_top_activations(
         sel_acts = acts[:, :, sel_tensor].float().cpu()  # (batch, seq, n_selected)
         ids_cpu = input_ids.cpu()
 
+        # Vectorized top-k extraction: for each latent, find the top-k
+        # activations in this batch in one pass instead of triple-nested loop
+        ids_list = ids_cpu.tolist()
         for si, lat_idx in enumerate(selected_latents):
             lat_acts = sel_acts[:, :, si]  # (batch, seq)
-            # Find top activation in this batch for this latent
-            for b in range(lat_acts.shape[0]):
-                for t in range(lat_acts.shape[1]):
-                    val = lat_acts[b, t].item()
-                    if val <= 0:
-                        continue
-                    # Context window: 10 tokens before, target, 10 after
-                    seq_ids = ids_cpu[b].tolist()
-                    start = max(0, t - 10)
-                    end = min(len(seq_ids), t + 11)
-                    context = seq_ids[start:end]
-                    pos_in_context = t - start
+            # Find all positive activations
+            positive_mask = lat_acts > 0
+            if not positive_mask.any():
+                continue
 
-                    heap = heaps[lat_idx]
-                    entry = (val, context, pos_in_context)
-                    if len(heap) < cfg.top_k_examples:
-                        heapq.heappush(heap, entry)
-                    elif val > heap[0][0]:
-                        heapq.heapreplace(heap, entry)
+            heap = heaps[lat_idx]
+            threshold = heap[0][0] if len(heap) >= cfg.top_k_examples else -1.0
+
+            # Only process positions above current heap threshold
+            candidates = (lat_acts > threshold).nonzero(as_tuple=False)
+            for pos in candidates:
+                b, t = pos[0].item(), pos[1].item()
+                val = lat_acts[b, t].item()
+                seq_ids = ids_list[b]
+                start = max(0, t - 10)
+                end = min(len(seq_ids), t + 11)
+                context = seq_ids[start:end]
+                pos_in_context = t - start
+
+                entry = (val, context, pos_in_context)
+                if len(heap) < cfg.top_k_examples:
+                    heapq.heappush(heap, entry)
+                    threshold = heap[0][0] if len(heap) >= cfg.top_k_examples else -1.0
+                elif val > heap[0][0]:
+                    heapq.heapreplace(heap, entry)
+                    threshold = heap[0][0]
 
         n_tokens += input_ids.numel()
         batch_texts = []
@@ -447,21 +490,34 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
     print(f"Organizing {len(descriptions)} descriptions into hierarchy "
           f"with {cfg.organization_model}...")
 
-    response = client.messages.create(
-        model=cfg.organization_model,
-        max_tokens=8000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = response.content[0].text
+    catalog = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            response = client.messages.create(
+                model=cfg.organization_model,
+                max_tokens=8000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = response.content[0].text
 
-    m = re.search(r"\{[\s\S]+\}", text)
-    if not m:
+            catalog = _extract_json_object(text)
+            if catalog is not None:
+                break
+            last_err = ValueError(
+                "Could not parse JSON from organization response. "
+                f"Response begins: {text[:300]}"
+            )
+        except Exception as e:
+            last_err = e
+        if attempt < 2:
+            print(f"  Attempt {attempt + 1} failed, retrying...")
+            time.sleep(2 ** attempt)
+
+    if catalog is None:
         raise ValueError(
-            "Could not parse JSON from organization response. "
-            f"Response begins: {text[:300]}"
+            f"Organization failed after 3 attempts. Last error: {last_err}"
         )
-
-    catalog = json.loads(m.group())
 
     n_groups = sum(1 for f in catalog["features"] if f["type"] == "group")
     n_leaves = sum(1 for f in catalog["features"] if f["type"] == "leaf")

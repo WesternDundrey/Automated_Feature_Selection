@@ -35,9 +35,9 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- Load model ---
-    cfg = torch.load(CKPT_DIR / "config.pt", map_location="cpu")
+    cfg = torch.load(CKPT_DIR / "config.pt", map_location="cpu", weights_only=True)
     model = SupervisedSAE(cfg["d_model"], cfg["n_supervised"], cfg["n_unsupervised"])
-    model.load_state_dict(torch.load(CKPT_DIR / "model.pt", map_location="cpu"))
+    model.load_state_dict(torch.load(CKPT_DIR / "model.pt", map_location="cpu", weights_only=True))
     model.eval().to(device)
 
     # --- Load data ---

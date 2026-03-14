@@ -4,6 +4,107 @@
 
 ---
 
+## [v2.2] — Vulnerability Fixes & Operational Hardening
+
+**Date:** 2026-03-13
+
+### Motivation
+
+Systematic review identified 18 issues spanning security, data loss, correctness, and
+performance. This release addresses all actionable items without changing the core
+architecture or evaluation philosophy.
+
+### Security
+
+**1. Unsafe `torch.load` in root-level files** (`evaluate.py`)
+Added `weights_only=True` to `torch.load` calls in the toy GPT-2 evaluation script.
+Without this, PyTorch's pickle-based deserialization can execute arbitrary code from
+a malicious `.pt` file. The `pipeline/` files already had this correctly.
+
+**2. `.gitignore` created**
+Excludes `pipeline_data/` (multi-GB tensors), `__pycache__/`, `.env`, `.DS_Store`,
+Jupyter checkpoints, and cloned dependencies (`circuit-tracer/`, `agentic-delphi/`).
+
+### Data Loss Prevention
+
+**3. Annotation failure logging** (`annotate.py`)
+When all retries are exhausted, `logger.warning()` now reports the sequence index,
+chunk range, retry count, and error message. Previously, failures were entirely silent.
+
+**4. Annotation wave checkpointing** (`annotate.py`)
+After each wave of 100 sequences, partial results are saved to
+`annotations_partial.pt`. If the process crashes at call 19,999 of 20,000, only the
+last wave needs to be re-run. The partial file is deleted on successful completion.
+
+**5. Dynamic `max_tokens` for annotation** (`annotate.py`)
+Scaled to `max(500, n_features_in_chunk * 30)`. With 50 features per chunk, the
+previous hard-coded 500 tokens could truncate the JSON response, silently zeroing
+all labels for that chunk.
+
+**6. Mid-training checkpoints** (`train.py`)
+Model state is saved every 5 epochs to `supervised_sae_epoch{N}.pt`. If training
+crashes at epoch 14/15, the epoch-10 checkpoint is available.
+
+### Correctness
+
+**7. Shuffled train/test split** (`train.py`)
+The split now uses `torch.randperm(n_total)` (seeded for reproducibility) instead of
+taking the first 80% in document order. OpenWebText is not randomly ordered, so the
+previous split introduced distribution shift between train and test sets.
+
+**8. Per-epoch validation monitoring** (`train.py`)
+After each training epoch, reconstruction MSE, supervised BCE, and R² are computed on
+the held-out test set. This detects overfitting to noisy LLM annotations before the
+final evaluation step.
+
+**9. Topologically ordered group propagation** (`annotate.py`)
+Group labels (`group = OR(children)`) are now propagated bottom-up: leaf-adjacent
+groups first, then their parents. Previously, nested hierarchies (group → sub-group →
+leaf) could produce incorrect labels if the outer group was processed before its
+sub-group children.
+
+**10. String-aware JSON extraction** (`annotate.py`, `inventory.py`)
+`_extract_json_object()` now tracks `in_string` and `escape` state so that braces
+inside JSON string values (e.g., `"description": "uses {curly} braces"`) don't
+corrupt the depth counter.
+
+**11. Retry for `organize_hierarchy`** (`inventory.py`)
+The single most critical Sonnet call (produces the entire feature catalog) now retries
+up to 3 times with exponential backoff. Previously, a transient API failure required
+re-running the full inventory step.
+
+### Performance & Usability
+
+**12. Vectorized activation collection** (`inventory.py`)
+Replaced the O(n_latents × batch × seq) triple-nested Python loop with vectorized
+candidate extraction: `(lat_acts > threshold).nonzero()` finds only positions above
+the current heap minimum, then iterates only those. Reduces inner loop iterations
+from ~512k per batch to typically <1k.
+
+**13. CUDA fallback** (`config.py`)
+`__post_init__` checks `torch.cuda.is_available()` and falls back to CPU with a
+warning. Previously, running without a GPU produced a confusing CUDA error.
+
+**14. Accurate tokenization progress bar** (`annotate.py`)
+Progress bar now tracks collected sequences (not dataset iteration), so it correctly
+shows progress toward `n_sequences`.
+
+**15. Pinned dependency versions** (`requirements.txt`)
+Added upper-bound pins to prevent breaking changes from major version bumps:
+`torch>=2.0,<3.0`, `transformer_lens>=2.0,<3.0`, `sae-lens>=4.0,<6.0`,
+`anthropic>=0.40.0,<1.0`.
+
+### What Did NOT Change
+
+- SupervisedSAE architecture (split latent space, ReLU, no decoder bias)
+- Loss function (MSE + class-balanced BCE + L1 + hierarchy)
+- Evaluation metrics and non-circular evaluation principle
+- Pipeline step structure (inventory → annotate → train → evaluate)
+- All existing hyperparameter defaults
+- Root-level toy pipeline files remain as-is (validation only, not primary)
+
+---
+
 ## [v2.1] — Training Robustness & Reproducibility
 
 **Date:** 2026-03-13
