@@ -1,0 +1,15 @@
+# Core
+torch>=2.0
+numpy
+tqdm
+
+# Model loading
+transformer_lens
+sae-lens
+
+# Data
+datasets
+huggingface_hub
+
+# LLM annotation
+anthropic>=0.40.0

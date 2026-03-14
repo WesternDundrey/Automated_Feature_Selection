@@ -1,0 +1,35 @@
+# Data & model artifacts
+pipeline_data/
+*.pt
+*.npz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment & secrets
+.env
+.env.*
+credentials.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Cloned dependencies (large, not ours)
+circuit-tracer/
+agentic-delphi/

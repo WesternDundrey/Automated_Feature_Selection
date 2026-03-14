@@ -1,0 +1,536 @@
+"""
+Step 1 — Feature Inventory
+
+Load a pretrained SAE, collect top-activating examples for selected latents,
+generate descriptions with Claude, and organize into a hierarchical catalog.
+
+Outputs:
+    pipeline_data/top_activations.json   Top examples per latent
+    pipeline_data/raw_descriptions.json  Initial Claude descriptions
+    pipeline_data/feature_catalog.json   Hierarchical feature catalog
+
+Usage:
+    python -m pipeline.inventory
+"""
+
+import json
+import re
+import textwrap
+import time
+from pathlib import Path
+
+import anthropic
+import torch
+from tqdm.auto import tqdm
+
+from .config import Config
+
+
+# ── Pretrained SAE wrapper ──────────────────────────────────────────────────
+
+class PretrainedSAE:
+    """Thin wrapper for a pretrained SAE with JumpReLU or ReLU activation.
+
+    Follows the GemmaScope convention (matching agentic-delphi JumpReluSae):
+        encode: z = JumpReLU_theta(x @ W_enc + b_enc)
+        decode: x_hat = z @ W_dec + b_dec
+    """
+
+    def __init__(self, W_enc, W_dec, b_enc, b_dec, threshold=None):
+        self.W_enc = W_enc        # (d_model, d_sae)
+        self.W_dec = W_dec        # (d_sae, d_model)
+        self.b_enc = b_enc        # (d_sae,)
+        self.b_dec = b_dec        # (d_model,)
+        self.threshold = threshold  # (d_sae,) for JumpReLU, None for ReLU
+        self.d_model = W_enc.shape[0]
+        self.d_sae = W_enc.shape[1]
+
+    def encode(self, x):
+        """x: (..., d_model) -> (..., d_sae)"""
+        z = x @ self.W_enc + self.b_enc
+        if self.threshold is not None:
+            mask = z > self.threshold
+            z = mask * torch.relu(z)
+        else:
+            z = torch.relu(z)
+        return z
+
+    def to(self, device):
+        self.W_enc = self.W_enc.to(device)
+        self.W_dec = self.W_dec.to(device)
+        self.b_enc = self.b_enc.to(device)
+        self.b_dec = self.b_dec.to(device)
+        if self.threshold is not None:
+            self.threshold = self.threshold.to(device)
+        return self
+
+
+def load_sae(cfg: Config) -> tuple[PretrainedSAE, torch.Tensor | None]:
+    """Load a pretrained SAE.
+
+    Tries sae_lens first (community standard), falls back to direct GemmaScope
+    npz loading (matches agentic-delphi/delphi/sparse_coders/custom/gemmascope.py).
+    """
+    try:
+        return _load_sae_sae_lens(cfg)
+    except ImportError:
+        print("sae_lens not installed, trying direct GemmaScope npz loading...")
+        return _load_sae_gemmascope_npz(cfg)
+
+
+def _load_sae_sae_lens(cfg: Config) -> tuple[PretrainedSAE, torch.Tensor | None]:
+    from sae_lens import SAE
+
+    print(f"Loading SAE via sae_lens: {cfg.sae_release} / {cfg.sae_id}")
+    sae, cfg_dict, sparsity = SAE.from_pretrained(
+        release=cfg.sae_release,
+        sae_id=cfg.sae_id,
+        device="cpu",
+    )
+
+    threshold = None
+    if hasattr(sae, "threshold") and sae.threshold is not None:
+        threshold = sae.threshold.data.clone()
+    elif hasattr(sae, "log_threshold"):
+        threshold = sae.log_threshold.data.exp()
+
+    # sae_lens stores W_enc as (d_sae, d_model) and W_dec as (d_sae, d_model).
+    # Our PretrainedSAE uses GemmaScope convention:
+    #   W_enc: (d_model, d_sae), W_dec: (d_sae, d_model)
+    W_enc = sae.W_enc.data.clone().T  # (d_sae, d_model) -> (d_model, d_sae)
+    W_dec = sae.W_dec.data.clone()    # already (d_sae, d_model) in sae_lens
+
+    wrapped = PretrainedSAE(
+        W_enc=W_enc,
+        W_dec=W_dec,
+        b_enc=sae.b_enc.data.clone(),
+        b_dec=sae.b_dec.data.clone(),
+        threshold=threshold,
+    )
+    print(f"  SAE: d_model={wrapped.d_model}, d_sae={wrapped.d_sae}")
+    if sparsity is not None:
+        print(f"  Sparsity info available ({sparsity.shape})")
+    return wrapped, sparsity
+
+
+def _load_sae_gemmascope_npz(cfg: Config) -> tuple[PretrainedSAE, None]:
+    """Load a GemmaScope SAE directly from HuggingFace npz.
+
+    Expected repo: google/gemma-scope-2b-pt-res (or -mlp)
+    Expected file: layer_N/width_Wk/average_l0_L/params.npz
+    npz keys: W_enc, W_dec, b_enc, b_dec, threshold
+    """
+    import numpy as np
+    from huggingface_hub import hf_hub_download
+
+    # sae_id like "layer_20/width_16k/canonical" -> need to find actual file
+    # For GemmaScope repos, the path structure is:
+    #   layer_N/width_Wk/average_l0_L/params.npz
+    # The sae_release doubles as the HF repo ID for npz loading.
+    repo_id = cfg.sae_release.replace("-canonical", "")
+    filename = f"{cfg.sae_id}/params.npz"
+    # If sae_id ends with /canonical, strip it and try to find a real L0 variant
+    if filename.endswith("/canonical/params.npz"):
+        filename = filename.replace("/canonical/params.npz", "")
+        # Default to a reasonable L0 value
+        filename = f"{filename}/average_l0_71/params.npz"
+
+    print(f"Loading GemmaScope npz: {repo_id} / {filename}")
+    path = hf_hub_download(repo_id=repo_id, filename=filename)
+
+    params = np.load(path)
+    # GemmaScope convention (matches JumpReluSae in agentic-delphi):
+    #   W_enc: (d_model, d_sae)
+    #   W_dec: (d_sae, d_model)
+    W_enc = torch.from_numpy(params["W_enc"].copy())   # (d_model, d_sae)
+    W_dec = torch.from_numpy(params["W_dec"].copy())   # (d_sae, d_model)
+    b_enc = torch.from_numpy(params["b_enc"].copy())   # (d_sae,)
+    b_dec = torch.from_numpy(params["b_dec"].copy())   # (d_model,)
+
+    threshold = None
+    if "threshold" in params:
+        threshold = torch.from_numpy(params["threshold"].copy())
+
+    wrapped = PretrainedSAE(
+        W_enc=W_enc, W_dec=W_dec, b_enc=b_enc, b_dec=b_dec, threshold=threshold,
+    )
+    print(f"  SAE: d_model={wrapped.d_model}, d_sae={wrapped.d_sae}")
+    return wrapped, None
+
+
+# ── Select latents by firing rate ───────────────────────────────────────────
+
+def select_latents(sparsity, cfg: Config) -> list[int]:
+    """Select latents whose firing rate falls in [min, max].
+
+    sae_lens sparsity is log(firing_rate). If sparsity is unavailable,
+    returns the first n_latents_to_explain indices (user must override).
+    """
+    if sparsity is None:
+        print("  No sparsity info — selecting first N latents.")
+        return list(range(cfg.n_latents_to_explain))
+
+    firing_rate = sparsity.exp()
+    mask = (firing_rate >= cfg.min_firing_rate) & (firing_rate <= cfg.max_firing_rate)
+    candidates = mask.nonzero(as_tuple=False).squeeze(-1).tolist()
+
+    # Sort by firing rate descending (more active = easier to explain)
+    candidates.sort(key=lambda i: -firing_rate[i].item())
+    selected = candidates[: cfg.n_latents_to_explain]
+
+    print(f"  {len(candidates)} latents in firing-rate window "
+          f"[{cfg.min_firing_rate}, {cfg.max_firing_rate}], selected {len(selected)}")
+    return selected
+
+
+# ── Collect top-activating examples ─────────────────────────────────────────
+
+def collect_top_activations(
+    model, sae: PretrainedSAE, tokenizer, selected_latents: list[int], cfg: Config
+) -> dict:
+    """Run model on corpus, collect top-k activating contexts per selected latent.
+
+    Uses transformer_lens API: model.to_tokens() for tokenization,
+    model.run_with_cache() for forward pass.
+
+    Returns:
+        {str(latent_idx): [{"context_ids": [...], "pos": int, "activation": float}, ...]}
+    """
+    from datasets import load_dataset
+    import heapq
+
+    print(f"Collecting top-{cfg.top_k_examples} activations for "
+          f"{len(selected_latents)} latents over "
+          f"{cfg.n_tokens_for_activation_collection:,} tokens...")
+
+    dataset = load_dataset(
+        cfg.corpus_dataset, split=cfg.corpus_split, streaming=True
+    )
+
+    seq_len = cfg.activation_collection_seq_len
+
+    # Per-latent min-heaps: (activation_value, context_ids, pos_in_context)
+    heaps: dict[int, list] = {idx: [] for idx in selected_latents}
+
+    # For vectorized top-example extraction: keep a tensor of selected indices
+    sel_tensor = torch.tensor(selected_latents, dtype=torch.long)
+
+    n_tokens = 0
+    batch_texts = []
+    sae_on_device = sae.to(cfg.device)
+
+    for example in tqdm(dataset, desc="Collecting activations", total=None):
+        text = example.get("text", "")
+        if len(text.strip()) < 50:
+            continue
+        batch_texts.append(text)
+
+        if len(batch_texts) < cfg.activation_collection_batch_size:
+            continue
+
+        # Tokenize with transformer_lens
+        try:
+            input_ids = model.to_tokens(batch_texts)[:, :seq_len].to(cfg.device)
+        except Exception:
+            batch_texts = []
+            continue
+
+        with torch.no_grad():
+            _, cache = model.run_with_cache(
+                input_ids, names_filter=cfg.hook_point, return_type=None
+            )
+            resid = cache[cfg.hook_point]  # (batch, seq, d_model)
+
+            # Encode through pretrained SAE
+            flat = resid.reshape(-1, sae.d_model)
+            acts = sae_on_device.encode(flat.to(sae_on_device.W_enc.dtype))
+            acts = acts.reshape(resid.shape[0], resid.shape[1], -1)
+
+        # Only extract columns for selected latents (saves memory)
+        sel_acts = acts[:, :, sel_tensor].float().cpu()  # (batch, seq, n_selected)
+        ids_cpu = input_ids.cpu()
+
+        for si, lat_idx in enumerate(selected_latents):
+            lat_acts = sel_acts[:, :, si]  # (batch, seq)
+            # Find top activation in this batch for this latent
+            for b in range(lat_acts.shape[0]):
+                for t in range(lat_acts.shape[1]):
+                    val = lat_acts[b, t].item()
+                    if val <= 0:
+                        continue
+                    # Context window: 10 tokens before, target, 10 after
+                    seq_ids = ids_cpu[b].tolist()
+                    start = max(0, t - 10)
+                    end = min(len(seq_ids), t + 11)
+                    context = seq_ids[start:end]
+                    pos_in_context = t - start
+
+                    heap = heaps[lat_idx]
+                    entry = (val, context, pos_in_context)
+                    if len(heap) < cfg.top_k_examples:
+                        heapq.heappush(heap, entry)
+                    elif val > heap[0][0]:
+                        heapq.heapreplace(heap, entry)
+
+        n_tokens += input_ids.numel()
+        batch_texts = []
+
+        if n_tokens >= cfg.n_tokens_for_activation_collection:
+            break
+
+    print(f"  Processed {n_tokens:,} tokens")
+
+    # Convert heaps to sorted lists (highest activation first)
+    result = {}
+    for lat_idx in selected_latents:
+        examples = sorted(heaps[lat_idx], key=lambda x: -x[0])
+        result[str(lat_idx)] = [
+            {
+                "context_ids": ex[1],
+                "pos": ex[2],
+                "activation": round(ex[0], 4),
+            }
+            for ex in examples
+        ]
+
+    n_with_examples = sum(1 for v in result.values() if len(v) > 0)
+    print(f"  {n_with_examples}/{len(selected_latents)} latents have activating examples")
+    return result
+
+
+# ── Generate feature descriptions with Claude ───────────────────────────────
+
+def format_examples_for_prompt(examples: list[dict], tokenizer) -> str:
+    """Format top-activating examples with Delphi-style >>target<< highlighting."""
+    lines = []
+    for i, ex in enumerate(examples):
+        context_ids = ex["context_ids"]
+        pos = ex["pos"]
+        # Decode each token individually
+        tok_strs = []
+        for t in context_ids:
+            try:
+                tok_strs.append(tokenizer.decode([t]))
+            except Exception:
+                tok_strs.append(f"<{t}>")
+        # Highlight the target token
+        if 0 <= pos < len(tok_strs):
+            tok_strs[pos] = f"<<{tok_strs[pos]}>>"
+        context_str = "".join(tok_strs)
+        lines.append(f"  [{i+1}] (act={ex['activation']:.2f}) {context_str}")
+    return "\n".join(lines)
+
+
+def explain_features(top_activations: dict, tokenizer, cfg: Config) -> dict:
+    """Generate initial descriptions for each latent using Claude."""
+    client = anthropic.Anthropic()
+    descriptions = {}
+
+    # Filter to latents that have examples
+    latent_indices = [k for k, v in top_activations.items() if len(v) > 0]
+    print(f"Explaining {len(latent_indices)} latents with {cfg.explanation_model}...")
+
+    batch_size = cfg.features_per_explanation_batch
+
+    for i in tqdm(range(0, len(latent_indices), batch_size), desc="Explaining"):
+        batch = latent_indices[i : i + batch_size]
+
+        prompt_parts = [
+            "You are analyzing sparse autoencoder latents from a language model. "
+            "For each latent below, you see its top-activating token contexts. "
+            "The token with highest activation is marked with <<token>>. "
+            "The number in parentheses is the activation strength.\n\n"
+            "For EACH latent, write a precise 1-2 sentence description of what "
+            "the latent detects. The description must be operationally testable: "
+            "someone should be able to read a token in context and decide yes/no "
+            "whether this feature should fire on that token.\n\n"
+            "Do NOT say 'this latent detects...'. Just state what the feature is, "
+            "e.g., 'Token is a color adjective modifying a noun.'\n\n"
+            "Reply in this exact format (one per line, no blank lines):\n"
+            "LATENT <idx>: <description>\n\n"
+            "Here are the latents:\n"
+        ]
+
+        for lat_idx in batch:
+            examples = top_activations[lat_idx][:cfg.top_k_examples]
+            examples_str = format_examples_for_prompt(examples, tokenizer)
+            prompt_parts.append(f"\n--- Latent {lat_idx} ---\n{examples_str}\n")
+
+        prompt = "".join(prompt_parts)
+
+        response = client.messages.create(
+            model=cfg.explanation_model,
+            max_tokens=200 * len(batch),
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text
+
+        # Parse "LATENT <idx>: <description>" lines
+        for line in text.strip().split("\n"):
+            m = re.match(r"LATENT\s+(\d+)\s*:\s*(.+)", line.strip())
+            if m:
+                idx = m.group(1)
+                desc = m.group(2).strip()
+                if idx in [str(x) for x in batch]:
+                    descriptions[idx] = desc
+
+        time.sleep(0.3)
+
+    print(f"  Generated {len(descriptions)} descriptions")
+    return descriptions
+
+
+# ── Organize into hierarchical catalog ──────────────────────────────────────
+
+def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
+    """Ask Claude to organize feature descriptions into a hierarchical catalog.
+
+    This is the key step: Claude rewrites descriptions for precision, groups them,
+    fills coverage gaps (symmetry partners, missing family members), and removes
+    vague or redundant features.
+    """
+    client = anthropic.Anthropic()
+
+    desc_lines = "\n".join(
+        f"- latent_{k}: {v}" for k, v in sorted(descriptions.items(), key=lambda x: int(x[0]))
+    )
+
+    prompt = textwrap.dedent(f"""\
+        You are building a supervised feature dictionary for a sparse autoencoder
+        trained on {cfg.model_name}, layer {cfg.target_layer}.
+
+        Below are {len(descriptions)} initial feature descriptions generated from
+        the SAE's top-activating examples. Your job is to turn these into a clean,
+        hierarchical feature catalog.
+
+        INITIAL DESCRIPTIONS:
+        {desc_lines}
+
+        YOUR TASKS:
+        1. REWRITE each description to be short (one phrase or sentence), precise,
+           and operationally testable. A reader should be able to look at a token in
+           context and decide yes/no whether it matches.
+        2. GROUP related features under parent categories. Create 2-level hierarchy:
+           parent groups (e.g., "color_words", "sentiment", "syntax") and leaf features.
+        3. FILL GAPS: if one member of a natural family exists (e.g., "red" among
+           colors), add the missing members (blue, green, etc.). If a concept has a
+           natural opposite or complement, include both.
+        4. REMOVE features that are too vague ("general language pattern"), too narrow
+           to be useful, or redundant with other features.
+        5. If a description would need many exceptions to be accurate ("starts with S
+           except snake, swim, ..."), the feature is poorly defined. Split it into
+           something cleaner or drop it.
+        6. Target 50-200 final features total (groups + leaves).
+
+        OUTPUT FORMAT — reply with ONLY this JSON, no other text:
+        {{
+          "features": [
+            {{
+              "id": "group_name",
+              "description": "What this group represents",
+              "type": "group",
+              "parent": null
+            }},
+            {{
+              "id": "group_name.leaf_name",
+              "description": "Precise operational description",
+              "type": "leaf",
+              "parent": "group_name"
+            }}
+          ]
+        }}
+
+        Every leaf must have a parent group. Groups have type "group" and parent null
+        (or another group for nested hierarchy). Leaf IDs use dot notation: group.leaf.
+    """)
+
+    print(f"Organizing {len(descriptions)} descriptions into hierarchy "
+          f"with {cfg.organization_model}...")
+
+    response = client.messages.create(
+        model=cfg.organization_model,
+        max_tokens=8000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = response.content[0].text
+
+    m = re.search(r"\{[\s\S]+\}", text)
+    if not m:
+        raise ValueError(
+            "Could not parse JSON from organization response. "
+            f"Response begins: {text[:300]}"
+        )
+
+    catalog = json.loads(m.group())
+
+    n_groups = sum(1 for f in catalog["features"] if f["type"] == "group")
+    n_leaves = sum(1 for f in catalog["features"] if f["type"] == "leaf")
+    print(f"  Catalog: {n_groups} groups, {n_leaves} leaves, {n_groups + n_leaves} total")
+
+    return catalog
+
+
+# ── Main entry point ────────────────────────────────────────────────────────
+
+def run(cfg: Config = None):
+    """Run the full feature inventory pipeline.
+
+    Skips steps whose outputs already exist on disk (resumable).
+    """
+    if cfg is None:
+        cfg = Config()
+
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if final output exists
+    if cfg.catalog_path.exists():
+        print(f"Feature catalog already exists: {cfg.catalog_path}")
+        return json.loads(cfg.catalog_path.read_text())
+
+    # 1. Load model and pretrained SAE
+    from transformer_lens import HookedTransformer
+
+    print("Loading base model...")
+    model = HookedTransformer.from_pretrained(
+        cfg.model_name, device=cfg.device, dtype=cfg.model_dtype
+    )
+    model.eval()
+    tokenizer = model.tokenizer
+
+    sae, sparsity = load_sae(cfg)
+
+    # 2. Select latents
+    selected = select_latents(sparsity, cfg)
+
+    # 3. Collect top activations (or load cached)
+    if cfg.top_activations_path.exists():
+        print(f"Loading cached top activations: {cfg.top_activations_path}")
+        top_acts = json.loads(cfg.top_activations_path.read_text())
+    else:
+        top_acts = collect_top_activations(model, sae, tokenizer, selected, cfg)
+        cfg.top_activations_path.write_text(json.dumps(top_acts, indent=2))
+        print(f"Saved top activations: {cfg.top_activations_path}")
+
+    # 4. Generate descriptions (or load cached)
+    if cfg.raw_descriptions_path.exists():
+        print(f"Loading cached descriptions: {cfg.raw_descriptions_path}")
+        descriptions = json.loads(cfg.raw_descriptions_path.read_text())
+    else:
+        descriptions = explain_features(top_acts, tokenizer, cfg)
+        cfg.raw_descriptions_path.write_text(json.dumps(descriptions, indent=2))
+        print(f"Saved raw descriptions: {cfg.raw_descriptions_path}")
+
+    # Free GPU memory before LLM calls
+    del model, sae
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # 5. Organize into hierarchy
+    catalog = organize_hierarchy(descriptions, cfg)
+    cfg.catalog_path.write_text(json.dumps(catalog, indent=2))
+    print(f"Saved feature catalog: {cfg.catalog_path}")
+
+    return catalog
+
+
+if __name__ == "__main__":
+    run()

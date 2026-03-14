@@ -1,0 +1,214 @@
+{
+  "features": [
+    {
+      "id": "color",
+      "description": "Token is any basic color word",
+      "type": "group",
+      "parent": null,
+      "words": []
+    },
+    {
+      "id": "color.red",
+      "description": "Token is the color red",
+      "type": "leaf",
+      "parent": "color",
+      "words": ["red"]
+    },
+    {
+      "id": "color.blue",
+      "description": "Token is the color blue",
+      "type": "leaf",
+      "parent": "color",
+      "words": ["blue"]
+    },
+    {
+      "id": "color.green",
+      "description": "Token is the color green",
+      "type": "leaf",
+      "parent": "color",
+      "words": ["green"]
+    },
+    {
+      "id": "color.yellow",
+      "description": "Token is the color yellow",
+      "type": "leaf",
+      "parent": "color",
+      "words": ["yellow"]
+    },
+    {
+      "id": "color.orange",
+      "description": "Token is the color orange",
+      "type": "leaf",
+      "parent": "color",
+      "words": ["orange"]
+    },
+    {
+      "id": "color.purple",
+      "description": "Token is the color purple",
+      "type": "leaf",
+      "parent": "color",
+      "words": ["purple"]
+    },
+    {
+      "id": "color.white",
+      "description": "Token is the color white",
+      "type": "leaf",
+      "parent": "color",
+      "words": ["white"]
+    },
+    {
+      "id": "color.black",
+      "description": "Token is the color black",
+      "type": "leaf",
+      "parent": "color",
+      "words": ["black"]
+    },
+    {
+      "id": "day_of_week",
+      "description": "Token is a day of the week",
+      "type": "group",
+      "parent": null,
+      "words": []
+    },
+    {
+      "id": "day_of_week.monday",
+      "description": "Token is Monday",
+      "type": "leaf",
+      "parent": "day_of_week",
+      "words": ["monday"]
+    },
+    {
+      "id": "day_of_week.tuesday",
+      "description": "Token is Tuesday",
+      "type": "leaf",
+      "parent": "day_of_week",
+      "words": ["tuesday"]
+    },
+    {
+      "id": "day_of_week.wednesday",
+      "description": "Token is Wednesday",
+      "type": "leaf",
+      "parent": "day_of_week",
+      "words": ["wednesday"]
+    },
+    {
+      "id": "day_of_week.thursday",
+      "description": "Token is Thursday",
+      "type": "leaf",
+      "parent": "day_of_week",
+      "words": ["thursday"]
+    },
+    {
+      "id": "day_of_week.friday",
+      "description": "Token is Friday",
+      "type": "leaf",
+      "parent": "day_of_week",
+      "words": ["friday"]
+    },
+    {
+      "id": "day_of_week.saturday",
+      "description": "Token is Saturday",
+      "type": "leaf",
+      "parent": "day_of_week",
+      "words": ["saturday"]
+    },
+    {
+      "id": "day_of_week.sunday",
+      "description": "Token is Sunday",
+      "type": "leaf",
+      "parent": "day_of_week",
+      "words": ["sunday"]
+    },
+    {
+      "id": "month",
+      "description": "Token is a month of the year",
+      "type": "group",
+      "parent": null,
+      "words": []
+    },
+    {
+      "id": "month.january",
+      "description": "Token is January",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["january"]
+    },
+    {
+      "id": "month.february",
+      "description": "Token is February",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["february"]
+    },
+    {
+      "id": "month.march",
+      "description": "Token is March",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["march"]
+    },
+    {
+      "id": "month.april",
+      "description": "Token is April",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["april"]
+    },
+    {
+      "id": "month.may",
+      "description": "Token is May",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["may"]
+    },
+    {
+      "id": "month.june",
+      "description": "Token is June",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["june"]
+    },
+    {
+      "id": "month.july",
+      "description": "Token is July",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["july"]
+    },
+    {
+      "id": "month.august",
+      "description": "Token is August",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["august"]
+    },
+    {
+      "id": "month.september",
+      "description": "Token is September",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["september"]
+    },
+    {
+      "id": "month.october",
+      "description": "Token is October",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["october"]
+    },
+    {
+      "id": "month.november",
+      "description": "Token is November",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["november"]
+    },
+    {
+      "id": "month.december",
+      "description": "Token is December",
+      "type": "leaf",
+      "parent": "month",
+      "words": ["december"]
+    }
+  ]
+}
