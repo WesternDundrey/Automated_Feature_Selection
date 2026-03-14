@@ -20,11 +20,15 @@ Outputs:
 """
 
 import json
+import sys
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from pathlib import Path
+
+_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_DIR))
 from model import SupervisedSAE
 
 # --- Hyperparameters ---
@@ -41,8 +45,8 @@ WARMUP_STEPS = 500     # steps before supervised loss reaches full weight
                        # the class-balanced BCE dominates. Monitor R² epoch-by-epoch.
 LOG_EVERY = 50         # print a line every N steps
 
-SAVE_DIR = Path("checkpoints")
-DATA_DIR = Path("data")
+SAVE_DIR = _DIR / "checkpoints"
+DATA_DIR = _DIR / "data"
 
 
 def hierarchy_loss(sup_acts: torch.Tensor, hierarchy: dict[int, list[int]]) -> torch.Tensor:
@@ -89,7 +93,7 @@ def main():
     pos_weight = pos_weight.to(device)
 
     # --- Feature catalog & hierarchy ---
-    with open("features.json") as f:
+    with open(_DIR / "features.json") as f:
         catalog = json.load(f)
     features = catalog["features"]
     feature_id_to_idx = {feat["id"]: i for i, feat in enumerate(features)}

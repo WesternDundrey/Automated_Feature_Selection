@@ -10,14 +10,18 @@ Reports:
 """
 
 import json
+import sys
 import numpy as np
 import torch
 import torch.nn.functional as F
 from pathlib import Path
+
+_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_DIR))
 from model import SupervisedSAE
 
-DATA_DIR = Path("data")
-CKPT_DIR = Path("checkpoints")
+DATA_DIR = _DIR / "data"
+CKPT_DIR = _DIR / "checkpoints"
 BATCH_SIZE = 512
 
 
@@ -82,7 +86,7 @@ def main():
     print(f"  Variance explained:   {var_explained:.3f}")
 
     # --- 2. Per-feature precision / recall / F1 ---
-    with open("features.json") as f:
+    with open(_DIR / "features.json") as f:
         features = json.load(f)["features"]
 
     # Threshold: pre_act > 0  ⟺  sigmoid(pre_act) > 0.5

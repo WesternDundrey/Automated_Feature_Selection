@@ -186,7 +186,7 @@ def run(cfg: Config = None):
             setattr(variant_cfg, k, v)
 
         # Train
-        sae = train_supervised_sae(activations, annotations, features, variant_cfg)
+        sae = train_supervised_sae(activations, annotations, features, variant_cfg, save_checkpoint=False)
 
         # Evaluate
         metrics = evaluate_quick(sae, x_test, y_test, features, variant_cfg)

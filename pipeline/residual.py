@@ -16,6 +16,7 @@ Usage:
 
 import json
 import textwrap
+import time
 
 import anthropic
 import numpy as np
@@ -99,14 +100,10 @@ def run(cfg: Config = None):
           f"{top_errors[0].item():.2f}]")
     print(f"  Mean MSE (sample): {errors.mean().item():.4f}")
 
-    # Need tokenizer to decode contexts
-    from transformer_lens import HookedTransformer
-    print("Loading model for tokenizer...")
-    model = HookedTransformer.from_pretrained(
-        cfg.model_name, device="cpu", dtype=cfg.model_dtype
-    )
-    tokenizer = model.tokenizer
-    del model
+    # Load tokenizer (lightweight — no need for full model)
+    from transformers import AutoTokenizer
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
 
     # Build context strings for high-error positions
     contexts = []
@@ -206,7 +203,6 @@ def run(cfg: Config = None):
         except Exception as e:
             if attempt < 2:
                 print(f"  Attempt {attempt + 1} failed: {e}, retrying...")
-                import time
                 time.sleep(2 ** attempt)
 
     if result is None:

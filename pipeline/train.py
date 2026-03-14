@@ -137,6 +137,7 @@ def train_supervised_sae(
     labels: torch.Tensor,
     features: list[dict],
     cfg: Config,
+    save_checkpoint: bool = True,
 ) -> SupervisedSAE:
     """Train a supervised SAE.
 
@@ -165,7 +166,8 @@ def train_supervised_sae(
     train_idx, test_idx = perm[:split_idx], perm[split_idx:]
 
     # Save split indices for reproducible evaluation (avoids RNG coupling)
-    torch.save(perm, cfg.split_path)
+    if save_checkpoint:
+        torch.save(perm, cfg.split_path)
 
     x_train, x_test = x_flat[train_idx], x_flat[test_idx]
     y_train, y_test = y_flat[train_idx], y_flat[test_idx]
@@ -298,7 +300,7 @@ def train_supervised_sae(
                   "Consider reducing lambda_sup or increasing warmup_steps.")
 
         # Mid-training checkpoint every 5 epochs
-        if epoch % 5 == 0 and epoch < cfg.epochs:
+        if save_checkpoint and epoch % 5 == 0 and epoch < cfg.epochs:
             ckpt_path = cfg.output_dir / f"supervised_sae_epoch{epoch}.pt"
             torch.save({
                 "model": sae.state_dict(),
@@ -311,17 +313,18 @@ def train_supervised_sae(
 
     # Save
     sae_cpu = sae.cpu()
-    torch.save(sae_cpu.state_dict(), cfg.checkpoint_path)
-    torch.save(
-        {
-            "d_model": d_model,
-            "n_supervised": n_supervised,
-            "n_unsupervised": cfg.n_unsupervised,
-            "n_lista_steps": cfg.n_lista_steps,
-        },
-        cfg.checkpoint_config_path,
-    )
-    print(f"\nModel saved: {cfg.checkpoint_path}")
+    if save_checkpoint:
+        torch.save(sae_cpu.state_dict(), cfg.checkpoint_path)
+        torch.save(
+            {
+                "d_model": d_model,
+                "n_supervised": n_supervised,
+                "n_unsupervised": cfg.n_unsupervised,
+                "n_lista_steps": cfg.n_lista_steps,
+            },
+            cfg.checkpoint_config_path,
+        )
+        print(f"\nModel saved: {cfg.checkpoint_path}")
 
     return sae_cpu
 

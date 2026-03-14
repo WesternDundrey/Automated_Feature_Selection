@@ -4,6 +4,71 @@
 
 ---
 
+## [v3.2] — Final Bug Fixes and Running Guide
+
+**Date:** 2026-03-15
+
+### Bug Fixes
+
+**agreement.py annotated group features wastefully**
+- `annotate_corpus_async` was called with all features (groups + leaves),
+  but `propagate_group_labels` immediately overwrites group labels. Now filters
+  to `leaf_features` before annotating and expands back to the full tensor,
+  matching the pattern established in `annotate.py` `run()` in v3.1. Saves
+  ~20-40% of API calls per agreement run (x2 runs).
+
+**ablation.py overwrote baseline checkpoint**
+- `train_supervised_sae()` unconditionally saved to `cfg.checkpoint_path`.
+  Since all ablation variants share the same config via `copy.copy()`, each
+  variant overwrote the previous checkpoint. After ablation, `supervised_sae.pt`
+  contained the last variant, not the baseline. Fixed by adding a
+  `save_checkpoint: bool = True` parameter to `train_supervised_sae()`.
+  Ablation passes `save_checkpoint=False`. The `split_path` save and
+  mid-training checkpoints are also guarded. Default `True` preserves all
+  existing behavior for normal training.
+
+**toy/ scripts had broken imports after v3.1 move**
+- `toy/train.py` and `toy/evaluate.py` used CWD-relative paths (`from model
+  import SupervisedSAE`, `open("features.json")`) that broke when files moved
+  from root to `toy/`. Added `_DIR = Path(__file__).resolve().parent` anchor
+  and `sys.path.insert` for the model import. All file paths now use `_DIR /`
+  prefix, so scripts work regardless of CWD.
+
+### Improvements
+
+**Lightweight tokenizer loading (agreement.py, residual.py)**
+- Both files loaded the full 5 GB HookedTransformer just to extract the
+  tokenizer, then immediately deleted the model. Replaced with
+  `AutoTokenizer.from_pretrained(cfg.model_name)` from `transformers`
+  (already a transitive dependency). Same tokenizer, ~1 MB vs 5 GB.
+
+**residual.py: moved `import time` to module level**
+- Was inside the `except` block of a retry loop (line 209). Moved to
+  module-level imports alongside `json` and `textwrap`.
+
+### New Files
+
+**RUNNING.md** — Running guide covering:
+- Quick start, CLI flags, configuration
+- Cost estimates per step (with optimization tips)
+- Trial run instructions ($2-3 for end-to-end validation)
+- vast.ai setup, resumability, output file reference
+- Toy validation pipeline instructions
+
+### Files Changed
+
+| File | Changes |
+|------|---------|
+| `pipeline/train.py` | `save_checkpoint` param guards all saves |
+| `pipeline/ablation.py` | Passes `save_checkpoint=False` |
+| `pipeline/agreement.py` | Leaf-only annotation, AutoTokenizer |
+| `pipeline/residual.py` | AutoTokenizer, `import time` at module level |
+| `toy/train.py` | `_DIR` anchor, fixed imports and paths |
+| `toy/evaluate.py` | `_DIR` anchor, fixed imports and paths |
+| `RUNNING.md` | New: comprehensive running guide |
+
+---
+
 ## [v3.1] — Bug Fixes, Robustness, and Project Cleanup
 
 **Date:** 2026-03-13

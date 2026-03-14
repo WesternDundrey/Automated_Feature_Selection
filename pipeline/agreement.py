@@ -66,6 +66,8 @@ def run(cfg: Config = None):
     tokens = torch.load(cfg.tokens_path, weights_only=True)
     catalog = json.loads(cfg.catalog_path.read_text())
     features = catalog["features"]
+    leaf_features = [f for f in features if f["type"] == "leaf"]
+    leaf_indices = [i for i, f in enumerate(features) if f["type"] == "leaf"]
 
     # Select subset for agreement testing
     n_agree = min(cfg.agreement_n_sequences, tokens.shape[0])
@@ -73,24 +75,24 @@ def run(cfg: Config = None):
     print(f"Measuring inter-annotator agreement on {n_agree} sequences, "
           f"{cfg.agreement_n_reruns} independent runs")
 
-    # Need tokenizer to decode — load model briefly
-    from transformer_lens import HookedTransformer
-    print("Loading model for tokenizer...")
-    model = HookedTransformer.from_pretrained(
-        cfg.model_name, device="cpu", dtype=cfg.model_dtype
-    )
-    tokenizer = model.tokenizer
-    del model
+    # Load tokenizer (lightweight — no need for full model)
+    from transformers import AutoTokenizer
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
 
-    # Run annotation multiple times independently
+    # Run annotation multiple times independently (leaf features only)
     annotation_runs = []
     for run_idx in range(cfg.agreement_n_reruns):
         print(f"\nAnnotation run {run_idx + 1}/{cfg.agreement_n_reruns}...")
-        labels = asyncio.run(
-            annotate_corpus_async(subset_tokens, features, tokenizer, cfg)
+        leaf_labels = asyncio.run(
+            annotate_corpus_async(subset_tokens, leaf_features, tokenizer, cfg)
         )
-        labels = propagate_group_labels(labels, features)
-        annotation_runs.append(labels)
+        # Expand leaf annotations to full feature tensor
+        full_labels = torch.zeros(subset_tokens.shape[0], subset_tokens.shape[1], len(features))
+        for li, fi in enumerate(leaf_indices):
+            full_labels[:, :, fi] = leaf_labels[:, :, li]
+        full_labels = propagate_group_labels(full_labels, features)
+        annotation_runs.append(full_labels)
 
     # Compute pairwise Cohen's kappa for each feature
     n_features = len(features)
