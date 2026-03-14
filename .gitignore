@@ -1,6 +1,7 @@
 # Data & model artifacts
 pipeline_data/
-*.pt
+data/
+checkpoints/
 *.npz
 
 # Python

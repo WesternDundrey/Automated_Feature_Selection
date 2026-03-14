@@ -14,6 +14,9 @@ pipeline/
   annotate.py     Step 2: Corpus preparation + LLM annotation
   train.py        Step 3: Supervised SAE training
   evaluate.py     Step 4: Held-out evaluation
+  agreement.py    Step 5: Inter-annotator agreement (Cohen's kappa)
+  ablation.py     Step 6: Ablation study (component importance)
+  residual.py     Step 7: Explain the residual (iterative feature discovery)
   run.py          CLI orchestrator (python -m pipeline)
 ```
 
@@ -26,9 +29,13 @@ pipeline_data/
   tokens.pt                Tokenized corpus (N, seq_len) int64
   activations.pt           Residual stream at target layer (N, seq_len, d_model) float32
   annotations.pt           Binary feature labels (N, seq_len, n_features) float32
+  split_indices.pt         Saved permutation for reproducible train/test split
   supervised_sae.pt        Trained model state dict
   supervised_sae_config.pt Model dimensions
   evaluation.json          Held-out metrics
+  agreement.json           Inter-annotator agreement (Cohen's kappa per feature)
+  ablation.json            Ablation study results (component importance)
+  residual_features.json   Proposed new features from residual analysis
 ```
 
 Every step checks for existing output files and skips if found (resumable).
@@ -151,10 +158,18 @@ Binary labels: 1.0 = feature should be active, 0.0 = not.
 ### Architecture
 
 ```
-SupervisedSAE(d_model, n_supervised, n_unsupervised):
+SupervisedSAE(d_model, n_supervised, n_unsupervised, n_lista_steps=0):
     pre  = W_enc * x + b_enc              in R^{n_total}
     acts = ReLU(pre)                       in R^{n_total}
     x_hat = W_dec * acts                   in R^{d_model}
+
+    # Optional LISTA refinement (Learned ISTA, Gregor & LeCun 2010)
+    for i in 1..n_lista_steps:
+        residual = x - x_hat
+        delta = W_enc * residual + b_enc
+        pre = pre + eta_i * delta          # eta_i is learnable per step
+        acts = ReLU(pre)
+        x_hat = W_dec * acts
 
     Supervised:   acts[:n_supervised]      — one latent per feature in catalog
     Unsupervised: acts[n_supervised:]      — absorb reconstruction residual
@@ -162,6 +177,11 @@ SupervisedSAE(d_model, n_supervised, n_unsupervised):
 
 Decoder columns normalized to unit norm after each optimizer step.
 This prevents the sparsity penalty from being gamed by shrinking decoder norms.
+
+**LISTA refinement** iteratively re-encodes the reconstruction residual with a
+learnable step size `eta_i` per iteration. This improves sparse recovery quality
+by allowing the encoder to correct its initial estimate based on reconstruction
+error. Disabled by default (`n_lista_steps=0`).
 
 ### Loss
 
@@ -192,11 +212,20 @@ Where:
 | lambda_hier | 0.5 | Hierarchy consistency weight |
 | warmup_steps | 500 | Linear ramp before full supervised loss |
 | pos_weight cap | 100 | Max class imbalance correction |
+| n_lista_steps | 0 | LISTA refinement iterations (0 = disabled) |
 
 ### Train/test split
 
 Default 80/20 split at the token-position level (not sequence level, since
-individual positions are i.i.d. inputs to the SAE).
+individual positions are i.i.d. inputs to the SAE). Split indices are saved
+to `split_indices.pt` so that evaluation uses exactly the same split
+regardless of PyTorch version or RNG state.
+
+### Learning rate schedule
+
+Cosine decay: constant learning rate for the first 2/3 of training,
+then cosine annealing to 0 over the final 1/3. Implemented via
+`LambdaLR` with a custom schedule function.
 
 ---
 
@@ -214,6 +243,7 @@ All computed on held-out test data (20% of corpus).
    - Precision: TP / (TP + FP)
    - Recall: TP / (TP + FN)
    - F1: harmonic mean
+   - AUROC: threshold-free metric via trapezoidal rule (no sklearn dependency)
    - Ground truth = LLM annotation (NOT any pretrained SAE activation)
 
 3. **Sparsity**
@@ -231,6 +261,86 @@ The description defines what the feature should detect. The annotation is an
 LLM's best-effort labeling of that description. The evaluation measures whether
 the SAE learned the specified behavior — not whether it matches any unsupervised
 SAE or transcoder.
+
+---
+
+## Step 5: Inter-Annotator Agreement (`agreement.py`)
+
+### Purpose
+
+Measure annotation reliability by re-annotating a subset of sequences
+independently and computing Cohen's kappa per feature.
+
+### Process
+
+1. Select a subset of sequences (default: 100).
+2. Run `annotate_corpus_async` independently `agreement_n_reruns` times (default: 2).
+3. Apply `propagate_group_labels` to each run.
+4. Compute Cohen's kappa between the first two runs for each feature:
+   ```
+   kappa = (p_observed - p_expected) / (1 - p_expected)
+   ```
+   Where p_observed = agreement rate, p_expected = chance agreement.
+
+### Quality classification
+
+| Kappa | Quality | Interpretation |
+|-------|---------|---------------|
+| >= 0.6 | Good | Clean labels, SAE can learn reliably |
+| 0.3-0.6 | Moderate | Noisy labels, SAE may struggle |
+| < 0.3 | Poor | Labels too noisy to train on |
+
+Features with poor kappa may need description refinement or should be excluded.
+
+---
+
+## Step 6: Ablation Study (`ablation.py`)
+
+### Purpose
+
+Quantify the contribution of each pipeline component by training variants
+with individual components disabled.
+
+### Variants
+
+| Variant | Override | Tests |
+|---------|----------|-------|
+| baseline | (none) | Full model performance |
+| no_hierarchy | lambda_hier = 0 | Value of hierarchy loss |
+| no_warmup | warmup_steps = 0 | Value of supervised loss warmup |
+| no_unsupervised | n_unsupervised = 0 | Value of free latents |
+| no_sparsity | lambda_sparse = 0 | Value of L1 penalty |
+| no_lista | n_lista_steps = 0 | Value of LISTA refinement (only if baseline uses LISTA) |
+
+### Metrics
+
+For each variant: R^2, mean F1, L0, hierarchy consistency.
+Deltas from baseline highlight which components matter most.
+
+---
+
+## Step 7: Explain the Residual (`residual.py`)
+
+### Purpose
+
+Identify what the trained SAE fails to capture and propose new features
+to reduce reconstruction error.
+
+### Process
+
+1. Load trained SAE and compute per-position reconstruction error on a sample.
+2. Find the top-k positions with highest MSE.
+3. Extract 21-token context windows around high-error positions.
+4. Send contexts to Claude (Sonnet) with the existing feature catalog, asking:
+   - What patterns appear in the high-error positions?
+   - What 5-15 new features would reduce reconstruction error?
+5. Output proposed features with rationale.
+
+### Iterative use
+
+The proposed features can be manually merged into `feature_catalog.json`
+and the pipeline re-run from the annotation step onward. This implements
+the "explain the residual" loop from the proposal.
 
 ---
 
@@ -257,6 +367,9 @@ python -m pipeline.run --step inventory
 python -m pipeline.run --step annotate
 python -m pipeline.run --step train
 python -m pipeline.run --step evaluate
+python -m pipeline.run --step agreement   # inter-annotator reliability
+python -m pipeline.run --step ablation    # component importance
+python -m pipeline.run --step residual    # propose new features
 ```
 
 ### Configuration overrides
@@ -323,6 +436,9 @@ and `corpus_batch_size` from 8 to 4. Any 12 GB+ card runs with default settings.
 | Annotation | Brief (activation extraction) then idle | ~20k Haiku calls (~$20) | 1-2 hrs |
 | Training | Moderate (small SAE) | None | 15-30 min |
 | Evaluation | Light | None | < 5 min |
+| Agreement | None (model loaded for tokenizer only) | ~200 Haiku calls (~$0.20) | 5-15 min |
+| Ablation | Moderate (trains 5-6 SAE variants) | None | 1-2 hrs |
+| Residual | Light | 1 Sonnet call (~$0.10) | < 5 min |
 
 **Cost-saving tip:** The annotation step is API-bound, not GPU-bound. After activation
 extraction completes (tokens.pt and activations.pt are saved), the GPU is idle during
@@ -343,17 +459,18 @@ avoiding ~1-2 hours of GPU rental.
 | "Take a large text corpus" | Step 2 | annotate.py: prepare_corpus() |
 | "Ask LLM to label token positions" | Step 2 | annotate.py: annotate_corpus() |
 | "Train supervised sparse dictionary" | Step 3 | train.py: train_supervised_sae() |
+| "Evaluate on held-out data" | Step 4 | evaluate.py: evaluate() |
+| "Explain the residual" | Step 7 | residual.py: run() |
 
 ### Not yet implemented (future extensions)
 
-- **Explain the residual loop**: after training, analyze reconstruction residuals,
-  propose new features, iterate. (Proposal section: "Explain the residual")
 - **Bootstrap from existing SAE features**: currently we select by firing rate.
   Could instead cluster related features and propose higher-level abstractions.
 - **Graded intensity targets**: currently binary (0/1). Could extend to
   continuous activation targets.
 - **Cross-prompt circuit aggregation**: using the hierarchical features to
   build stable high-level circuits across different prompts.
+- **SAEBench integration**: automated benchmark scoring against community baselines.
 
 ---
 

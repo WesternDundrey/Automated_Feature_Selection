@@ -264,7 +264,9 @@ def collect_top_activations(
         # Tokenize with transformer_lens
         try:
             input_ids = model.to_tokens(batch_texts)[:, :seq_len].to(cfg.device)
-        except Exception:
+        except Exception as e:
+            if "out of memory" in str(e).lower():
+                raise
             batch_texts = []
             continue
 
@@ -401,12 +403,22 @@ def explain_features(top_activations: dict, tokenizer, cfg: Config) -> dict:
 
         prompt = "".join(prompt_parts)
 
-        response = client.messages.create(
-            model=cfg.explanation_model,
-            max_tokens=200 * len(batch),
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = response.content[0].text
+        text = ""
+        for attempt in range(3):
+            try:
+                response = client.messages.create(
+                    model=cfg.explanation_model,
+                    max_tokens=200 * len(batch),
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                text = response.content[0].text
+                break
+            except Exception as e:
+                if attempt < 2:
+                    print(f"  Explanation attempt {attempt + 1} failed: {e}, retrying...")
+                    time.sleep(2 ** attempt)
+                else:
+                    print(f"  Explanation failed after 3 attempts: {e}")
 
         # Parse "LATENT <idx>: <description>" lines
         for line in text.strip().split("\n"):

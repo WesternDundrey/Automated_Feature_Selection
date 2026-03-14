@@ -81,9 +81,13 @@ class Config:
         self.output_dir = Path(self.output_dir)
         # Fallback to CPU if CUDA not available
         if self.device == "cuda":
-            import torch
-            if not torch.cuda.is_available():
-                print("WARNING: CUDA not available, falling back to CPU")
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    print("WARNING: CUDA not available, falling back to CPU")
+                    self.device = "cpu"
+            except ImportError:
+                print("WARNING: torch not installed, defaulting to CPU")
                 self.device = "cpu"
 
     @property
@@ -133,3 +137,7 @@ class Config:
     @property
     def residual_path(self) -> Path:
         return self.output_dir / "residual_features.json"
+
+    @property
+    def split_path(self) -> Path:
+        return self.output_dir / "split_indices.pt"

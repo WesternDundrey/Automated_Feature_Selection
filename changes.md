@@ -4,6 +4,107 @@
 
 ---
 
+## [v3.1] — Bug Fixes, Robustness, and Project Cleanup
+
+**Date:** 2026-03-13
+
+### Summary
+
+Systematic fix of 13 issues identified in code review: bugs, fragile patterns,
+missing resilience, and project organization. No architectural changes.
+
+### Bug Fixes
+
+**Partial annotation resume (annotate.py)**
+- Crash recovery checkpoints (`annotations_partial.pt`) were saved after each
+  wave but never loaded on resume. Added progress tracking via companion file
+  (`annotations_progress.txt`). On restart, annotation resumes from the last
+  completed wave instead of starting over.
+
+**Group features wasted API calls (annotate.py)**
+- `annotate_corpus()` was called with all features (groups + leaves), but
+  `propagate_group_labels()` immediately overwrites group labels with OR of
+  children. Now only leaf features are sent for annotation. Group labels are
+  populated solely via propagation. Saves ~20-40% of API calls depending on
+  group-to-leaf ratio.
+
+**Validation R² used training-set variance (train.py)**
+- Per-epoch validation R² was computed as `1 - val_mse / baseline_mse` where
+  `baseline_mse` came from the training set. This leaks training-set statistics
+  into the validation metric. Now computes `test_baseline_mse` from the test set
+  independently. The training R² is unaffected (still uses training baseline).
+
+### Fragile Pattern Fixes
+
+**OOM silently swallowed (inventory.py)**
+- `collect_top_activations()` had a bare `except Exception` around tokenization
+  that would silently catch CUDA OOM errors, causing the pipeline to continue
+  with missing data. Now re-raises any error containing "out of memory" and only
+  swallows tokenization-specific failures (malformed text, etc.).
+
+**RNG-based split coupling (train.py, evaluate.py, ablation.py)**
+- Train/test split was reproduced via `set_seed()` + `torch.randperm()`, which
+  couples the split to PyTorch version and RNG implementation. `train.py` now
+  saves the permutation tensor to `split_indices.pt`. `evaluate.py` and
+  `ablation.py` load from disk with a fallback to RNG regeneration for backward
+  compatibility.
+
+### Missing Resilience
+
+**No retry on explain_features (inventory.py)**
+- `explain_features()` made bare API calls with no retry, while every other LLM
+  call in the pipeline had retry logic. Added 3-attempt retry with exponential
+  backoff matching `organize_hierarchy()`.
+
+**Mid-training checkpoints incomplete (train.py)**
+- Mid-training checkpoints (every 5 epochs) saved only `sae.state_dict()`,
+  making training resume impossible (optimizer/scheduler state lost). Now saves
+  full checkpoint: model, optimizer, scheduler, epoch, and step count.
+
+### Improvements
+
+**Token decoding performance (annotate.py)**
+- Replaced per-element `t.item()` calls with bulk `.tolist()` conversion in
+  token decoding loop. Reduces Python↔C++ bridge overhead for large corpora.
+
+**Config torch import guard (config.py)**
+- `Config.__post_init__` CUDA check now catches `ImportError` so the config
+  dataclass can be instantiated without torch installed (useful for inspecting
+  configs, generating documentation, etc.).
+
+**.gitignore scoping**
+- Replaced blanket `*.pt` rule with directory-specific ignores (`pipeline_data/`,
+  `data/`, `checkpoints/`). The blanket rule prevented tracking any `.pt` file
+  in the repo, even if intentionally versioned.
+
+**Root-level file organization**
+- Moved toy validation scripts (`model.py`, `train.py`, `evaluate.py`,
+  `annotate.py`, `extract.py`, `features.json`) from repo root to `toy/`
+  subdirectory. These GPT-2 validation scripts are not part of the primary
+  pipeline and were cluttering the root namespace.
+
+**Documentation update (pipeline_steps.md)**
+- Added documentation for Steps 5-7 (agreement, ablation, residual), LISTA
+  refinement architecture, AUROC metric, cosine LR schedule, split persistence,
+  and updated resource profile table. Removed "explain the residual" from the
+  "not yet implemented" section (it's now Step 7).
+
+### Files Changed
+
+| File | Changes |
+|------|---------|
+| `pipeline/annotate.py` | Partial resume (#2), leaf-only annotation (#3), batch decode (#13) |
+| `pipeline/train.py` | Test-set R² (#4), save split (#7), full checkpoints (#9) |
+| `pipeline/evaluate.py` | Load split from disk (#7) |
+| `pipeline/ablation.py` | Load split from disk (#7) |
+| `pipeline/inventory.py` | Narrow OOM except (#6), retry explain_features (#8) |
+| `pipeline/config.py` | split_path property, torch import guard (#14) |
+| `.gitignore` | Scoped *.pt → directory ignores (#15) |
+| `pipeline_steps.md` | v3.0 documentation (#10) |
+| `toy/` | Moved 6 root-level files (#12) |
+
+---
+
 ## [v3.0] — LISTA Refinement, Ablation, Agreement, Residual Analysis, AUROC
 
 **Date:** 2026-03-13

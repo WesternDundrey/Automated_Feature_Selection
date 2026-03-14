@@ -213,28 +213,43 @@ async def annotate_corpus_async(
     """
     N, T = tokens.shape
     n_features = len(features)
-    all_labels = torch.zeros(N, T, n_features)
 
     client = anthropic.AsyncAnthropic()
     semaphore = asyncio.Semaphore(cfg.max_annotation_concurrency)
 
-    # Decode all sequences to strings
+    # Decode all sequences to strings (use .tolist() to avoid per-element overhead)
     print("Decoding tokens to strings...")
     all_token_strs = []
     for i in range(N):
-        strs = [tokenizer.decode([t.item()]) for t in tokens[i]]
+        ids = tokens[i].tolist()
+        strs = [tokenizer.decode([t]) for t in ids]
         all_token_strs.append(strs)
 
     print(f"Annotating {N} sequences x {n_features} features "
           f"with {cfg.annotation_model}...")
 
-    t0 = time.time()
-    completed = 0
-
-    # Process in waves, saving partial results after each wave
+    # Resume from partial annotations if available
     wave_size = 100
     partial_path = cfg.output_dir / "annotations_partial.pt"
-    for wave_start in range(0, N, wave_size):
+    progress_path = cfg.output_dir / "annotations_progress.txt"
+    resume_from = 0
+
+    if partial_path.exists() and progress_path.exists():
+        all_labels = torch.load(partial_path, weights_only=True)
+        if all_labels.shape == (N, T, n_features):
+            resume_from = int(progress_path.read_text().strip())
+            print(f"Resuming annotation from sequence {resume_from}/{N}")
+        else:
+            print("Partial annotations shape mismatch, starting fresh")
+            all_labels = torch.zeros(N, T, n_features)
+    else:
+        all_labels = torch.zeros(N, T, n_features)
+
+    t0 = time.time()
+    completed = resume_from
+
+    # Process in waves, saving partial results after each wave
+    for wave_start in range(resume_from, N, wave_size):
         wave_end = min(wave_start + wave_size, N)
         tasks = [
             annotate_sequence_async(
@@ -249,20 +264,24 @@ async def annotate_corpus_async(
 
         completed += len(tasks)
         elapsed = time.time() - t0
-        rate = completed / elapsed if elapsed > 0 else 0
-        eta = (N - completed) / rate if rate > 0 else 0
+        rate = (completed - resume_from) / elapsed if elapsed > 0 else 0
+        remaining = N - completed
+        eta = remaining / rate if rate > 0 else 0
         total_pos = int(all_labels[:completed].sum().item())
         print(f"  {completed}/{N} sequences  "
               f"({rate:.1f} seq/s, ETA {eta:.0f}s, {total_pos} positives)")
 
         # Save partial results after each wave (crash recovery)
         torch.save(all_labels, partial_path)
+        progress_path.write_text(str(wave_end))
 
     elapsed = time.time() - t0
     total_pos = int(all_labels.sum().item())
-    # Remove partial checkpoint on success
+    # Remove partial checkpoints on success
     if partial_path.exists():
         partial_path.unlink()
+    if progress_path.exists():
+        progress_path.unlink()
     print(f"\nAnnotation complete in {elapsed:.1f}s")
     print(f"  Total positives: {total_pos}")
 
@@ -349,6 +368,7 @@ def run(cfg: Config = None):
     features = catalog["features"]
     # Only annotate leaf features (groups are derived)
     leaf_features = [f for f in features if f["type"] == "leaf"]
+    leaf_indices = [i for i, f in enumerate(features) if f["type"] == "leaf"]
     print(f"Feature catalog: {len(features)} total, {len(leaf_features)} leaves to annotate")
 
     # Load model for tokenization and activation extraction
@@ -391,8 +411,14 @@ def run(cfg: Config = None):
         print(f"Loading cached annotations: {cfg.annotations_path}")
         annotations = torch.load(cfg.annotations_path, weights_only=True)
     else:
-        annotations = annotate_corpus(tokens, features, tokenizer_ref, cfg)
-        # Propagate group labels
+        # Only annotate leaf features (groups are derived via propagation)
+        leaf_annotations = annotate_corpus(tokens, leaf_features, tokenizer_ref, cfg)
+        # Map leaf annotations back to full feature tensor
+        N_tok, T_tok = tokens.shape
+        annotations = torch.zeros(N_tok, T_tok, len(features))
+        for li, fi in enumerate(leaf_indices):
+            annotations[:, :, fi] = leaf_annotations[:, :, li]
+        # Propagate group labels (OR of children)
         annotations = propagate_group_labels(annotations, features)
         torch.save(annotations, cfg.annotations_path)
         print(f"Saved annotations: {cfg.annotations_path}")

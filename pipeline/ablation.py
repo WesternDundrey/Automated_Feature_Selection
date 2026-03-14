@@ -136,9 +136,15 @@ def run(cfg: Config = None):
     # Prepare test set (matching train.py's split)
     x_flat = activations.reshape(-1, d_model)
     y_flat = annotations.reshape(-1, n_features)
-    set_seed(cfg.seed)
     n_total = x_flat.shape[0]
-    perm = torch.randperm(n_total)
+
+    # Load split indices from disk (saved by train.py) to avoid RNG coupling
+    if cfg.split_path.exists():
+        perm = torch.load(cfg.split_path, weights_only=True)
+    else:
+        set_seed(cfg.seed)
+        perm = torch.randperm(n_total)
+
     split_idx = int(cfg.train_fraction * n_total)
     x_test = x_flat[perm[split_idx:]]
     y_test = y_flat[perm[split_idx:]]

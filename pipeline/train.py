@@ -163,6 +163,10 @@ def train_supervised_sae(
     perm = torch.randperm(n_total)
     split_idx = int(cfg.train_fraction * n_total)
     train_idx, test_idx = perm[:split_idx], perm[split_idx:]
+
+    # Save split indices for reproducible evaluation (avoids RNG coupling)
+    torch.save(perm, cfg.split_path)
+
     x_train, x_test = x_flat[train_idx], x_flat[test_idx]
     y_train, y_test = y_flat[train_idx], y_flat[test_idx]
 
@@ -172,6 +176,9 @@ def train_supervised_sae(
     # Baseline MSE for R^2
     baseline_mse = F.mse_loss(
         x_train.mean(0, keepdim=True).expand_as(x_train), x_train
+    ).item()
+    test_baseline_mse = F.mse_loss(
+        x_test.mean(0, keepdim=True).expand_as(x_test), x_test
     ).item()
 
     # Class-balanced pos_weight for BCE
@@ -282,7 +289,7 @@ def train_supervised_sae(
                 ).item()
                 val_batches += 1
         sae.train()
-        val_r2 = 1.0 - (val_recon / val_batches) / baseline_mse
+        val_r2 = 1.0 - (val_recon / val_batches) / test_baseline_mse
         print(f"           val_recon={val_recon/val_batches:.5f}  "
               f"val_sup={val_sup/val_batches:.5f}  val_R2={val_r2:.3f}")
 
@@ -293,7 +300,13 @@ def train_supervised_sae(
         # Mid-training checkpoint every 5 epochs
         if epoch % 5 == 0 and epoch < cfg.epochs:
             ckpt_path = cfg.output_dir / f"supervised_sae_epoch{epoch}.pt"
-            torch.save(sae.state_dict(), ckpt_path)
+            torch.save({
+                "model": sae.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": epoch,
+                "step": step,
+            }, ckpt_path)
             print(f"  Checkpoint saved: {ckpt_path}")
 
     # Save

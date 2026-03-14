@@ -86,12 +86,20 @@ def evaluate(cfg: Config = None):
     N, T, d_model = activations.shape
     n_features = annotations.shape[-1]
 
-    # Flatten and split to test set (must match train.py's shuffled split)
+    # Flatten and split to test set
     x_flat = activations.reshape(-1, d_model)
     y_flat = annotations.reshape(-1, n_features)
-    set_seed(cfg.seed)
     n_total = x_flat.shape[0]
-    perm = torch.randperm(n_total)
+
+    # Load split indices from disk (saved by train.py) to avoid RNG coupling
+    if cfg.split_path.exists():
+        perm = torch.load(cfg.split_path, weights_only=True)
+    else:
+        # Fallback: regenerate via RNG (backward compatibility)
+        print("WARNING: split_indices.pt not found, regenerating via RNG")
+        set_seed(cfg.seed)
+        perm = torch.randperm(n_total)
+
     split_idx = int(cfg.train_fraction * n_total)
     test_idx = perm[split_idx:]
     x_test = x_flat[test_idx]
