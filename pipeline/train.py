@@ -51,16 +51,29 @@ class SupervisedSAE(nn.Module):
     First n_supervised latents are trained with a supervised loss (BCE against
     LLM labels). Remaining n_unsupervised latents absorb whatever the
     supervised features don't cover.
+
+    Optional LISTA refinement: after the initial encode→decode, compute the
+    reconstruction residual, re-encode it, and update pre-activations with a
+    learnable step size eta. This iterative refinement (from Learned ISTA,
+    Gregor & LeCun 2010) improves sparse recovery.
     """
 
-    def __init__(self, d_model: int, n_supervised: int, n_unsupervised: int):
+    def __init__(self, d_model: int, n_supervised: int, n_unsupervised: int,
+                 n_lista_steps: int = 0):
         super().__init__()
         self.d_model = d_model
         self.n_supervised = n_supervised
         self.n_total = n_supervised + n_unsupervised
+        self.n_lista_steps = n_lista_steps
 
         self.encoder = nn.Linear(d_model, self.n_total, bias=True)
         self.decoder = nn.Linear(self.n_total, d_model, bias=False)
+
+        # LISTA refinement step sizes (one per iteration)
+        if n_lista_steps > 0:
+            self.lista_eta = nn.ParameterList([
+                nn.Parameter(torch.ones(1) * 0.1) for _ in range(n_lista_steps)
+            ])
 
         nn.init.kaiming_uniform_(self.encoder.weight)
         nn.init.zeros_(self.encoder.bias)
@@ -72,6 +85,15 @@ class SupervisedSAE(nn.Module):
         pre = self.encoder(x)
         acts = F.relu(pre)
         recon = self.decoder(acts)
+
+        # LISTA refinement iterations
+        for i in range(self.n_lista_steps):
+            residual = x - recon
+            delta = self.encoder(residual)
+            pre = pre + self.lista_eta[i] * delta
+            acts = F.relu(pre)
+            recon = self.decoder(acts)
+
         sup_pre = pre[..., : self.n_supervised]
         sup_acts = acts[..., : self.n_supervised]
         return recon, sup_pre, sup_acts, acts
@@ -161,7 +183,10 @@ def train_supervised_sae(
     hier_map = build_hierarchy_map(features)
 
     # Model
-    sae = SupervisedSAE(d_model, n_supervised, cfg.n_unsupervised).to(cfg.device)
+    sae = SupervisedSAE(
+        d_model, n_supervised, cfg.n_unsupervised,
+        n_lista_steps=cfg.n_lista_steps,
+    ).to(cfg.device)
     optimizer = torch.optim.AdamW(sae.parameters(), lr=cfg.lr, weight_decay=0.0)
 
     loader = DataLoader(
@@ -185,7 +210,8 @@ def train_supervised_sae(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     print(f"\nTraining: {cfg.epochs} epochs, {len(loader)} steps/epoch")
-    print(f"  n_supervised={n_supervised}  n_unsupervised={cfg.n_unsupervised}")
+    print(f"  n_supervised={n_supervised}  n_unsupervised={cfg.n_unsupervised}"
+          f"  lista_steps={cfg.n_lista_steps}")
     print(f"  lambda_sup={cfg.lambda_sup}  lambda_sparse={cfg.lambda_sparse}  "
           f"lambda_hier={cfg.lambda_hier}")
     print(f"  baseline_mse={baseline_mse:.6f}")
@@ -278,6 +304,7 @@ def train_supervised_sae(
             "d_model": d_model,
             "n_supervised": n_supervised,
             "n_unsupervised": cfg.n_unsupervised,
+            "n_lista_steps": cfg.n_lista_steps,
         },
         cfg.checkpoint_config_path,
     )

@@ -3,7 +3,7 @@ Step 3 — Evaluate Supervised SAE
 
 Reports on held-out test data:
   1. Reconstruction quality (MSE, R^2)
-  2. Per-feature precision / recall / F1
+  2. Per-feature precision / recall / F1 / AUROC
   3. Supervised vs unsupervised-best-match comparison
   4. Hierarchy consistency
 
@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from .config import Config
-from .train import SupervisedSAE, build_hierarchy_map
+from .train import SupervisedSAE, build_hierarchy_map, set_seed
 
 
 def precision_recall_f1(y_true: np.ndarray, y_pred: np.ndarray):
@@ -34,6 +34,29 @@ def precision_recall_f1(y_true: np.ndarray, y_pred: np.ndarray):
     r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
     return p, r, f1
+
+
+def auroc(y_true: np.ndarray, scores: np.ndarray) -> float:
+    """Compute AUROC without sklearn dependency using the trapezoidal rule."""
+    n_pos = y_true.sum()
+    n_neg = len(y_true) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return float('nan')
+
+    # Sort by score descending
+    desc = np.argsort(-scores)
+    y_sorted = y_true[desc]
+
+    # Cumulative TP and FP rates
+    tps = np.cumsum(y_sorted)
+    fps = np.cumsum(~y_sorted)
+    tpr = tps / n_pos
+    fpr = fps / n_neg
+
+    # Prepend (0, 0) and compute area under curve
+    tpr = np.concatenate([[0], tpr])
+    fpr = np.concatenate([[0], fpr])
+    return float(np.trapz(tpr, fpr))
 
 
 def evaluate(cfg: Config = None):
@@ -47,6 +70,7 @@ def evaluate(cfg: Config = None):
         model_cfg["d_model"],
         model_cfg["n_supervised"],
         model_cfg["n_unsupervised"],
+        n_lista_steps=model_cfg.get("n_lista_steps", 0),
     )
     sae.load_state_dict(
         torch.load(cfg.checkpoint_path, map_location="cpu", weights_only=True)
@@ -62,12 +86,16 @@ def evaluate(cfg: Config = None):
     N, T, d_model = activations.shape
     n_features = annotations.shape[-1]
 
-    # Flatten and split to test set
+    # Flatten and split to test set (must match train.py's shuffled split)
     x_flat = activations.reshape(-1, d_model)
     y_flat = annotations.reshape(-1, n_features)
-    split_idx = int(cfg.train_fraction * x_flat.shape[0])
-    x_test = x_flat[split_idx:]
-    y_test = y_flat[split_idx:]
+    set_seed(cfg.seed)
+    n_total = x_flat.shape[0]
+    perm = torch.randperm(n_total)
+    split_idx = int(cfg.train_fraction * n_total)
+    test_idx = perm[split_idx:]
+    x_test = x_flat[test_idx]
+    y_test = y_flat[test_idx]
 
     print(f"Evaluating on {x_test.shape[0]:,} test vectors")
 
@@ -107,38 +135,48 @@ def evaluate(cfg: Config = None):
     # ── 2. Per-feature classification ────────────────────────────────────
     gt = y_test.numpy().astype(bool)
     preds = sup_pre.numpy() > 0  # threshold at sigmoid=0.5
+    scores = sup_pre.numpy()     # raw logits for AUROC
 
     print("\n" + "=" * 70)
     print("PER-FEATURE CLASSIFICATION (threshold: pre_act > 0)")
-    print(f"  {'Feature':<40} {'P':>6} {'R':>6} {'F1':>6} {'Pos':>8}")
-    print("  " + "-" * 64)
+    print(f"  {'Feature':<36} {'P':>6} {'R':>6} {'F1':>6} {'AUROC':>7} {'Pos':>8}")
+    print("  " + "-" * 73)
 
     feature_results = []
     f1_scores = []
+    auroc_scores = []
 
     for k, feat in enumerate(features):
         n_pos = int(gt[:, k].sum())
         if n_pos == 0:
             feature_results.append({
                 "id": feat["id"], "type": feat["type"],
-                "n_positives": 0, "precision": None, "recall": None, "f1": None,
+                "n_positives": 0, "precision": None, "recall": None,
+                "f1": None, "auroc": None,
             })
-            print(f"  {feat['id']:<40} {'--':>6} {'--':>6} {'--':>6} {n_pos:>8}")
+            print(f"  {feat['id']:<36} {'--':>6} {'--':>6} {'--':>6} {'--':>7} {n_pos:>8}")
             continue
 
         p, r, f1 = precision_recall_f1(gt[:, k], preds[:, k])
+        auc = auroc(gt[:, k], scores[:, k])
         f1_scores.append(f1)
+        if not np.isnan(auc):
+            auroc_scores.append(auc)
         tag = " [group]" if feat["type"] == "group" else ""
-        print(f"  {feat['id']:<40} {p:>6.3f} {r:>6.3f} {f1:>6.3f} {n_pos:>8}{tag}")
+        auc_str = f"{auc:.4f}" if not np.isnan(auc) else "--"
+        print(f"  {feat['id']:<36} {p:>6.3f} {r:>6.3f} {f1:>6.3f} {auc_str:>7} {n_pos:>8}{tag}")
 
         feature_results.append({
             "id": feat["id"], "type": feat["type"],
             "n_positives": n_pos, "precision": round(p, 4),
             "recall": round(r, 4), "f1": round(f1, 4),
+            "auroc": round(auc, 4) if not np.isnan(auc) else None,
         })
 
     mean_f1 = float(np.mean(f1_scores)) if f1_scores else 0.0
-    print(f"\n  Mean F1 (features with positives): {mean_f1:.3f}")
+    mean_auroc = float(np.mean(auroc_scores)) if auroc_scores else 0.0
+    print(f"\n  Mean F1 (features with positives):    {mean_f1:.3f}")
+    print(f"  Mean AUROC (features with positives): {mean_auroc:.3f}")
 
     # ── 3. Sparsity ─────────────────────────────────────────────────────
     l0_supervised = (sup_acts > 0).float().sum(dim=-1).mean().item()
@@ -180,6 +218,7 @@ def evaluate(cfg: Config = None):
         "sparsity": {"l0_supervised": l0_supervised, "l0_total": l0_total},
         "features": feature_results,
         "mean_f1": mean_f1,
+        "mean_auroc": mean_auroc,
         "hierarchy": hier_results,
         "n_test_vectors": int(x_test.shape[0]),
     }

@@ -4,6 +4,135 @@
 
 ---
 
+## [v3.0] — LISTA Refinement, Ablation, Agreement, Residual Analysis, AUROC
+
+**Date:** 2026-03-13
+
+### Motivation
+
+The pipeline was functional but lacked: (a) the architectural improvement most
+supported by recent results (LISTA), (b) principled annotation quality measurement,
+(c) ablation evidence for which components matter, (d) the "explain the residual"
+iterative loop from the proposal, and (e) AUROC as a threshold-free metric.
+
+### New Architecture: LISTA Refinement (`train.py`)
+
+SupervisedSAE now supports optional LISTA (Learned ISTA) refinement iterations.
+After the initial encode→decode pass, the model computes the reconstruction
+residual, re-encodes it, and updates pre-activations with a learnable step size η:
+
+```
+pre₀ = W_enc · x + b_enc
+acts₀ = ReLU(pre₀)
+recon₀ = W_dec · acts₀
+
+For i = 1..n_lista_steps:
+    residual = x - recon_{i-1}
+    delta = W_enc · residual + b_enc
+    pre_i = pre_{i-1} + η_i · delta
+    acts_i = ReLU(pre_i)
+    recon_i = W_dec · acts_i
+```
+
+Each η_i is a learnable scalar (initialized to 0.1). This iterative refinement
+(from Gregor & LeCun, ICML 2010) was the single largest improvement in the
+synthsaebench experiments, improving F1 from 0.88 to 0.95.
+
+Config: `n_lista_steps: int = 0` (backward compatible, 0 = disabled).
+CLI: `python -m pipeline --lista 1`.
+
+The model config checkpoint now saves `n_lista_steps` so evaluate.py can
+reconstruct the correct architecture.
+
+### New Step: Inter-Annotator Agreement (`agreement.py`)
+
+Measures annotation reliability by re-running LLM annotation independently
+on a subset of sequences and computing Cohen's kappa per feature:
+
+```
+κ = (p_observed - p_expected) / (1 - p_expected)
+```
+
+Features are classified as:
+- **Good** (κ ≥ 0.6): clean labels, will train well
+- **Moderate** (0.3 ≤ κ < 0.6): some noise, may need description refinement
+- **Poor** (κ < 0.3): noisy labels, description is ambiguous or subjective
+
+This is the principled answer to "but aren't the LLM labels noisy?" — it tells
+you exactly which features have clean labels and which don't.
+
+Config: `agreement_n_sequences: int = 100`, `agreement_n_reruns: int = 2`.
+CLI: `python -m pipeline.run --step agreement`.
+
+### New Step: Ablation Study (`ablation.py`)
+
+Trains 5-6 model variants with individual components disabled:
+
+| Variant | Override |
+|---------|----------|
+| baseline | (full model) |
+| no_hierarchy | λ_hier = 0 |
+| no_warmup | warmup_steps = 0 |
+| no_unsupervised | n_unsupervised = 0 |
+| no_sparsity | λ_sparse = 0 |
+| no_lista | n_lista_steps = 0 (only if baseline uses LISTA) |
+
+Outputs a comparison table with R², mean F1, L0, and hierarchy consistency,
+plus deltas from baseline. This is table 1 of any paper.
+
+CLI: `python -m pipeline.run --step ablation`.
+
+### New Step: Explain the Residual (`residual.py`)
+
+Implements the iterative loop from the proposal:
+
+1. Load trained SAE and compute per-position reconstruction error
+2. Find the top-k highest-error token positions
+3. Extract context windows around those positions
+4. Ask Claude to identify patterns in what the SAE is missing
+5. Propose 5-15 new features to reduce reconstruction error
+
+Output: `residual_features.json` with proposed features, rationales,
+and error statistics. Features can be manually merged into
+`feature_catalog.json` for the next iteration.
+
+Config: `residual_n_samples: int = 500`, `residual_top_k_positions: int = 100`,
+`residual_model: str = "claude-sonnet-4-6"`.
+CLI: `python -m pipeline.run --step residual`.
+
+### AUROC Added to Evaluation (`evaluate.py`)
+
+Per-feature AUROC (Area Under the ROC Curve) is now computed alongside F1.
+Uses raw pre-activation logits as scores — no threshold needed.
+Implemented without sklearn dependency (trapezoidal rule on sorted scores).
+
+Mean AUROC is reported and saved to `evaluation.json`.
+
+### Evaluation Split Consistency Fix (`evaluate.py`)
+
+Evaluation now uses the same seeded `torch.randperm` shuffle as training,
+ensuring the test set is identical. Previously, evaluate.py used an
+unshuffled sequential split while train.py used a shuffled split.
+
+### What Did NOT Change
+
+- Core loss function (MSE + class-balanced BCE + L1 + hierarchy)
+- Non-circular evaluation principle
+- Pipeline steps 1-4 (inventory, annotate, train, evaluate)
+- All existing hyperparameter defaults
+- Annotation prompts and format
+
+### New CLI Arguments
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `--lista` | int | LISTA refinement steps (default 0) |
+| `--step agreement` | | Run inter-annotator agreement |
+| `--step ablation` | | Run ablation study |
+| `--step residual` | | Run explain-the-residual |
+
+---
+
 ## [v2.2] — Vulnerability Fixes & Operational Hardening
 
 **Date:** 2026-03-13

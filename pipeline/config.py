@@ -57,10 +57,20 @@ class Config:
     warmup_steps: int = 500
     train_fraction: float = 0.8
     seed: int = 42
+    n_lista_steps: int = 0  # LISTA refinement iterations (0 = disabled)
 
     # ── Annotation robustness ────────────────────────────────────
     annotation_max_retries: int = 3
     annotation_retry_base_delay: float = 1.0
+
+    # ── Inter-annotator agreement ────────────────────────────────
+    agreement_n_sequences: int = 100
+    agreement_n_reruns: int = 2  # number of independent annotation passes
+
+    # ── Explain-the-residual ─────────────────────────────────────
+    residual_n_samples: int = 500
+    residual_top_k_positions: int = 100
+    residual_model: str = "claude-sonnet-4-6"
 
     # ── Output ──────────────────────────────────────────────────────
     output_dir: str = "pipeline_data"
@@ -111,3 +121,15 @@ class Config:
     @property
     def eval_path(self) -> Path:
         return self.output_dir / "evaluation.json"
+
+    @property
+    def agreement_path(self) -> Path:
+        return self.output_dir / "agreement.json"
+
+    @property
+    def ablation_path(self) -> Path:
+        return self.output_dir / "ablation.json"
+
+    @property
+    def residual_path(self) -> Path:
+        return self.output_dir / "residual_features.json"

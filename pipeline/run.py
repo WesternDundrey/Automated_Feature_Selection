@@ -33,9 +33,11 @@ def main():
     parser.add_argument("--output_dir", default=None, help="Output directory")
     parser.add_argument("--device", default=None, help="Device (cuda/cpu)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--lista", type=int, default=None, help="LISTA refinement steps")
     parser.add_argument(
         "--step", default=None,
-        choices=["inventory", "annotate", "train", "evaluate"],
+        choices=["inventory", "annotate", "train", "evaluate",
+                 "agreement", "ablation", "residual"],
         help="Run only this step",
     )
     args = parser.parse_args()
@@ -63,6 +65,8 @@ def main():
         overrides["device"] = args.device
     if args.seed is not None:
         overrides["seed"] = args.seed
+    if args.lista is not None:
+        overrides["n_lista_steps"] = args.lista
 
     cfg = Config(**overrides)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -119,6 +123,36 @@ def main():
         from .evaluate import evaluate
         evaluate(cfg)
         print(f"Step 4 completed in {time.time() - t0:.1f}s")
+
+    # Step 5: Inter-annotator agreement (optional, run with --step agreement)
+    if args.step == "agreement":
+        print("\n" + "=" * 70)
+        print("STEP 5: INTER-ANNOTATOR AGREEMENT")
+        print("=" * 70)
+        t0 = time.time()
+        from .agreement import run as run_agreement
+        run_agreement(cfg)
+        print(f"Step 5 completed in {time.time() - t0:.1f}s")
+
+    # Step 6: Ablation study (optional, run with --step ablation)
+    if args.step == "ablation":
+        print("\n" + "=" * 70)
+        print("STEP 6: ABLATION STUDY")
+        print("=" * 70)
+        t0 = time.time()
+        from .ablation import run as run_ablation
+        run_ablation(cfg)
+        print(f"Step 6 completed in {time.time() - t0:.1f}s")
+
+    # Step 7: Explain the residual (optional, run with --step residual)
+    if args.step == "residual":
+        print("\n" + "=" * 70)
+        print("STEP 7: EXPLAIN THE RESIDUAL")
+        print("=" * 70)
+        t0 = time.time()
+        from .residual import run as run_residual
+        run_residual(cfg)
+        print(f"Step 7 completed in {time.time() - t0:.1f}s")
 
     print(f"\nTotal pipeline time: {time.time() - t_total:.1f}s")
 
