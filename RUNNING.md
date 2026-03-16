@@ -4,7 +4,7 @@
 
 ```bash
 pip install -r pipeline/requirements.txt
-export ANTHROPIC_API_KEY="sk-ant-..."
+export OPENROUTER_API_KEY="sk-or-..."
 ```
 
 Requires a GPU with >= 12 GB VRAM for Steps 1-2 (model loading).
@@ -110,7 +110,7 @@ python -m pipeline.run --n_sequences 500 --n_latents 100 --epochs 5
    ```bash
    git clone <repo-url> supsae && cd supsae
    pip install -r pipeline/requirements.txt
-   export ANTHROPIC_API_KEY="sk-ant-..."
+   export OPENROUTER_API_KEY="sk-or-..."
    ```
 4. Run: `python -m pipeline`
 5. Copy results: `scp -P <port> -r root@<ip>:~/supsae/pipeline_data/ ./pipeline_data/`

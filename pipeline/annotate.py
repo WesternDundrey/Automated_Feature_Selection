@@ -20,7 +20,6 @@ import re
 import time
 from pathlib import Path
 
-import anthropic
 import torch
 from tqdm.auto import tqdm
 
@@ -145,7 +144,7 @@ def _extract_json_object(text: str) -> dict | None:
 
 
 async def annotate_sequence_async(
-    client: anthropic.AsyncAnthropic,
+    client,
     token_strs: list[str],
     features: list[dict],
     n_features: int,
@@ -170,12 +169,12 @@ async def annotate_sequence_async(
                 try:
                     # Scale max_tokens with feature count: ~30 tokens per feature
                     max_toks = max(500, len(chunk) * 30)
-                    response = await client.messages.create(
+                    response = await client.chat.completions.create(
                         model=cfg.annotation_model,
                         max_tokens=max_toks,
                         messages=[{"role": "user", "content": prompt}],
                     )
-                    text = response.content[0].text.strip()
+                    text = response.choices[0].message.content.strip()
                     result = _extract_json_object(text)
                     if result:
                         for k in range(len(chunk)):
@@ -214,7 +213,8 @@ async def annotate_corpus_async(
     N, T = tokens.shape
     n_features = len(features)
 
-    client = anthropic.AsyncAnthropic()
+    from .llm import get_async_client
+    client = get_async_client()
     semaphore = asyncio.Semaphore(cfg.max_annotation_concurrency)
 
     # Decode all sequences to strings (use .tolist() to avoid per-element overhead)

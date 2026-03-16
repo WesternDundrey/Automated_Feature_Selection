@@ -11,5 +11,5 @@ sae-lens>=4.0,<6.0
 datasets>=2.14
 huggingface_hub>=0.20
 
-# LLM annotation
-anthropic>=0.40.0,<1.0
+# LLM annotation (via OpenRouter, OpenAI-compatible API)
+openai>=1.0

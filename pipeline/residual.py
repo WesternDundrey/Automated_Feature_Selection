@@ -18,7 +18,6 @@ import json
 import textwrap
 import time
 
-import anthropic
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -184,19 +183,15 @@ def run(cfg: Config = None):
     """)
 
     print(f"\nAsking {cfg.residual_model} to analyze residual patterns...")
-    client = anthropic.Anthropic()
+    from .llm import get_client, chat
+    client = get_client()
 
     from .inventory import _extract_json_object
 
     result = None
     for attempt in range(3):
         try:
-            response = client.messages.create(
-                model=cfg.residual_model,
-                max_tokens=4000,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = response.content[0].text
+            text = chat(client, cfg.residual_model, prompt, max_tokens=4000)
             result = _extract_json_object(text)
             if result is not None:
                 break

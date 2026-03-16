@@ -4,6 +4,38 @@
 
 ---
 
+## [v3.3] — OpenRouter Migration
+
+**Date:** 2026-03-16
+
+### API Provider Change: Anthropic SDK → OpenRouter (OpenAI-compatible)
+
+Switched all LLM calls from the Anthropic Python SDK (`anthropic`) to OpenRouter
+via the OpenAI SDK (`openai`). OpenRouter is an OpenAI-compatible API that routes
+to Anthropic models, providing broader model access and a unified interface.
+
+**New file: `pipeline/llm.py`** — Central LLM client abstraction. All pipeline
+API calls route through `get_client()` / `get_async_client()` (sync/async
+`openai.OpenAI` instances) and `chat()` / `achat()` helpers. To switch providers,
+only this file needs to change.
+
+**Files modified:**
+- `pipeline/inventory.py` — `explain_features()` and `organize_hierarchy()` now
+  use `from .llm import get_client, chat` instead of `anthropic.Anthropic()`
+- `pipeline/annotate.py` — `annotate_corpus_async()` uses `get_async_client()`,
+  `annotate_sequence_async()` calls `client.chat.completions.create()` and reads
+  `response.choices[0].message.content` (was `client.messages.create()` /
+  `response.content[0].text`)
+- `pipeline/residual.py` — uses `from .llm import get_client, chat`
+- `pipeline/config.py` — model names prefixed with `anthropic/` for OpenRouter
+  routing (e.g., `anthropic/claude-sonnet-4-6`)
+- `pipeline/requirements.txt` — replaced `anthropic>=0.40.0,<1.0` with `openai>=1.0`
+- `RUNNING.md` — env var changed from `ANTHROPIC_API_KEY` to `OPENROUTER_API_KEY`
+
+**Environment variable:** `OPENROUTER_API_KEY` (was `ANTHROPIC_API_KEY`)
+
+---
+
 ## [v3.2] — Final Bug Fixes and Running Guide
 
 **Date:** 2026-03-15

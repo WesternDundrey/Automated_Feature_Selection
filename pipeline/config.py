@@ -31,10 +31,10 @@ class Config:
     min_firing_rate: float = 0.0005
     max_firing_rate: float = 0.10
 
-    # ── LLM models ──────────────────────────────────────────────────
-    explanation_model: str = "claude-sonnet-4-6"
-    organization_model: str = "claude-sonnet-4-6"
-    annotation_model: str = "claude-haiku-4-5-20251001"
+    # ── LLM models (OpenRouter model IDs) ────────────────────────────
+    explanation_model: str = "anthropic/claude-sonnet-4-6"
+    organization_model: str = "anthropic/claude-sonnet-4-6"
+    annotation_model: str = "anthropic/claude-haiku-4-5-20251001"
     features_per_explanation_batch: int = 10
     features_per_annotation_call: int = 50
     max_annotation_concurrency: int = 20
@@ -70,7 +70,7 @@ class Config:
     # ── Explain-the-residual ─────────────────────────────────────
     residual_n_samples: int = 500
     residual_top_k_positions: int = 100
-    residual_model: str = "claude-sonnet-4-6"
+    residual_model: str = "anthropic/claude-sonnet-4-6"
 
     # ── Output ──────────────────────────────────────────────────────
     output_dir: str = "pipeline_data"

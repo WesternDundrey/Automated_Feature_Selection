@@ -19,7 +19,6 @@ import textwrap
 import time
 from pathlib import Path
 
-import anthropic
 import torch
 from tqdm.auto import tqdm
 
@@ -368,7 +367,8 @@ def format_examples_for_prompt(examples: list[dict], tokenizer) -> str:
 
 def explain_features(top_activations: dict, tokenizer, cfg: Config) -> dict:
     """Generate initial descriptions for each latent using Claude."""
-    client = anthropic.Anthropic()
+    from .llm import get_client, chat
+    client = get_client()
     descriptions = {}
 
     # Filter to latents that have examples
@@ -406,12 +406,7 @@ def explain_features(top_activations: dict, tokenizer, cfg: Config) -> dict:
         text = ""
         for attempt in range(3):
             try:
-                response = client.messages.create(
-                    model=cfg.explanation_model,
-                    max_tokens=200 * len(batch),
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                text = response.content[0].text
+                text = chat(client, cfg.explanation_model, prompt, max_tokens=200 * len(batch))
                 break
             except Exception as e:
                 if attempt < 2:
@@ -444,7 +439,8 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
     fills coverage gaps (symmetry partners, missing family members), and removes
     vague or redundant features.
     """
-    client = anthropic.Anthropic()
+    from .llm import get_client, chat
+    client = get_client()
 
     desc_lines = "\n".join(
         f"- latent_{k}: {v}" for k, v in sorted(descriptions.items(), key=lambda x: int(x[0]))
@@ -506,12 +502,7 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
     last_err = None
     for attempt in range(3):
         try:
-            response = client.messages.create(
-                model=cfg.organization_model,
-                max_tokens=8000,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = response.content[0].text
+            text = chat(client, cfg.organization_model, prompt, max_tokens=8000)
 
             catalog = _extract_json_object(text)
             if catalog is not None:
