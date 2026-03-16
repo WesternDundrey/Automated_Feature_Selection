@@ -1,5 +1,5 @@
 # Data & model artifacts
-pipeline_data/
+
 data/
 checkpoints/
 *.npz
