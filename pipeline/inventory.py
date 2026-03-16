@@ -472,12 +472,12 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
            colors), add the missing members (blue, green, etc.). If a concept has a
            natural opposite or complement, include both.
         4. REMOVE features that are too vague ("general language pattern"),
-           redundant with other features, or too narrow to fire reliably on
-           general English text. Individual phrases ("feel free to", "a lot of
-           fun"), single named entities ("Jon Stewart"), and highly specialized
-           terms ("eigenface method", "Swift private(set)") will have near-zero
-           positive rates on a general corpus. A good leaf feature should
-           plausibly fire on at least 1 in 1000 tokens in diverse web text.
+           redundant with other features, or not operationally crisp. Each
+           feature must be a well-defined concept that a reader can judge as
+           yes/no for any token in context. Reject features that are really
+           just surface-level correlates (e.g., "starts with cor-") rather
+           than genuine semantic or functional categories. Rare features are
+           fine — what matters is crispness, not base rate.
         5. If a description would need many exceptions to be accurate ("starts with S
            except snake, swim, ..."), the feature is poorly defined. Split it into
            something cleaner or drop it.

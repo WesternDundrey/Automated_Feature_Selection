@@ -60,7 +60,7 @@ class Config:
     n_lista_steps: int = 0  # LISTA refinement iterations (0 = disabled)
 
     # ── Feature filtering ──────────────────────────────────────
-    min_feature_positive_rate: float = 0.001  # drop features with <0.1% positive rate
+    min_feature_positive_rate: float = 0.0  # disabled by default (rare features are intentional)
 
     # ── Annotation robustness ────────────────────────────────────
     annotation_max_retries: int = 3
