@@ -87,6 +87,10 @@ class PretrainedSAE:
             z = torch.relu(z)
         return z
 
+    def decode(self, z):
+        """z: (..., d_sae) -> (..., d_model)"""
+        return z @ self.W_dec + self.b_dec
+
     def to(self, device):
         self.W_enc = self.W_enc.to(device)
         self.W_dec = self.W_dec.to(device)
