@@ -3,6 +3,7 @@
 data/
 checkpoints/
 *.npz
+pipeline_data/
 
 # Python
 __pycache__/
