@@ -280,11 +280,14 @@ def evaluate(cfg: Config = None):
     print(f"  Probe Mean F1:    {probe_mean_f1:.3f}  (supervised SAE: {mean_f1:.3f})")
     print(f"  Probe Mean AUROC: {probe_mean_auroc:.3f}  (supervised SAE: {mean_auroc:.3f})")
 
-    del x_train, y_train, probe  # free memory
+    del probe  # free memory (keep x_train, y_train for section 7)
 
-    # ── 6. Pretrained SAE reconstruction comparison ───────────────────
+    # ── 6 & 7. Pretrained SAE comparisons ─────────────────────────────
     pretrained_mse = None
     pretrained_r2 = None
+    posttrain_mean_f1 = 0.0
+    posttrain_mean_auroc = 0.0
+    posttrain_results = []
 
     try:
         from .inventory import load_sae
@@ -295,6 +298,7 @@ def evaluate(cfg: Config = None):
         pretrained, _ = load_sae(cfg)
         pretrained.to(cfg.device)
 
+        # ── 6. Reconstruction comparison ──────────────────────────────
         pre_recon_list = []
         with torch.no_grad():
             for i in range(0, x_test.shape[0], cfg.batch_size):
@@ -314,10 +318,80 @@ def evaluate(cfg: Config = None):
         print(f"  Supervised SAE ({n_sup}+{n_unsup} latents):  "
               f"MSE={mse:.4f}  R²={r2:.4f}")
         print(f"  Reconstruction cost of supervision: {r2 - pretrained_r2:+.4f} R²")
+        del pre_recon
 
-        del pretrained, pre_recon
+        # ── 7. Post-training baseline (AlignSAE-style) ───────────────
+        # Train a linear readout from pretrained SAE's 16k latent space
+        # to feature labels. Tests whether the pretrained representation
+        # already captures our features without from-scratch training.
+        print("\n" + "=" * 70)
+        print("POST-TRAINING BASELINE (linear readout from pretrained SAE latents)")
+
+        readout = torch.nn.Linear(pretrained.d_sae, n_features)
+        readout_opt = torch.optim.Adam(
+            readout.parameters(), lr=1e-3, weight_decay=1e-4
+        )
+        readout_loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+        readout.train()
+        for epoch in range(10):
+            shuffle_idx = torch.randperm(x_train.shape[0])
+            for i in range(0, x_train.shape[0], cfg.batch_size):
+                idx = shuffle_idx[i : i + cfg.batch_size]
+                with torch.no_grad():
+                    z_b = pretrained.encode(
+                        x_train[idx].to(cfg.device)
+                    ).cpu()
+                logits = readout(z_b)
+                loss = readout_loss_fn(logits, y_train[idx])
+                readout_opt.zero_grad()
+                loss.backward()
+                readout_opt.step()
+
+        readout.eval()
+        with torch.no_grad():
+            rt_logits_list = []
+            for i in range(0, x_test.shape[0], cfg.batch_size):
+                z_b = pretrained.encode(
+                    x_test[i : i + cfg.batch_size].to(cfg.device)
+                ).cpu()
+                rt_logits_list.append(readout(z_b))
+            rt_logits = torch.cat(rt_logits_list).numpy()
+
+        rt_preds = rt_logits > 0
+        pt_f1_scores = []
+        pt_auroc_scores = []
+
+        for k, feat in enumerate(features):
+            n_pos = int(gt[:, k].sum())
+            if n_pos == 0:
+                posttrain_results.append({
+                    "id": feat["id"], "f1": None, "auroc": None,
+                })
+                continue
+            pp, pr, pf1 = precision_recall_f1(gt[:, k], rt_preds[:, k])
+            pauc = auroc(gt[:, k], rt_logits[:, k])
+            pt_f1_scores.append(pf1)
+            if not np.isnan(pauc):
+                pt_auroc_scores.append(pauc)
+            posttrain_results.append({
+                "id": feat["id"], "f1": round(pf1, 4),
+                "auroc": round(pauc, 4) if not np.isnan(pauc) else None,
+            })
+
+        posttrain_mean_f1 = float(np.mean(pt_f1_scores)) if pt_f1_scores else 0.0
+        posttrain_mean_auroc = float(np.mean(pt_auroc_scores)) if pt_auroc_scores else 0.0
+
+        print(f"  Post-train Mean F1:    {posttrain_mean_f1:.3f}  "
+              f"(supervised SAE: {mean_f1:.3f}, probe: {probe_mean_f1:.3f})")
+        print(f"  Post-train Mean AUROC: {posttrain_mean_auroc:.3f}  "
+              f"(supervised SAE: {mean_auroc:.3f}, probe: {probe_mean_auroc:.3f})")
+
+        del pretrained, readout
     except Exception as e:
-        print(f"\n  Skipping pretrained SAE comparison: {e}")
+        print(f"\n  Skipping pretrained SAE comparisons: {e}")
+
+    del x_train, y_train
 
     # ── Save results ────────────────────────────────────────────────────
     results = {
@@ -330,6 +404,11 @@ def evaluate(cfg: Config = None):
             "mean_f1": probe_mean_f1,
             "mean_auroc": probe_mean_auroc,
             "per_feature": probe_results,
+        },
+        "posttrain_baseline": {
+            "mean_f1": posttrain_mean_f1,
+            "mean_auroc": posttrain_mean_auroc,
+            "per_feature": posttrain_results,
         },
         "pretrained_reconstruction": {
             "mse": pretrained_mse,
