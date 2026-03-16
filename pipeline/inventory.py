@@ -126,10 +126,10 @@ def _load_sae_sae_lens(cfg: Config) -> tuple[PretrainedSAE, torch.Tensor | None]
     elif hasattr(sae, "log_threshold"):
         threshold = sae.log_threshold.data.exp()
 
-    # sae_lens stores W_enc as (d_sae, d_model) and W_dec as (d_sae, d_model).
-    # Our PretrainedSAE uses GemmaScope convention:
+    # sae_lens stores W_enc as (d_model, d_sae) and W_dec as (d_sae, d_model).
+    # Both already match our GemmaScope convention:
     #   W_enc: (d_model, d_sae), W_dec: (d_sae, d_model)
-    W_enc = sae.W_enc.data.clone().T  # (d_sae, d_model) -> (d_model, d_sae)
+    W_enc = sae.W_enc.data.clone()    # already (d_model, d_sae) in sae_lens
     W_dec = sae.W_dec.data.clone()    # already (d_sae, d_model) in sae_lens
 
     wrapped = PretrainedSAE(
