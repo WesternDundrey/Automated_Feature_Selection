@@ -463,6 +463,11 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
            context and decide yes/no whether it matches.
         2. GROUP related features under parent categories. Create 2-level hierarchy:
            parent groups (e.g., "color_words", "sentiment", "syntax") and leaf features.
+           CRITICAL: Leaf features within the same group MUST be mutually exclusive —
+           a token should match at most one leaf per group. Across groups, features
+           should capture independent aspects of a token (e.g., syntactic role vs.
+           semantic domain vs. morphological structure). Minimize cross-group overlap
+           so that any given token activates only 1-3 leaf features total.
         3. FILL GAPS: if one member of a natural family exists (e.g., "red" among
            colors), add the missing members (blue, green, etc.). If a concept has a
            natural opposite or complement, include both.
