@@ -220,6 +220,105 @@ def evaluate(cfg: Config = None):
                 "consistency": round(consistent, 4),
             })
 
+    # ── 5. Linear probe baseline ─────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("LINEAR PROBE BASELINE (same train/test split)")
+
+    train_idx = perm[:split_idx]
+    x_train = x_flat[train_idx]
+    y_train = y_flat[train_idx]
+
+    # Class-balanced BCE (same weighting strategy as supervised SAE training)
+    n_pos_per_feat = y_train.sum(dim=0)
+    pos_weight = ((y_train.shape[0] - n_pos_per_feat) / n_pos_per_feat.clamp(min=1)).clamp(max=100)
+
+    probe = torch.nn.Linear(d_model, n_features)
+    probe_opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
+    probe_loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    probe.train()
+    for epoch in range(10):
+        shuffle_idx = torch.randperm(x_train.shape[0])
+        for i in range(0, x_train.shape[0], cfg.batch_size):
+            idx = shuffle_idx[i : i + cfg.batch_size]
+            logits = probe(x_train[idx])
+            loss = probe_loss_fn(logits, y_train[idx])
+            probe_opt.zero_grad()
+            loss.backward()
+            probe_opt.step()
+
+    probe.eval()
+    with torch.no_grad():
+        probe_logits_list = []
+        for i in range(0, x_test.shape[0], cfg.batch_size):
+            probe_logits_list.append(probe(x_test[i : i + cfg.batch_size]))
+        probe_logits = torch.cat(probe_logits_list).numpy()
+
+    probe_preds = probe_logits > 0
+    probe_f1_scores = []
+    probe_auroc_scores = []
+    probe_results = []
+
+    for k, feat in enumerate(features):
+        n_pos = int(gt[:, k].sum())
+        if n_pos == 0:
+            probe_results.append({"id": feat["id"], "f1": None, "auroc": None})
+            continue
+        pp, pr, pf1 = precision_recall_f1(gt[:, k], probe_preds[:, k])
+        pauc = auroc(gt[:, k], probe_logits[:, k])
+        probe_f1_scores.append(pf1)
+        if not np.isnan(pauc):
+            probe_auroc_scores.append(pauc)
+        probe_results.append({
+            "id": feat["id"], "f1": round(pf1, 4),
+            "auroc": round(pauc, 4) if not np.isnan(pauc) else None,
+        })
+
+    probe_mean_f1 = float(np.mean(probe_f1_scores)) if probe_f1_scores else 0.0
+    probe_mean_auroc = float(np.mean(probe_auroc_scores)) if probe_auroc_scores else 0.0
+
+    print(f"  Probe Mean F1:    {probe_mean_f1:.3f}  (supervised SAE: {mean_f1:.3f})")
+    print(f"  Probe Mean AUROC: {probe_mean_auroc:.3f}  (supervised SAE: {mean_auroc:.3f})")
+
+    del x_train, y_train, probe  # free memory
+
+    # ── 6. Pretrained SAE reconstruction comparison ───────────────────
+    pretrained_mse = None
+    pretrained_r2 = None
+
+    try:
+        from .inventory import load_sae
+
+        print("\n" + "=" * 70)
+        print("PRETRAINED SAE RECONSTRUCTION COMPARISON")
+
+        pretrained, _ = load_sae(cfg)
+        pretrained.to(cfg.device)
+
+        pre_recon_list = []
+        with torch.no_grad():
+            for i in range(0, x_test.shape[0], cfg.batch_size):
+                x_b = x_test[i : i + cfg.batch_size].to(cfg.device)
+                z = pretrained.encode(x_b)
+                r = pretrained.decode(z)
+                pre_recon_list.append(r.cpu())
+
+        pre_recon = torch.cat(pre_recon_list)
+        pretrained_mse = F.mse_loss(pre_recon, x_test).item()
+        pretrained_r2 = 1.0 - pretrained_mse / baseline_mse
+
+        n_sup = model_cfg["n_supervised"]
+        n_unsup = model_cfg["n_unsupervised"]
+        print(f"  Pretrained SAE ({pretrained.d_sae} latents):  "
+              f"MSE={pretrained_mse:.4f}  R²={pretrained_r2:.4f}")
+        print(f"  Supervised SAE ({n_sup}+{n_unsup} latents):  "
+              f"MSE={mse:.4f}  R²={r2:.4f}")
+        print(f"  Reconstruction cost of supervision: {r2 - pretrained_r2:+.4f} R²")
+
+        del pretrained, pre_recon
+    except Exception as e:
+        print(f"\n  Skipping pretrained SAE comparison: {e}")
+
     # ── Save results ────────────────────────────────────────────────────
     results = {
         "reconstruction": {"mse": mse, "baseline_mse": baseline_mse, "r2": r2},
@@ -227,6 +326,15 @@ def evaluate(cfg: Config = None):
         "features": feature_results,
         "mean_f1": mean_f1,
         "mean_auroc": mean_auroc,
+        "probe_baseline": {
+            "mean_f1": probe_mean_f1,
+            "mean_auroc": probe_mean_auroc,
+            "per_feature": probe_results,
+        },
+        "pretrained_reconstruction": {
+            "mse": pretrained_mse,
+            "r2": pretrained_r2,
+        } if pretrained_mse is not None else None,
         "hierarchy": hier_results,
         "n_test_vectors": int(x_test.shape[0]),
     }

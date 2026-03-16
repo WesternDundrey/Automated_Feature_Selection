@@ -466,8 +466,13 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
         3. FILL GAPS: if one member of a natural family exists (e.g., "red" among
            colors), add the missing members (blue, green, etc.). If a concept has a
            natural opposite or complement, include both.
-        4. REMOVE features that are too vague ("general language pattern"), too narrow
-           to be useful, or redundant with other features.
+        4. REMOVE features that are too vague ("general language pattern"),
+           redundant with other features, or too narrow to fire reliably on
+           general English text. Individual phrases ("feel free to", "a lot of
+           fun"), single named entities ("Jon Stewart"), and highly specialized
+           terms ("eigenface method", "Swift private(set)") will have near-zero
+           positive rates on a general corpus. A good leaf feature should
+           plausibly fire on at least 1 in 1000 tokens in diverse web text.
         5. If a description would need many exceptions to be accurate ("starts with S
            except snake, swim, ..."), the feature is poorly defined. Split it into
            something cleaner or drop it.

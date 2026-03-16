@@ -311,6 +311,53 @@ def annotate_corpus(
 
 # ── Propagate group labels ──────────────────────────────────────────────────
 
+def filter_sparse_features(
+    features: list[dict], annotations: torch.Tensor, min_rate: float
+) -> tuple[list[dict], torch.Tensor, list[str]]:
+    """Remove leaf features with positive rate below min_rate and orphaned groups.
+
+    Returns (filtered_features, filtered_annotations, removed_ids).
+    """
+    rates = annotations.mean(dim=(0, 1))  # per-feature positive rate
+
+    # Step 1: identify surviving leaves
+    surviving_ids = set()
+    removed_ids = []
+    for i, feat in enumerate(features):
+        if feat["type"] == "leaf":
+            if rates[i].item() >= min_rate:
+                surviving_ids.add(feat["id"])
+            else:
+                removed_ids.append(feat["id"])
+
+    if not removed_ids:
+        return features, annotations, []
+
+    # Step 2: keep groups that still have at least one surviving descendant
+    changed = True
+    while changed:
+        changed = False
+        for feat in features:
+            if feat["type"] == "group" and feat["id"] not in surviving_ids:
+                has_child = any(
+                    f.get("parent") == feat["id"] and f["id"] in surviving_ids
+                    for f in features
+                )
+                if has_child:
+                    surviving_ids.add(feat["id"])
+                    changed = True
+
+    for feat in features:
+        if feat["type"] == "group" and feat["id"] not in surviving_ids:
+            removed_ids.append(feat["id"])
+
+    keep_indices = [i for i, f in enumerate(features) if f["id"] in surviving_ids]
+    filtered_features = [features[i] for i in keep_indices]
+    filtered_annotations = annotations[:, :, keep_indices]
+
+    return filtered_features, filtered_annotations, removed_ids
+
+
 def propagate_group_labels(annotations: torch.Tensor, features: list[dict]) -> torch.Tensor:
     """Set group feature labels = OR of children's labels.
 
@@ -420,6 +467,22 @@ def run(cfg: Config = None):
             annotations[:, :, fi] = leaf_annotations[:, :, li]
         # Propagate group labels (OR of children)
         annotations = propagate_group_labels(annotations, features)
+
+        # Filter out features with very low positive rate
+        if cfg.min_feature_positive_rate > 0:
+            features, annotations, removed = filter_sparse_features(
+                features, annotations, cfg.min_feature_positive_rate
+            )
+            if removed:
+                print(f"\n  Filtered {len(removed)} sparse features "
+                      f"(rate < {cfg.min_feature_positive_rate:.2%}):")
+                for fid in removed:
+                    print(f"    - {fid}")
+                # Update catalog on disk to match filtered annotations
+                catalog["features"] = features
+                cfg.catalog_path.write_text(json.dumps(catalog, indent=2))
+                print(f"  Updated catalog: {len(features)} features remain")
+
         torch.save(annotations, cfg.annotations_path)
         print(f"Saved annotations: {cfg.annotations_path}")
 

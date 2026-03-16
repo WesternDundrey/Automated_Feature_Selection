@@ -4,6 +4,46 @@
 
 ---
 
+## [v3.4] — Sparse Feature Filtering + Baseline Comparisons
+
+**Date:** 2026-03-16
+
+### Sparse feature post-filtering
+
+After annotation, leaf features with positive rate below `min_feature_positive_rate`
+(default 0.1%) are removed along with orphaned parent groups. The catalog on disk
+is updated to match. This addresses the observation that very narrow features
+(e.g., `eigenface_method`, `feel_free_to`, `react_framework`) have near-zero
+positives even at 5000 sequences and waste supervised latent capacity.
+
+- `pipeline/config.py`: Added `min_feature_positive_rate: float = 0.001`
+- `pipeline/annotate.py`: Added `filter_sparse_features()`, called after
+  group label propagation. Prints removed features and updates catalog.
+- `pipeline/inventory.py`: Strengthened organize prompt §4 — now explicitly
+  warns against individual phrases, single named entities, and highly specialized
+  terms, with a concrete heuristic (≥1 in 1000 tokens on diverse web text).
+
+### Evaluation baselines
+
+**Linear probe** (Section 5 in evaluate output): Trains a single `nn.Linear(d_model,
+n_features)` on the same train split with class-balanced BCE (matching the SAE's
+pos_weight strategy), evaluates on the same test split. Reports Mean F1 and AUROC
+alongside the supervised SAE's scores. This is the theoretical upper bound for what
+a linear classifier can extract from the residual stream — if the SAE matches the
+probe, the shared decoder constraint is "free."
+
+**Pretrained SAE reconstruction** (Section 6): Loads the original GemmaScope SAE
+(16k latents via sae_lens), runs encode→decode on the test set, reports MSE and R².
+Shows the reconstruction cost of replacing a large unsupervised dictionary with a
+small supervised one (e.g., 107+256 = 363 latents vs 16,384). The supervised SAE's
+advantage is that every latent has a known, testable meaning.
+
+Both baselines are saved to `evaluation.json` (`probe_baseline` and
+`pretrained_reconstruction` keys). Pretrained SAE comparison is wrapped in
+try/except — gracefully skipped if sae_lens unavailable.
+
+---
+
 ## [v3.3] — OpenRouter Migration
 
 **Date:** 2026-03-16

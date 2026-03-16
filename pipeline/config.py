@@ -59,6 +59,9 @@ class Config:
     seed: int = 42
     n_lista_steps: int = 0  # LISTA refinement iterations (0 = disabled)
 
+    # ── Feature filtering ──────────────────────────────────────
+    min_feature_positive_rate: float = 0.001  # drop features with <0.1% positive rate
+
     # ── Annotation robustness ────────────────────────────────────
     annotation_max_retries: int = 3
     annotation_retry_base_delay: float = 1.0
