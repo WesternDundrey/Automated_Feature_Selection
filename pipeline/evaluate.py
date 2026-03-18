@@ -290,21 +290,26 @@ def evaluate(cfg: Config = None):
     posttrain_results = []
 
     try:
-        from .inventory import load_sae
+        # Load sae_lens SAE directly (bypass our wrapper to avoid
+        # weight-convention issues — use sae_lens's tested encode/decode)
+        from sae_lens import SAE as SaeLensSAE
 
         print("\n" + "=" * 70)
         print("PRETRAINED SAE RECONSTRUCTION COMPARISON")
 
-        pretrained, _ = load_sae(cfg)
-        pretrained.to(cfg.device)
+        raw_sae, _, _ = SaeLensSAE.from_pretrained(
+            release=cfg.sae_release, sae_id=cfg.sae_id, device=cfg.device,
+        )
+        raw_sae.eval()
+        d_sae = raw_sae.cfg.d_sae
 
         # ── 6. Reconstruction comparison ──────────────────────────────
         pre_recon_list = []
         with torch.no_grad():
             for i in range(0, x_test.shape[0], cfg.batch_size):
                 x_b = x_test[i : i + cfg.batch_size].to(cfg.device)
-                z = pretrained.encode(x_b)
-                r = pretrained.decode(z)
+                # Use sae_lens native forward: encode → decode
+                r = raw_sae(x_b)
                 pre_recon_list.append(r.cpu())
 
         pre_recon = torch.cat(pre_recon_list)
@@ -313,7 +318,7 @@ def evaluate(cfg: Config = None):
 
         n_sup = model_cfg["n_supervised"]
         n_unsup = model_cfg["n_unsupervised"]
-        print(f"  Pretrained SAE ({pretrained.d_sae} latents):  "
+        print(f"  Pretrained SAE ({d_sae} latents):  "
               f"MSE={pretrained_mse:.4f}  R²={pretrained_r2:.4f}")
         print(f"  Supervised SAE ({n_sup}+{n_unsup} latents):  "
               f"MSE={mse:.4f}  R²={r2:.4f}")
@@ -327,7 +332,7 @@ def evaluate(cfg: Config = None):
         print("\n" + "=" * 70)
         print("POST-TRAINING BASELINE (linear readout from pretrained SAE latents)")
 
-        readout = torch.nn.Linear(pretrained.d_sae, n_features)
+        readout = torch.nn.Linear(d_sae, n_features)
         readout_opt = torch.optim.Adam(
             readout.parameters(), lr=1e-3, weight_decay=1e-4
         )
@@ -339,7 +344,7 @@ def evaluate(cfg: Config = None):
             for i in range(0, x_train.shape[0], cfg.batch_size):
                 idx = shuffle_idx[i : i + cfg.batch_size]
                 with torch.no_grad():
-                    z_b = pretrained.encode(
+                    z_b = raw_sae.encode(
                         x_train[idx].to(cfg.device)
                     ).cpu()
                 logits = readout(z_b)
@@ -352,7 +357,7 @@ def evaluate(cfg: Config = None):
         with torch.no_grad():
             rt_logits_list = []
             for i in range(0, x_test.shape[0], cfg.batch_size):
-                z_b = pretrained.encode(
+                z_b = raw_sae.encode(
                     x_test[i : i + cfg.batch_size].to(cfg.device)
                 ).cpu()
                 rt_logits_list.append(readout(z_b))
@@ -387,7 +392,7 @@ def evaluate(cfg: Config = None):
         print(f"  Post-train Mean AUROC: {posttrain_mean_auroc:.3f}  "
               f"(supervised SAE: {mean_auroc:.3f}, probe: {probe_mean_auroc:.3f})")
 
-        del pretrained, readout
+        del raw_sae, readout
     except Exception as e:
         print(f"\n  Skipping pretrained SAE comparisons: {e}")
 
