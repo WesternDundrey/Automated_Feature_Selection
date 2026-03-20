@@ -336,11 +336,11 @@ def annotate_local(
         Context: tok1 tok2 >>target_tok<< tok4 ...
     And outputs a single token: "0" or "1".
 
-    Backends:
-        ollama (default): HTTP calls to local Ollama server. Handles quantization,
-            KV caching, and continuous batching. Best for gpt-oss:20b (MoE, MXFP4).
-        vllm: Offline batch inference with prefix caching. Best raw throughput.
-        hf: HuggingFace transformers fallback. Slowest, no prefix caching.
+    Uses vLLM with prefix caching for high throughput. For a given feature,
+    all prompts share the same system prefix (~60 tokens). vLLM detects this
+    at the token level and caches the KV states.
+
+    Falls back to HuggingFace transformers if vLLM is unavailable (slower).
     """
     N, T = tokens.shape
     n_features = len(features)
@@ -352,144 +352,18 @@ def annotate_local(
         strs = [base_tokenizer.decode([t]) for t in tokens[i].tolist()]
         all_token_strs.append(strs)
 
-    backend = cfg.local_annotator_backend
-
-    if backend == "ollama":
-        return _annotate_local_ollama(
-            tokens, features, all_token_strs, n_features, N, T, cfg,
-        )
-    elif backend == "vllm":
+    try:
+        from vllm import LLM, SamplingParams
         return _annotate_local_vllm(
             tokens, features, all_token_strs, n_features, N, T, cfg,
         )
-    elif backend == "hf":
+    except ImportError:
+        print("WARNING: vLLM not installed. Falling back to HuggingFace transformers.")
+        print("  This is 10-50x slower due to no prefix caching.")
+        print("  Install vLLM: pip install vllm")
         return _annotate_local_hf(
             tokens, features, all_token_strs, n_features, N, T, cfg,
         )
-    else:
-        raise ValueError(f"Unknown local annotator backend: {backend}")
-
-
-async def _ollama_annotate_batch(
-    session,
-    semaphore: asyncio.Semaphore,
-    model: str,
-    system: str,
-    all_token_strs: list[list[str]],
-    positions: list[tuple[int, int]],
-    annotations: torch.Tensor,
-    fi: int,
-    url: str,
-):
-    """Annotate a batch of (sequence, position) pairs via Ollama API."""
-    tasks = []
-    for seq_j, tok_k in positions:
-        ctx = _format_annotator_context(all_token_strs[seq_j], tok_k)
-        tasks.append(_ollama_single(
-            session, semaphore, model, system, ctx, url,
-        ))
-    results = await asyncio.gather(*tasks)
-    for idx, label in enumerate(results):
-        seq_j, tok_k = positions[idx]
-        annotations[seq_j, tok_k, fi] = label
-
-
-async def _ollama_single(session, semaphore, model, system, context, url,
-                         max_retries=3, base_delay=0.5):
-    """Single annotation call to Ollama with retry. Returns 0.0 or 1.0."""
-    async with semaphore:
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"Context: {context}\nAnswer:"},
-            ],
-            "stream": False,
-            "options": {"num_predict": 1, "temperature": 0},
-        }
-        for attempt in range(max_retries):
-            try:
-                async with session.post(f"{url}/api/chat", json=payload) as resp:
-                    data = await resp.json()
-                    text = data["message"]["content"].strip()
-                    return 1.0 if text.startswith("1") else 0.0
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(base_delay * (2 ** attempt))
-                else:
-                    logger.warning("Ollama annotation failed after %d retries: %s", max_retries, e)
-                    return 0.0
-
-
-def _annotate_local_ollama(
-    tokens: torch.Tensor,
-    features: list[dict],
-    all_token_strs: list[list[str]],
-    n_features: int,
-    N: int,
-    T: int,
-    cfg: Config,
-) -> torch.Tensor:
-    """Ollama backend: async HTTP calls with concurrent requests.
-
-    Ollama handles quantization (MXFP4 for gpt-oss:20b), KV caching,
-    and continuous batching internally. We just send concurrent requests
-    and it schedules them on the GPU.
-    """
-    import aiohttp
-
-    annotations = torch.zeros(N, T, n_features)
-    total_decisions = n_features * N * T
-    completed = 0
-    t_start = time.time()
-
-    print(f"Annotating via Ollama ({cfg.ollama_url}): "
-          f"{cfg.local_annotator_model}")
-    print(f"  {n_features} features x {N} sequences x {T} tokens "
-          f"= {total_decisions:,} decisions")
-    print(f"  Concurrency: {cfg.local_annotation_concurrency}")
-
-    wave_size = 5000  # process this many (seq, pos) pairs per async wave
-
-    async def run_all():
-        nonlocal completed
-        semaphore = asyncio.Semaphore(cfg.local_annotation_concurrency)
-
-        async with aiohttp.ClientSession() as session:
-            for fi, feat in enumerate(features):
-                system = (
-                    "You are a feature annotator. "
-                    f"Feature: {feat['description']}\n"
-                    "Output only 0 or 1. No other text."
-                )
-
-                # Build all (seq, pos) pairs for this feature
-                all_positions = [
-                    (seq_j, tok_k)
-                    for seq_j in range(N)
-                    for tok_k in range(T)
-                ]
-
-                # Process in waves to limit memory
-                for wave_start in range(0, len(all_positions), wave_size):
-                    wave = all_positions[wave_start:wave_start + wave_size]
-                    await _ollama_annotate_batch(
-                        session, semaphore, cfg.local_annotator_model,
-                        system, all_token_strs, wave, annotations, fi,
-                        cfg.ollama_url,
-                    )
-                    completed += len(wave)
-
-                elapsed = time.time() - t_start
-                rate = completed / elapsed if elapsed > 0 else 0
-                eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
-                n_pos = int(annotations[:, :, fi].sum().item())
-                print(f"  [{fi+1}/{n_features}] {feat['id']:<36} "
-                      f"pos={n_pos:>6} rate={rate:.0f}/s  "
-                      f"ETA {eta_sec/3600:.1f}h")
-
-    asyncio.run(run_all())
-    return annotations
 
 
 def _annotate_local_vllm(
@@ -501,22 +375,8 @@ def _annotate_local_vllm(
     T: int,
     cfg: Config,
 ) -> torch.Tensor:
-    """vLLM backend with automatic prefix caching.
-
-    For a given feature, all prompts share the same system prefix (~60 tokens).
-    vLLM detects this at the token level and caches the KV states, so only the
-    per-(sequence, position) context needs to be computed for each decision.
-
-    NOTE: cfg.local_annotator_model must be a HuggingFace model ID (e.g.,
-    "openai/gpt-oss-20b"), not an Ollama tag. Use --annotator-model to override.
-    """
-    try:
-        from vllm import LLM, SamplingParams
-    except ImportError:
-        raise ImportError(
-            "vLLM not installed. Install with: pip install vllm\n"
-            "Or use --annotator-backend ollama (default, no extra install)."
-        )
+    """vLLM backend with automatic prefix caching."""
+    from vllm import LLM, SamplingParams
 
     print(f"Loading local annotator via vLLM: {cfg.local_annotator_model}")
     llm = LLM(
@@ -596,9 +456,6 @@ def _annotate_local_hf(
 
     Uses logit comparison (token "1" vs "0") instead of generate() for speed,
     but re-processes the full prompt for every decision. 10-50x slower than vLLM.
-
-    NOTE: cfg.local_annotator_model must be a HuggingFace model ID (e.g.,
-    "openai/gpt-oss-20b"), not an Ollama tag. Use --annotator-model to override.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 

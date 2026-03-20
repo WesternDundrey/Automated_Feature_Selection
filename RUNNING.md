@@ -8,13 +8,11 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 source ~/.cargo/env
 uv pip install --system -r pipeline/requirements.txt
 
+# vLLM for local annotation (prefix caching)
+uv pip install --system vllm
+
 # API key for Step 1 (feature inventory uses Claude Sonnet via OpenRouter)
 export OPENROUTER_API_KEY="sk-or-..."
-
-# Ollama for local annotation (Step 2)
-curl -fsSL https://ollama.com/install.sh | sh
-ollama serve &
-ollama pull gpt-oss:20b
 ```
 
 ## Quick Start
@@ -28,7 +26,6 @@ python -m pipeline.run --local-annotator --n_sequences 50000 --epochs 15
 ### API annotation (if no local GPU for annotator)
 
 ```bash
-export OPENROUTER_API_KEY="sk-or-..."
 python -m pipeline.run --n_sequences 2000 --epochs 15
 ```
 
@@ -60,9 +57,8 @@ python -m pipeline.run --step residual     # Step 7: propose new features from r
 | `--n_sequences` | 5000 | Corpus sequences for annotation |
 | `--epochs` | 15 | Training epochs |
 | `--lista` | 0 | LISTA refinement steps (0 = disabled) |
-| `--local-annotator` | off | Use local model instead of API for annotation |
-| `--annotator-model` | gpt-oss:20b | Local annotator model |
-| `--annotator-backend` | ollama | Local backend: ollama, vllm, or hf |
+| `--local-annotator` | off | Use local model via vLLM with prefix caching |
+| `--annotator-model` | openai/gpt-oss-20b | HuggingFace model ID for local annotator |
 | `--no-mse` | off | Use legacy BCE supervision instead of MSE |
 | `--output_dir` | pipeline_data | Output directory |
 | `--device` | cuda | Device (cuda/cpu) |
@@ -71,12 +67,10 @@ python -m pipeline.run --step residual     # Step 7: propose new features from r
 
 ## Two Models, Two Roles
 
-The pipeline uses two completely independent models:
-
 | Role | What it does | Default | Runs on |
 |------|-------------|---------|---------|
 | **Target model** | The model being analyzed. Forward pass extracts activations. | GPT-2 Small (124M) | GPU |
-| **Annotator model** | Labels tokens with feature presence/absence. | gpt-oss:20b (local via Ollama) | GPU |
+| **Annotator model** | Labels tokens with feature presence/absence. | gpt-oss-20b (local via vLLM) | GPU |
 
 These never run simultaneously. The target model is freed from GPU before annotation starts.
 
@@ -87,46 +81,32 @@ provide analytically derived ground-truth feature directions for it. If the supe
 SAE's learned decoder directions converge to Makelov's directions, the MSE feature
 dictionary loss works. Any SAE failures are attributable to the pipeline, not annotation
 noise — GPT-2 features are trivially simple (punctuation, word categories, syntactic roles)
-and gpt-oss:20b labels them near-perfectly.
+and gpt-oss-20b labels them near-perfectly.
 
 ## vast.ai Setup
 
 ### Hardware
 
 - **GPU:** RTX 5090 (32GB) or RTX 4090 (24GB)
-- **Disk:** 50GB (activations.pt ≈ 20GB at 50K sequences with GPT-2's d_model=768)
+- **Disk:** 50GB (activations.pt ~ 20GB at 50K sequences with GPT-2's d_model=768)
 - **Template:** PyTorch
 
 ### Onstart Script
 
-```bash
-#!/bin/bash
-
-export OPENROUTER_API_KEY="sk-or-..."
-
-# Install uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source ~/.cargo/env
-
-# Install Ollama + pull annotator model
-curl -fsSL https://ollama.com/install.sh | sh
-ollama serve &
-sleep 5
-ollama pull gpt-oss:20b
-
-# Clone repo and install deps
-# setup.sh handles clone + deps automatically (see Onstart Script below)
-```
-
-Or use the provisioning script directly as vast.ai on-start URL:
+Use the provisioning script directly as vast.ai on-start URL:
 ```
 https://raw.githubusercontent.com/WesternDundrey/Automated_Feature_Selection/main/setup.sh
 ```
 
+Set `OPENROUTER_API_KEY` as an environment variable in the vast.ai template.
+
+The script installs uv, vLLM, clones the repo, installs deps, and pre-downloads
+gpt-oss-20b. GPT-2 Small (~500MB) downloads on first run.
+
 ### Run
 
 ```bash
-cd /workspace/repo
+cd /workspace/Automated_Feature_Selection
 python -m pipeline.run --local-annotator --n_sequences 50000 --epochs 15
 ```
 
@@ -135,27 +115,17 @@ Use `tmux` so SSH disconnects don't kill the run.
 ### Copy results
 
 ```bash
-scp -P <port> -r root@<ip>:/workspace/repo/pipeline_data/ ./pipeline_data/
+scp -P <port> -r root@<ip>:/workspace/Automated_Feature_Selection/pipeline_data/ ./pipeline_data/
 ```
 
 **Stop the instance when done.**
 
-## Cost Comparison
-
-### API annotation (default)
+## Cost
 
 | Step | Model | API Calls | Est. Cost |
 |------|-------|-----------|-----------|
 | Inventory | Sonnet 4.6 | ~40 | ~$1.90 |
-| Annotation | Haiku 4.5 | ~10,000 | ~$30 |
-| **Total** | | ~10,040 | **~$32** |
-
-### Local annotation (Ollama)
-
-| Step | Model | API Calls | Est. Cost |
-|------|-------|-----------|-----------|
-| Inventory | Sonnet 4.6 | ~40 | ~$1.90 |
-| Annotation | gpt-oss:20b | 0 (local) | $0 |
+| Annotation | gpt-oss-20b (local) | 0 | $0 |
 | **Total** | | ~40 | **~$2** (+ GPU rental) |
 
 GPU rental: ~$0.30-0.50/hr on vast.ai, pipeline takes ~4-8 hours with local annotation.

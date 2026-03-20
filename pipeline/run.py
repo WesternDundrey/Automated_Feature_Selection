@@ -35,12 +35,9 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--lista", type=int, default=None, help="LISTA refinement steps")
     parser.add_argument("--local-annotator", action="store_true",
-                        help="Use local model for annotation instead of API")
+                        help="Use local model for annotation (vLLM + prefix caching)")
     parser.add_argument("--annotator-model", default=None,
-                        help="Local annotator model (default: gpt-oss:20b for Ollama, use HF ID for vllm/hf)")
-    parser.add_argument("--annotator-backend", default=None,
-                        choices=["ollama", "vllm", "hf"],
-                        help="Local annotator backend (default: ollama)")
+                        help="Local annotator HF model ID (default: openai/gpt-oss-20b)")
     parser.add_argument("--no-mse", action="store_true",
                         help="Use legacy BCE supervision instead of MSE")
     parser.add_argument(
@@ -80,8 +77,6 @@ def main():
         overrides["use_local_annotator"] = True
     if args.annotator_model:
         overrides["local_annotator_model"] = args.annotator_model
-    if args.annotator_backend:
-        overrides["local_annotator_backend"] = args.annotator_backend
     if args.no_mse:
         overrides["use_mse_supervision"] = False
 

@@ -14,5 +14,5 @@ huggingface_hub>=0.20
 # LLM annotation (via OpenRouter, OpenAI-compatible API)
 openai>=1.0
 
-# Local annotation (Ollama backend)
-aiohttp>=3.9
+# Local annotation (install separately: pip install vllm)
+# vllm>=0.6.0
