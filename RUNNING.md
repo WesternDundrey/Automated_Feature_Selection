@@ -8,30 +8,28 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 source ~/.cargo/env
 uv pip install --system -r pipeline/requirements.txt
 
-# API key for Step 1 (feature inventory uses Claude Sonnet)
+# API key for Step 1 (feature inventory uses Claude Sonnet via OpenRouter)
 export OPENROUTER_API_KEY="sk-or-..."
 
-# HuggingFace token for gated models (Gemma-2-2B)
-export HF_TOKEN="hf_..."
+# Ollama for local annotation (Step 2)
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &
+ollama pull gpt-oss:20b
 ```
 
 ## Quick Start
 
-### API annotation (default)
+### Full pipeline (local annotation, recommended)
 
 ```bash
-python -m pipeline.run --n_sequences 2000 --n_latents 100 --epochs 15
+python -m pipeline.run --local-annotator --n_sequences 50000 --epochs 15
 ```
 
-### Local annotation (Ollama + gpt-oss:20b)
+### API annotation (if no local GPU for annotator)
 
 ```bash
-# Start Ollama with gpt-oss:20b (do this once, or in onstart script)
-ollama serve &
-ollama pull gpt-oss:20b
-
-# Run with local annotation — 10x more data, zero annotation API cost
-python -m pipeline.run --local-annotator --n_sequences 50000 --epochs 15
+export OPENROUTER_API_KEY="sk-or-..."
+python -m pipeline.run --n_sequences 2000 --epochs 15
 ```
 
 ### Individual steps
@@ -56,8 +54,8 @@ python -m pipeline.run --step residual     # Step 7: propose new features from r
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | google/gemma-2-2b | Target model to analyze |
-| `--layer` | 20 | Target layer |
+| `--model` | openai-community/gpt2 | Target model to analyze |
+| `--layer` | 8 | Target layer |
 | `--n_latents` | 500 | Latents to explain from pretrained SAE |
 | `--n_sequences` | 5000 | Corpus sequences for annotation |
 | `--epochs` | 15 | Training epochs |
@@ -77,31 +75,26 @@ The pipeline uses two completely independent models:
 
 | Role | What it does | Default | Runs on |
 |------|-------------|---------|---------|
-| **Target model** | The model being analyzed. Forward pass extracts activations. | Gemma-2-2B | GPU |
-| **Annotator model** | Labels tokens with feature presence/absence. | Claude Haiku (API) or gpt-oss:20b (local) | API or GPU |
+| **Target model** | The model being analyzed. Forward pass extracts activations. | GPT-2 Small (124M) | GPU |
+| **Annotator model** | Labels tokens with feature presence/absence. | gpt-oss:20b (local via Ollama) | GPU |
 
 These never run simultaneously. The target model is freed from GPU before annotation starts.
 
-## Validation Mode (GPT-2 Small)
+## Why GPT-2 Small?
 
-To validate the pipeline against known analytical features (Makelov et al.):
-
-```bash
-python -m pipeline.run --model openai-community/gpt2 --layer 8 \
-    --local-annotator --n_sequences 50000 --epochs 15
-```
-
-GPT-2 Small (124M params, d_model=768) is ~3x cheaper on memory/compute.
-Features are simple (punctuation, common words, syntactic roles) making
-annotation trivially easy for gpt-oss:20b. Any SAE failures are attributable
-to the training pipeline, not annotation noise.
+GPT-2 Small (124M params, d_model=768) is the validation target because Makelov et al.
+provide analytically derived ground-truth feature directions for it. If the supervised
+SAE's learned decoder directions converge to Makelov's directions, the MSE feature
+dictionary loss works. Any SAE failures are attributable to the pipeline, not annotation
+noise — GPT-2 features are trivially simple (punctuation, word categories, syntactic roles)
+and gpt-oss:20b labels them near-perfectly.
 
 ## vast.ai Setup
 
 ### Hardware
 
 - **GPU:** RTX 5090 (32GB) or RTX 4090 (24GB)
-- **Disk:** 50GB minimum, 80GB recommended (activations.pt can be 25GB+ at 50K sequences)
+- **Disk:** 50GB (activations.pt ≈ 20GB at 50K sequences with GPT-2's d_model=768)
 - **Template:** PyTorch
 
 ### Onstart Script
@@ -109,7 +102,6 @@ to the training pipeline, not annotation noise.
 ```bash
 #!/bin/bash
 
-export HF_TOKEN="hf_..."
 export OPENROUTER_API_KEY="sk-or-..."
 
 # Install uv
@@ -126,27 +118,16 @@ ollama pull gpt-oss:20b
 git clone https://github.com/WesternDundrey/Automated_Feature_Selection.git /workspace/supsae
 cd /workspace/supsae
 uv pip install --system -r pipeline/requirements.txt
-
-# Pre-download target model
-python -c "
-from huggingface_hub import login; login(token='$HF_TOKEN')
-from transformers import AutoModelForCausalLM, AutoTokenizer
-AutoTokenizer.from_pretrained('google/gemma-2-2b')
-AutoModelForCausalLM.from_pretrained('google/gemma-2-2b', torch_dtype='bfloat16')
-"
 ```
+
+GPT-2 Small is ~500MB — downloads in seconds on first load. No pre-download needed.
+No `HF_TOKEN` needed (GPT-2 is not gated).
 
 ### Run
 
 ```bash
 cd /workspace/supsae
-
-# Local annotation, 50K sequences
 python -m pipeline.run --local-annotator --n_sequences 50000 --epochs 15
-
-# Or GPT-2 validation mode
-python -m pipeline.run --model openai-community/gpt2 --layer 8 \
-    --local-annotator --n_sequences 50000 --epochs 15
 ```
 
 Use `tmux` so SSH disconnects don't kill the run.

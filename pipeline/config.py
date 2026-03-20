@@ -12,15 +12,15 @@ from pathlib import Path
 @dataclass
 class Config:
     # ── Base model ───────────────────────────────────────────────────
-    model_name: str = "google/gemma-2-2b"
-    target_layer: int = 20
+    model_name: str = "openai-community/gpt2"
+    target_layer: int = 8
     hook_point: str = ""  # auto-set in __post_init__
     device: str = "cuda"
-    model_dtype: str = "bfloat16"
+    model_dtype: str = "float32"  # GPT-2 Small runs in fp32
 
     # ── Pretrained SAE (sae_lens format) ─────────────────────────────
-    sae_release: str = "gemma-scope-2b-pt-res-canonical"
-    sae_id: str = "layer_20/width_16k/canonical"
+    sae_release: str = "gpt2-small-res-jb"
+    sae_id: str = "blocks.8.hook_resid_pre"
 
     # ── Feature selection from pretrained SAE ────────────────────────
     n_latents_to_explain: int = 500
