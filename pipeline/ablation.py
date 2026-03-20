@@ -162,6 +162,12 @@ def run(cfg: Config = None):
     if cfg.n_lista_steps > 0:
         ablations["no_lista"] = {"n_lista_steps": 0}
 
+    # v2: MSE vs BCE supervision ablation
+    if cfg.use_mse_supervision:
+        ablations["bce_supervision"] = {"use_mse_supervision": False}
+    else:
+        ablations["mse_supervision"] = {"use_mse_supervision": True}
+
     print("=" * 70)
     print("ABLATION STUDY")
     print("=" * 70)

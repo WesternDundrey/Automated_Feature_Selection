@@ -43,6 +43,86 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+# ── v2: MSE feature dictionary supervision ─────────────────────────────────
+
+def compute_target_directions(
+    x_flat: torch.Tensor, y_flat: torch.Tensor, n_supervised: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute Makelov-style conditional mean directions for each feature.
+
+    For feature i: target_dir_i = normalize(mean(x | label_i=1) - mean(x))
+
+    Args:
+        x_flat: (N, d_model) residual stream activations
+        y_flat: (N, n_supervised) binary labels
+        n_supervised: number of supervised features
+
+    Returns:
+        target_dirs: (n_supervised, d_model) unit-norm target directions
+        raw_norms:   (n_supervised,) norms before normalization (signal strength)
+        counts:      (n_supervised,) number of positive examples per feature
+    """
+    y = y_flat[:, :n_supervised].float()
+    mean_all = x_flat.mean(dim=0)  # (d_model,)
+
+    # Vectorized weighted mean: (y.T @ x) / counts
+    counts = y.sum(dim=0).clamp(min=1)  # (n_sup,)
+    mean_pos = (y.T @ x_flat) / counts.unsqueeze(1)  # (n_sup, d_model)
+
+    directions = mean_pos - mean_all.unsqueeze(0)  # (n_sup, d_model)
+    raw_norms = directions.norm(dim=1)  # (n_sup,)
+
+    # Normalize, zeroing features with no signal
+    valid = raw_norms > 1e-6
+    target_dirs = torch.zeros_like(directions)
+    target_dirs[valid] = directions[valid] / raw_norms[valid].unsqueeze(1)
+
+    return target_dirs, raw_norms, counts
+
+
+def mse_supervision_loss(
+    decoder_weight: torch.Tensor,
+    sup_acts: torch.Tensor,
+    target_dirs: torch.Tensor,
+    activations: torch.Tensor,
+    labels: torch.Tensor,
+    cfg,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Vectorized MSE feature dictionary loss (Makelov et al. 2024).
+
+    Two components:
+      A) Direction loss: cosine alignment of decoder columns to target directions
+      B) Magnitude loss: at positive positions, activation ≈ projection onto target
+
+    Args:
+        decoder_weight: (d_model, n_total) — sae.decoder.weight
+        sup_acts: (batch, n_sup) — supervised latent activations (post-ReLU)
+        target_dirs: (n_sup, d_model) — precomputed target directions
+        activations: (batch, d_model) — input activations
+        labels: (batch, n_sup) — binary labels
+        cfg: Config with direction_loss_weight and magnitude_loss_weight
+
+    Returns:
+        total_loss, direction_loss, magnitude_loss
+    """
+    n_sup = target_dirs.shape[0]
+
+    # A) Direction: push decoder columns toward target directions
+    # decoder_weight[:, :n_sup] is (d_model, n_sup), target_dirs.T is (d_model, n_sup)
+    dec_cols = decoder_weight[:, :n_sup]  # (d_model, n_sup)
+    cosines = (dec_cols * target_dirs.T).sum(dim=0)  # (n_sup,)
+    direction_loss = (1 - cosines).mean()
+
+    # B) Magnitude: at positive positions, sup_act ≈ activation projected onto target
+    target_mag = activations @ target_dirs.T  # (batch, n_sup)
+    mag_err = (sup_acts - target_mag) ** 2  # (batch, n_sup)
+    n_positive = labels.sum().clamp(min=1.0)
+    magnitude_loss = (mag_err * labels).sum() / n_positive
+
+    total = cfg.direction_loss_weight * direction_loss + cfg.magnitude_loss_weight * magnitude_loss
+    return total, direction_loss, magnitude_loss
+
+
 # ── Model ───────────────────────────────────────────────────────────────────
 
 class SupervisedSAE(nn.Module):
@@ -183,7 +263,34 @@ def train_supervised_sae(
         x_test.mean(0, keepdim=True).expand_as(x_test), x_test
     ).item()
 
-    # Class-balanced pos_weight for BCE
+    # v2: Compute target directions for MSE supervision
+    target_dirs = None
+    if cfg.use_mse_supervision:
+        target_dirs, raw_norms, dir_counts = compute_target_directions(
+            x_train, y_train, n_supervised,
+        )
+        # Report target direction quality
+        valid = raw_norms > 1e-6
+        print(f"\n  Target directions: {valid.sum()}/{n_supervised} features have signal")
+        if valid.any():
+            print(f"  Direction norms — min: {raw_norms[valid].min():.4f}, "
+                  f"median: {raw_norms[valid].median():.4f}, "
+                  f"max: {raw_norms[valid].max():.4f}")
+        # Warn about correlated directions
+        if valid.sum() > 1:
+            valid_dirs = target_dirs[valid]
+            pairwise = valid_dirs @ valid_dirs.T
+            pairwise.fill_diagonal_(0)
+            max_sim = pairwise.max().item()
+            if max_sim > 0.8:
+                print(f"  WARNING: max pairwise cosine similarity = {max_sim:.3f} "
+                      f"(>0.8 means correlated features)")
+        target_dirs = target_dirs.to(cfg.device)
+        # Save for evaluation
+        if save_checkpoint:
+            torch.save(target_dirs.cpu(), cfg.target_dirs_path)
+
+    # Class-balanced pos_weight for BCE (used when use_mse_supervision=False)
     pos_counts = y_train.sum(dim=0).clamp(min=1.0)
     neg_counts = y_train.shape[0] - pos_counts
     pos_weight = (neg_counts / pos_counts).clamp(max=100.0).to(cfg.device)
@@ -236,9 +343,14 @@ def train_supervised_sae(
             recon, sup_pre, sup_acts, all_acts = sae(x_b)
 
             loss_recon = F.mse_loss(recon, x_b)
-            loss_sup = F.binary_cross_entropy_with_logits(
-                sup_pre, y_b, pos_weight=pos_weight
-            )
+            if cfg.use_mse_supervision:
+                loss_sup, loss_dir, loss_mag = mse_supervision_loss(
+                    sae.decoder.weight, sup_acts, target_dirs, x_b, y_b, cfg,
+                )
+            else:
+                loss_sup = F.binary_cross_entropy_with_logits(
+                    sup_pre, y_b, pos_weight=pos_weight
+                )
             loss_sparse = all_acts.abs().mean()
             loss_hier = hierarchy_loss(sup_acts, hier_map)
 
@@ -284,11 +396,17 @@ def train_supervised_sae(
             for i in range(0, x_test.shape[0], cfg.batch_size):
                 xv = x_test[i : i + cfg.batch_size].to(cfg.device)
                 yv = y_test[i : i + cfg.batch_size].to(cfg.device)
-                recon_v, sup_pre_v, _, _ = sae(xv)
+                recon_v, sup_pre_v, sup_acts_v, _ = sae(xv)
                 val_recon += F.mse_loss(recon_v, xv).item()
-                val_sup += F.binary_cross_entropy_with_logits(
-                    sup_pre_v, yv, pos_weight=pos_weight
-                ).item()
+                if cfg.use_mse_supervision:
+                    vs, _, _ = mse_supervision_loss(
+                        sae.decoder.weight, sup_acts_v, target_dirs, xv, yv, cfg,
+                    )
+                    val_sup += vs.item()
+                else:
+                    val_sup += F.binary_cross_entropy_with_logits(
+                        sup_pre_v, yv, pos_weight=pos_weight
+                    ).item()
                 val_batches += 1
         sae.train()
         val_r2 = 1.0 - (val_recon / val_batches) / test_baseline_mse
@@ -321,6 +439,7 @@ def train_supervised_sae(
                 "n_supervised": n_supervised,
                 "n_unsupervised": cfg.n_unsupervised,
                 "n_lista_steps": cfg.n_lista_steps,
+                "use_mse_supervision": cfg.use_mse_supervision,
             },
             cfg.checkpoint_config_path,
         )

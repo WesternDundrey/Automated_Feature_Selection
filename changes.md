@@ -4,6 +4,213 @@
 
 ---
 
+## [v4.0] — MSE Feature Dictionary Loss + Local Annotation
+
+**Date:** 2026-03-19
+
+### Motivation
+
+Two fundamental changes to improve both the training objective and annotation scalability:
+
+1. **BCE supervision creates a classification/reconstruction tension.** The trial run showed
+   AUROC 0.938 but F1 0.263 — the latent classified well but the threshold was miscalibrated.
+   BCE says nothing about which direction the decoder should point or how much the latent
+   should activate. MSE feature dictionary supervision (Makelov et al. 2024) resolves this
+   by directly optimizing decoder direction and activation magnitude.
+
+2. **API annotation is expensive and hard to scale.** 5,000 sequences cost ~$13-17 via Claude
+   Haiku. Decomposing annotation into single-feature single-token binary decisions enables
+   use of a local open-source model (~20B) with KV cache reuse, giving 10× more data at
+   zero marginal API cost.
+
+### New: MSE Feature Dictionary Supervision (`train.py`)
+
+Replaces `BCE_balanced(sup_pre, labels)` with `MSE_supervised(decoder_dirs, target_dirs, sup_acts, labels)`.
+
+**Step 1 — Precompute target directions (once, before training):**
+
+For each supervised feature `i`, the target direction is the conditional mean shift:
+```
+d_i = normalize(mean(x | label_i = 1) − mean(x))
+```
+
+This is the Makelov et al. mean feature dictionary formula. `d_i` is the direction in
+residual stream space uniquely associated with concept `i` being present.
+
+Implementation is fully vectorized:
+```python
+counts = labels.sum(dim=0)                           # (n_sup,)
+mean_pos = (labels.T @ activations) / counts          # (n_sup, d_model)
+directions = mean_pos - activations.mean(dim=0)       # (n_sup, d_model)
+target_dirs = directions / directions.norm(dim=1)     # unit-normalized
+```
+
+Single matmul, no Python loop over features.
+
+**Step 2 — Two-component supervision loss during training:**
+
+A) **Direction alignment** — push each decoder column toward its target direction:
+```
+L_dir = mean_k(1 − cos(W_dec[:, k], d_k))
+```
+
+B) **Magnitude alignment** — at positive positions, activation ≈ projection onto target:
+```
+L_mag = Σ (sup_acts[k] − x · d_k)² · labels[k] / Σ labels[k]
+```
+
+Combined: `L_sup = α · L_dir + β · L_mag` (α=1.0, β=0.5 by default)
+
+**Why this is better than BCE:**
+
+| Property | BCE | MSE Feature Dict |
+|----------|-----|-------------------|
+| Tells decoder WHERE to point | No (indirect via reconstruction) | Yes (cosine target) |
+| Tells encoder HOW MUCH to fire | No (only sign of pre-activation) | Yes (projection magnitude) |
+| Threshold tuning | Required (sigmoid > 0.5) | Not needed (continuous) |
+| pos_weight tuning | Required (class imbalance) | Not needed (positive-only) |
+| Gradient signal | Bounded [-1, 1] | Proportional to error |
+| Aligned with reconstruction | Competing objective | Same objective |
+
+The last row is the key insight: with MSE supervision, the decoder column must point toward
+`d_i` because the reconstruction loss ALSO demands this — `d_i` is the direction the concept
+actually occupies in the residual stream. BCE supervision and reconstruction MSE pull in
+different directions; MSE supervision and reconstruction MSE pull in the same direction.
+
+**Backward compatibility:** `use_mse_supervision: bool = True` in config. Set to `False` to
+get legacy BCE behavior. The flag is saved in `supervised_sae_config.pt` so evaluation knows
+which mode was used.
+
+### New: Evaluation Metrics (`evaluate.py`)
+
+**Cosine similarity to target direction** — per-feature `cos(W_dec[:, k], d_k)`. Direct
+measure of whether training converged to the right direction. Values > 0.8 = strong; < 0.5 =
+drifted.
+
+**Fraction of Variance Explained (FVE)** — per-feature measure of how much positive-class
+activation variance lies along the decoder column:
+```
+FVE_k = Σ (proj(x_pos − x̄_pos, dec_k))² / Σ ‖x_pos − x̄_pos‖²
+```
+
+**Fraction of Variance Unexplained (FVU)** — `1 − FVE`. The headline number for v2: lower
+is better. FVU 0.05 means the decoder column captures 95% of the concept's variance.
+
+With MSE supervision, FVE/cosine replace AUROC/F1 as primary metrics. AUROC/F1 are still
+computed for comparison.
+
+### New: Local Model Annotation (`annotate.py`)
+
+Decomposed single-feature single-token annotation:
+
+```
+For each feature:
+  System prompt + feature description (KV-cached)
+  For each (sequence, position):
+    Context: tok1 tok2 >>target_tok<< tok4 ...
+    → logit("1") > logit("0") ? 1 : 0
+```
+
+Two backends:
+
+**vLLM (primary, recommended):** Automatic prefix caching means the system prompt + feature
+description (~60 tokens) is computed once per feature and reused across all sequences/positions.
+vLLM handles scheduling, batching, and KV cache management internally. Throughput: 10K–50K
+decisions/sec on H100. Install: `pip install vllm`.
+
+**HuggingFace transformers (fallback):** Uses logit comparison (`logit["1"] > logit["0"]`)
+instead of `generate()` for speed, but re-processes the full prompt on every call — no prefix
+caching. Left-padded batching ensures last-position logit extraction works correctly.
+Throughput: ~500–2K decisions/sec. 10–50x slower than vLLM. Prints a warning at startup.
+
+**Config:**
+- `use_local_annotator: bool = False` (API by default, for backward compatibility)
+- `local_annotator_model: str = "mistralai/Mistral-Small-24B-Instruct-2501"`
+- `local_annotation_batch_size: int = 64`
+
+### New: Ablation Variant (`ablation.py`)
+
+Added `mse_vs_bce` / `bce_supervision` variant — trains the same architecture with the
+opposite supervision method. Direct comparison of MSE vs BCE on identical data.
+
+### Files Changed
+
+| File | Changes |
+|------|---------|
+| `pipeline/config.py` | 6 new fields (MSE supervision, local annotation), `target_dirs_path` |
+| `pipeline/train.py` | `compute_target_directions()`, `mse_supervision_loss()`, training/validation loop branching |
+| `pipeline/evaluate.py` | Section 4b: cosine similarity, FVE, FVU per feature |
+| `pipeline/annotate.py` | `annotate_local()`, `_format_annotator_context()`, routing in `run()` |
+| `pipeline/ablation.py` | MSE vs BCE ablation variant |
+
+### What Did NOT Change
+
+- SupervisedSAE architecture (split latent space, encoder/decoder, LISTA)
+- Reconstruction loss: `MSE(x̂, x)` — unchanged
+- Sparsity loss: `L1(acts)` — unchanged
+- Hierarchy loss — unchanged
+- Decoder normalization — unchanged
+- API annotation path — fully preserved behind `use_local_annotator=False`
+- Causal validation (step 8) — unchanged
+- All v1 evaluation metrics (R², F1, AUROC, L0, hierarchy) — still computed
+
+---
+
+## [v3.5] — Causal Validation (Zero-Ablation)
+
+**Date:** 2026-03-18
+
+### Motivation
+
+The pipeline measures detection (F1/AUROC) and reconstruction (R²), but never asks:
+"if I zero-ablate the `german_text` latent, does the model stop producing German?"
+A linear probe can detect; only the SAE can intervene. Causal validation is the
+experiment that separates a supervised SAE from a supervised linear probe.
+
+### New Step: Causal Validation (`causal.py`)
+
+For each supervised latent k, measures whether zeroing that latent's contribution
+to the SAE reconstruction changes the model's output distribution:
+
+**Protocol:**
+1. Run the base model with SAE reconstruction at the target layer (baseline).
+   A hook replaces the residual stream with `x̂ = W_dec · acts + b_dec`.
+2. For each supervised latent k, run the same forward pass but subtract
+   latent k's contribution: `x̂_ablated = x̂ − acts_k · W_dec[k, :]`.
+3. Compute KL divergence between baseline and ablated output distributions
+   at every token position: `KL(p_baseline ‖ p_ablated)`.
+4. Report mean KL at **firing positions** (where `acts_k > 0`) vs all positions.
+
+**Metrics per feature:**
+| Metric | Formula | Interpretation |
+|--------|---------|----------------|
+| `mean_kl_firing` | `Σ KL[fires] / n_fires` | Causal effect when the feature is active |
+| `mean_kl_all` | `Σ KL / n_total` | Average causal effect across all positions |
+| `max_kl` | `max(KL[fires])` | Strongest single-position effect |
+| `specificity` | `mean_kl_firing / mean_kl_all` | How targeted the effect is (higher = more specific) |
+
+A large `mean_kl_firing` means the latent causally affects model output when it
+fires. A near-zero value means the latent is "decorative" — it detects a pattern
+but doesn't influence computation. High specificity means the effect is concentrated
+at firing positions rather than spread everywhere (which would indicate the latent
+is entangled with a broad reconstruction component).
+
+**Computational cost:** Each of n_supervised features requires a separate forward
+pass per batch. With 86 features × 50 sequences × 4 batch size = ~1,075 forward
+passes. This is why `causal_n_sequences` defaults to 50 (vs 5000 for training).
+
+**Files:**
+- `pipeline/causal.py` — New. Full implementation of zero-ablation protocol.
+- `pipeline/config.py` — `causal_n_sequences: int = 50`, `causal_batch_size: int = 4`,
+  `causal_path` property.
+- `pipeline/run.py` — Registered as `--step causal` (Step 8, optional).
+
+**Output:** `pipeline_data/causal.json` with per-feature results and summary.
+
+CLI: `python -m pipeline.run --step causal`
+
+---
+
 ## [v3.4] — Sparse Feature Filtering + Baseline Comparisons
 
 **Date:** 2026-03-16

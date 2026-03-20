@@ -59,6 +59,16 @@ class Config:
     seed: int = 42
     n_lista_steps: int = 0  # LISTA refinement iterations (0 = disabled)
 
+    # ── v2: MSE feature dictionary supervision (Makelov et al. 2024) ──
+    use_mse_supervision: bool = True    # False = legacy BCE mode
+    direction_loss_weight: float = 1.0  # α: decoder direction alignment
+    magnitude_loss_weight: float = 0.5  # β: activation magnitude alignment
+
+    # ── v2: Local model annotation ────────────────────────────────
+    use_local_annotator: bool = False   # True = local model, False = API
+    local_annotator_model: str = "mistralai/Mistral-Small-24B-Instruct-2501"
+    local_annotation_batch_size: int = 64
+
     # ── Feature filtering ──────────────────────────────────────
     min_feature_positive_rate: float = 0.0  # disabled by default (rare features are intentional)
 
@@ -69,6 +79,10 @@ class Config:
     # ── Inter-annotator agreement ────────────────────────────────
     agreement_n_sequences: int = 100
     agreement_n_reruns: int = 2  # number of independent annotation passes
+
+    # ── Causal validation ────────────────────────────────────────
+    causal_n_sequences: int = 50  # small — each needs n_features forward passes
+    causal_batch_size: int = 4
 
     # ── Explain-the-residual ─────────────────────────────────────
     residual_n_samples: int = 500
@@ -140,6 +154,14 @@ class Config:
     @property
     def residual_path(self) -> Path:
         return self.output_dir / "residual_features.json"
+
+    @property
+    def causal_path(self) -> Path:
+        return self.output_dir / "causal.json"
+
+    @property
+    def target_dirs_path(self) -> Path:
+        return self.output_dir / "target_directions.pt"
 
     @property
     def split_path(self) -> Path:

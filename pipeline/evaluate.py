@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from .config import Config
-from .train import SupervisedSAE, build_hierarchy_map, set_seed
+from .train import SupervisedSAE, build_hierarchy_map, compute_target_directions, set_seed
 
 
 def precision_recall_f1(y_true: np.ndarray, y_pred: np.ndarray):
@@ -220,6 +220,97 @@ def evaluate(cfg: Config = None):
                 "consistency": round(consistent, 4),
             })
 
+    # ── 4b. MSE supervision metrics (v2) ─────────────────────────────
+    use_mse = model_cfg.get("use_mse_supervision", False)
+    cosine_results = []
+    fve_results = []
+    mean_cosine = None
+    mean_fve = None
+    mean_fvu = None
+
+    if use_mse:
+        print("\n" + "=" * 70)
+        print("MSE FEATURE DICTIONARY METRICS (v2)")
+
+        # Load or recompute target directions
+        if cfg.target_dirs_path.exists():
+            target_dirs = torch.load(cfg.target_dirs_path, weights_only=True)
+        else:
+            print("  Target directions not found on disk, recomputing from train split...")
+            train_idx = perm[:split_idx]
+            target_dirs, _, _ = compute_target_directions(
+                x_flat[train_idx], y_flat[train_idx], n_features,
+            )
+
+        # Per-feature cosine similarity: cos(decoder_col_i, target_dir_i)
+        dec_weight = sae.decoder.weight.cpu()  # (d_model, n_total)
+        dec_cols = dec_weight[:, :n_features]  # (d_model, n_features)
+        cosines_all = (dec_cols * target_dirs.T).sum(dim=0)  # (n_features,)
+
+        # Per-feature FVE: fraction of variance in positive-class activations
+        # explained by the decoder column direction
+        print(f"\n  {'Feature':<36} {'Cos':>7} {'FVE':>7} {'FVU':>7} {'Pos':>8}")
+        print("  " + "-" * 69)
+
+        cosine_vals = []
+        fve_vals = []
+
+        for k, feat in enumerate(features):
+            pos_mask = gt[:, k]
+            n_pos = int(pos_mask.sum())
+            cos_k = cosines_all[k].item()
+
+            if n_pos < 2:
+                cosine_results.append({
+                    "id": feat["id"], "cosine": round(cos_k, 4),
+                    "fve": None, "fvu": None, "n_positives": n_pos,
+                })
+                fve_results.append({"id": feat["id"], "fve": None, "fvu": None})
+                print(f"  {feat['id']:<36} {cos_k:>7.4f} {'--':>7} {'--':>7} {n_pos:>8}")
+                continue
+
+            # FVE: fraction of positive-class variance along decoder direction
+            pos_acts = x_test[pos_mask]
+            pos_centered = pos_acts - pos_acts.mean(dim=0)
+            total_var = (pos_centered ** 2).sum().item()
+
+            if total_var < 1e-10:
+                fve_k = 0.0
+            else:
+                dec_dir = dec_cols[:, k]
+                dec_dir_unit = dec_dir / dec_dir.norm().clamp(min=1e-8)
+                projections = pos_centered @ dec_dir_unit  # (n_pos,)
+                explained = (projections ** 2).sum().item()
+                fve_k = explained / total_var
+
+            fvu_k = 1.0 - fve_k
+            cosine_vals.append(cos_k)
+            fve_vals.append(fve_k)
+            tag = " [G]" if feat["type"] == "group" else ""
+            print(f"  {feat['id']:<36} {cos_k:>7.4f} {fve_k:>7.4f} {fvu_k:>7.4f} {n_pos:>8}{tag}")
+
+            cosine_results.append({
+                "id": feat["id"], "cosine": round(cos_k, 4),
+                "fve": round(fve_k, 4), "fvu": round(fvu_k, 4),
+                "n_positives": n_pos,
+            })
+            fve_results.append({
+                "id": feat["id"], "fve": round(fve_k, 4), "fvu": round(fvu_k, 4),
+            })
+
+        if cosine_vals:
+            mean_cosine = float(np.mean(cosine_vals))
+            mean_fve = float(np.mean(fve_vals))
+            mean_fvu = 1.0 - mean_fve
+            print(f"\n  Mean cosine to target:          {mean_cosine:.4f}")
+            print(f"  Mean FVE (decoder direction):   {mean_fve:.4f}")
+            print(f"  Mean FVU (fraction unexplained): {mean_fvu:.4f}")
+
+            high_cos = sum(1 for c in cosine_vals if c > 0.8)
+            low_cos = sum(1 for c in cosine_vals if c < 0.5)
+            print(f"  Features with cosine > 0.8: {high_cos}/{len(cosine_vals)}")
+            print(f"  Features with cosine < 0.5: {low_cos}/{len(cosine_vals)}")
+
     # ── 5. Linear probe baseline ─────────────────────────────────────
     print("\n" + "=" * 70)
     print("LINEAR PROBE BASELINE (same train/test split)")
@@ -405,6 +496,12 @@ def evaluate(cfg: Config = None):
         "features": feature_results,
         "mean_f1": mean_f1,
         "mean_auroc": mean_auroc,
+        "mse_supervision_metrics": {
+            "mean_cosine_to_target": mean_cosine,
+            "mean_fve": mean_fve,
+            "mean_fvu": mean_fvu,
+            "per_feature": cosine_results,
+        } if use_mse else None,
         "probe_baseline": {
             "mean_f1": probe_mean_f1,
             "mean_auroc": probe_mean_auroc,

@@ -34,10 +34,16 @@ def main():
     parser.add_argument("--device", default=None, help="Device (cuda/cpu)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--lista", type=int, default=None, help="LISTA refinement steps")
+    parser.add_argument("--local-annotator", action="store_true",
+                        help="Use local model for annotation instead of API")
+    parser.add_argument("--annotator-model", default=None,
+                        help="Local annotator model (default: Mistral-Small-24B)")
+    parser.add_argument("--no-mse", action="store_true",
+                        help="Use legacy BCE supervision instead of MSE")
     parser.add_argument(
         "--step", default=None,
         choices=["inventory", "annotate", "train", "evaluate",
-                 "agreement", "ablation", "residual"],
+                 "agreement", "ablation", "residual", "causal"],
         help="Run only this step",
     )
     args = parser.parse_args()
@@ -67,6 +73,12 @@ def main():
         overrides["seed"] = args.seed
     if args.lista is not None:
         overrides["n_lista_steps"] = args.lista
+    if args.local_annotator:
+        overrides["use_local_annotator"] = True
+    if args.annotator_model:
+        overrides["local_annotator_model"] = args.annotator_model
+    if args.no_mse:
+        overrides["use_mse_supervision"] = False
 
     cfg = Config(**overrides)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -153,6 +165,16 @@ def main():
         from .residual import run as run_residual
         run_residual(cfg)
         print(f"Step 7 completed in {time.time() - t0:.1f}s")
+
+    # Step 8: Causal validation (optional, run with --step causal)
+    if args.step == "causal":
+        print("\n" + "=" * 70)
+        print("STEP 8: CAUSAL VALIDATION")
+        print("=" * 70)
+        t0 = time.time()
+        from .causal import run as run_causal
+        run_causal(cfg)
+        print(f"Step 8 completed in {time.time() - t0:.1f}s")
 
     print(f"\nTotal pipeline time: {time.time() - t_total:.1f}s")
 

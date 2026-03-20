@@ -309,6 +309,232 @@ def annotate_corpus(
     )
 
 
+# ── v2: Local model annotation (decomposed single-feature single-token) ───
+
+def _format_annotator_context(token_strs: list[str], target_pos: int) -> str:
+    """Format a token sequence with the target token marked by >><<."""
+    parts = []
+    for i, t in enumerate(token_strs):
+        if i == target_pos:
+            parts.append(f">>{t}<<")
+        else:
+            parts.append(t)
+    return "".join(parts)
+
+
+def annotate_local(
+    tokens: torch.Tensor,
+    features: list[dict],
+    base_tokenizer,
+    cfg: Config,
+) -> torch.Tensor:
+    """Decomposed single-feature single-token annotation with a local model.
+
+    For each (feature, sequence, position), the model sees:
+        System: You are a feature annotator...
+        Feature: <description>
+        Context: tok1 tok2 >>target_tok<< tok4 ...
+        Answer:
+    And outputs a single token: "0" or "1".
+
+    Uses vLLM with prefix caching (primary) for 10K-50K decisions/sec throughput.
+    Falls back to HuggingFace transformers if vLLM is unavailable (~500-2K/sec).
+    """
+    N, T = tokens.shape
+    n_features = len(features)
+
+    # Decode all tokens to strings once
+    print("Decoding tokens to strings...")
+    all_token_strs = []
+    for i in range(N):
+        strs = [base_tokenizer.decode([t]) for t in tokens[i].tolist()]
+        all_token_strs.append(strs)
+
+    try:
+        from vllm import LLM, SamplingParams
+        return _annotate_local_vllm(
+            tokens, features, all_token_strs, n_features, N, T, cfg,
+        )
+    except ImportError:
+        print("WARNING: vLLM not installed. Falling back to HuggingFace transformers.")
+        print("  This is 10-50x slower than vLLM due to no prefix caching.")
+        print("  Install vLLM for production throughput: pip install vllm")
+        return _annotate_local_hf(
+            tokens, features, all_token_strs, n_features, N, T, cfg,
+        )
+
+
+def _annotate_local_vllm(
+    tokens: torch.Tensor,
+    features: list[dict],
+    all_token_strs: list[list[str]],
+    n_features: int,
+    N: int,
+    T: int,
+    cfg: Config,
+) -> torch.Tensor:
+    """vLLM backend with automatic prefix caching.
+
+    For a given feature, all prompts share the same system prefix (~60 tokens).
+    vLLM detects this at the token level and caches the KV states, so only the
+    per-(sequence, position) context needs to be computed for each decision.
+    """
+    from vllm import LLM, SamplingParams
+
+    print(f"Loading local annotator via vLLM: {cfg.local_annotator_model}")
+    llm = LLM(
+        model=cfg.local_annotator_model,
+        dtype="bfloat16",
+        enable_prefix_caching=True,
+        max_model_len=512,
+    )
+    params = SamplingParams(max_tokens=1, temperature=0)
+
+    annotations = torch.zeros(N, T, n_features)
+    total_decisions = n_features * N * T
+    completed = 0
+    t_start = time.time()
+
+    # Chunk size: how many sequences to batch per vLLM call per feature.
+    # Each sequence produces T prompts, so chunk_size=500 → 64K prompts per call.
+    seq_chunk = max(1, 500_000 // T)  # aim for ~500K prompts per vLLM batch
+
+    print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
+          f"= {total_decisions:,} decisions (vLLM, prefix caching enabled)")
+
+    for fi, feat in enumerate(features):
+        system = (
+            "You are a feature annotator. You see a token highlighted "
+            "with >>token<< in context.\n"
+            f"Feature: {feat['description']}\n"
+            "Does the feature activate at the marked token? "
+            "Answer ONLY 0 or 1.\n\nContext: "
+        )
+
+        for seq_start in range(0, N, seq_chunk):
+            seq_end = min(seq_start + seq_chunk, N)
+
+            # Build all prompts for this chunk: (seq_end - seq_start) * T prompts
+            prompts = []
+            positions = []
+            for seq_j in range(seq_start, seq_end):
+                for tok_k in range(T):
+                    ctx = _format_annotator_context(all_token_strs[seq_j], tok_k)
+                    prompts.append(f"{system}{ctx}\n\nAnswer:")
+                    positions.append((seq_j, tok_k))
+
+            # vLLM processes all prompts with automatic scheduling and prefix caching
+            outputs = llm.generate(prompts, params)
+
+            for idx, output in enumerate(outputs):
+                seq_j, tok_k = positions[idx]
+                token_text = output.outputs[0].text.strip()
+                annotations[seq_j, tok_k, fi] = 1.0 if token_text.startswith("1") else 0.0
+
+            completed += len(prompts)
+
+        elapsed_total = time.time() - t_start
+        rate = completed / elapsed_total if elapsed_total > 0 else 0
+        eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
+        n_pos = int(annotations[:, :, fi].sum().item())
+        print(f"  [{fi+1}/{n_features}] {feat['id']:<36} "
+              f"pos={n_pos:>6} rate={rate:.0f}/s  "
+              f"ETA {eta_sec/3600:.1f}h")
+
+    del llm
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    return annotations
+
+
+def _annotate_local_hf(
+    tokens: torch.Tensor,
+    features: list[dict],
+    all_token_strs: list[list[str]],
+    n_features: int,
+    N: int,
+    T: int,
+    cfg: Config,
+) -> torch.Tensor:
+    """HuggingFace transformers fallback (no prefix caching).
+
+    Uses logit comparison (token "1" vs "0") instead of generate() for speed,
+    but re-processes the full prompt for every decision. 10-50x slower than vLLM.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    print(f"Loading local annotator via transformers: {cfg.local_annotator_model}")
+    ann_tokenizer = AutoTokenizer.from_pretrained(cfg.local_annotator_model)
+    ann_model = AutoModelForCausalLM.from_pretrained(
+        cfg.local_annotator_model,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+    ann_model.eval()
+
+    if ann_tokenizer.pad_token is None:
+        ann_tokenizer.pad_token = ann_tokenizer.eos_token
+    ann_tokenizer.padding_side = "left"
+
+    tok_0 = ann_tokenizer.encode("0", add_special_tokens=False)[0]
+    tok_1 = ann_tokenizer.encode("1", add_special_tokens=False)[0]
+
+    annotations = torch.zeros(N, T, n_features)
+    batch_size = cfg.local_annotation_batch_size
+    total_decisions = n_features * N * T
+    completed = 0
+    t_start = time.time()
+
+    print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
+          f"= {total_decisions:,} decisions (HF transformers, no prefix caching)")
+
+    for fi, feat in enumerate(features):
+        system = (
+            "You are a feature annotator. You see a token highlighted "
+            "with >>token<< in context.\n"
+            f"Feature: {feat['description']}\n"
+            "Does the feature activate at the marked token? "
+            "Answer ONLY 0 or 1."
+        )
+
+        for seq_start in range(0, N, batch_size):
+            seq_end = min(seq_start + batch_size, N)
+            batch_seqs = list(range(seq_start, seq_end))
+
+            for tok_k in range(T):
+                prompts = []
+                for seq_j in batch_seqs:
+                    ctx = _format_annotator_context(all_token_strs[seq_j], tok_k)
+                    prompts.append(f"{system}\n\nContext: {ctx}\n\nAnswer:")
+
+                inputs = ann_tokenizer(
+                    prompts, return_tensors="pt", padding=True,
+                    truncation=True, max_length=512,
+                )
+                inputs = {k: v.to(ann_model.device) for k, v in inputs.items()}
+
+                with torch.no_grad():
+                    outputs = ann_model(**inputs)
+                    last_logits = outputs.logits[:, -1, :]
+                    labels = (last_logits[:, tok_1] > last_logits[:, tok_0]).float()
+
+                for j, seq_j in enumerate(batch_seqs):
+                    annotations[seq_j, tok_k, fi] = labels[j].item()
+
+                completed += len(batch_seqs)
+
+        elapsed_total = time.time() - t_start
+        rate = completed / elapsed_total if elapsed_total > 0 else 0
+        eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
+        n_pos = int(annotations[:, :, fi].sum().item())
+        print(f"  [{fi+1}/{n_features}] {feat['id']:<36} "
+              f"pos={n_pos:>6} rate={rate:.0f}/s  "
+              f"ETA {eta_sec/3600:.1f}h")
+
+    del ann_model
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    return annotations
+
+
 # ── Propagate group labels ──────────────────────────────────────────────────
 
 def filter_sparse_features(
@@ -458,8 +684,12 @@ def run(cfg: Config = None):
         print(f"Loading cached annotations: {cfg.annotations_path}")
         annotations = torch.load(cfg.annotations_path, weights_only=True)
     else:
-        # Only annotate leaf features (groups are derived via propagation)
-        leaf_annotations = annotate_corpus(tokens, leaf_features, tokenizer_ref, cfg)
+        if cfg.use_local_annotator:
+            # v2: Decomposed single-feature single-token with local model
+            leaf_annotations = annotate_local(tokens, leaf_features, tokenizer_ref, cfg)
+        else:
+            # v1: API-based multi-feature annotation
+            leaf_annotations = annotate_corpus(tokens, leaf_features, tokenizer_ref, cfg)
         # Map leaf annotations back to full feature tensor
         N_tok, T_tok = tokens.shape
         annotations = torch.zeros(N_tok, T_tok, len(features))
