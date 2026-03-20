@@ -37,7 +37,7 @@ def main():
     parser.add_argument("--local-annotator", action="store_true",
                         help="Use local model for annotation instead of API")
     parser.add_argument("--annotator-model", default=None,
-                        help="Local annotator model (default: gpt-oss:20b)")
+                        help="Local annotator model (default: gpt-oss:20b for Ollama, use HF ID for vllm/hf)")
     parser.add_argument("--annotator-backend", default=None,
                         choices=["ollama", "vllm", "hf"],
                         help="Local annotator backend (default: ollama)")

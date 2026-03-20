@@ -394,8 +394,9 @@ async def _ollama_annotate_batch(
         annotations[seq_j, tok_k, fi] = label
 
 
-async def _ollama_single(session, semaphore, model, system, context, url):
-    """Single annotation call to Ollama. Returns 0.0 or 1.0."""
+async def _ollama_single(session, semaphore, model, system, context, url,
+                         max_retries=3, base_delay=0.5):
+    """Single annotation call to Ollama with retry. Returns 0.0 or 1.0."""
     async with semaphore:
         payload = {
             "model": model,
@@ -406,13 +407,18 @@ async def _ollama_single(session, semaphore, model, system, context, url):
             "stream": False,
             "options": {"num_predict": 1, "temperature": 0},
         }
-        try:
-            async with session.post(f"{url}/api/chat", json=payload) as resp:
-                data = await resp.json()
-                text = data["message"]["content"].strip()
-                return 1.0 if text.startswith("1") else 0.0
-        except Exception:
-            return 0.0  # safe default on failure
+        for attempt in range(max_retries):
+            try:
+                async with session.post(f"{url}/api/chat", json=payload) as resp:
+                    data = await resp.json()
+                    text = data["message"]["content"].strip()
+                    return 1.0 if text.startswith("1") else 0.0
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(base_delay * (2 ** attempt))
+                else:
+                    logger.warning("Ollama annotation failed after %d retries: %s", max_retries, e)
+                    return 0.0
 
 
 def _annotate_local_ollama(
@@ -445,44 +451,42 @@ def _annotate_local_ollama(
 
     wave_size = 5000  # process this many (seq, pos) pairs per async wave
 
-    async def process_feature(fi, feat):
+    async def run_all():
         nonlocal completed
-        system = (
-            "You are a feature annotator. "
-            f"Feature: {feat['description']}\n"
-            "Output only 0 or 1. No other text."
-        )
         semaphore = asyncio.Semaphore(cfg.local_annotation_concurrency)
 
         async with aiohttp.ClientSession() as session:
-            # Build all (seq, pos) pairs for this feature
-            all_positions = [
-                (seq_j, tok_k)
-                for seq_j in range(N)
-                for tok_k in range(T)
-            ]
-
-            # Process in waves to limit memory
-            for wave_start in range(0, len(all_positions), wave_size):
-                wave = all_positions[wave_start:wave_start + wave_size]
-                await _ollama_annotate_batch(
-                    session, semaphore, cfg.local_annotator_model,
-                    system, all_token_strs, wave, annotations, fi,
-                    cfg.ollama_url,
+            for fi, feat in enumerate(features):
+                system = (
+                    "You are a feature annotator. "
+                    f"Feature: {feat['description']}\n"
+                    "Output only 0 or 1. No other text."
                 )
-                completed += len(wave)
 
-        elapsed = time.time() - t_start
-        rate = completed / elapsed if elapsed > 0 else 0
-        eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
-        n_pos = int(annotations[:, :, fi].sum().item())
-        print(f"  [{fi+1}/{n_features}] {feat['id']:<36} "
-              f"pos={n_pos:>6} rate={rate:.0f}/s  "
-              f"ETA {eta_sec/3600:.1f}h")
+                # Build all (seq, pos) pairs for this feature
+                all_positions = [
+                    (seq_j, tok_k)
+                    for seq_j in range(N)
+                    for tok_k in range(T)
+                ]
 
-    async def run_all():
-        for fi, feat in enumerate(features):
-            await process_feature(fi, feat)
+                # Process in waves to limit memory
+                for wave_start in range(0, len(all_positions), wave_size):
+                    wave = all_positions[wave_start:wave_start + wave_size]
+                    await _ollama_annotate_batch(
+                        session, semaphore, cfg.local_annotator_model,
+                        system, all_token_strs, wave, annotations, fi,
+                        cfg.ollama_url,
+                    )
+                    completed += len(wave)
+
+                elapsed = time.time() - t_start
+                rate = completed / elapsed if elapsed > 0 else 0
+                eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
+                n_pos = int(annotations[:, :, fi].sum().item())
+                print(f"  [{fi+1}/{n_features}] {feat['id']:<36} "
+                      f"pos={n_pos:>6} rate={rate:.0f}/s  "
+                      f"ETA {eta_sec/3600:.1f}h")
 
     asyncio.run(run_all())
     return annotations
@@ -502,8 +506,17 @@ def _annotate_local_vllm(
     For a given feature, all prompts share the same system prefix (~60 tokens).
     vLLM detects this at the token level and caches the KV states, so only the
     per-(sequence, position) context needs to be computed for each decision.
+
+    NOTE: cfg.local_annotator_model must be a HuggingFace model ID (e.g.,
+    "openai/gpt-oss-20b"), not an Ollama tag. Use --annotator-model to override.
     """
-    from vllm import LLM, SamplingParams
+    try:
+        from vllm import LLM, SamplingParams
+    except ImportError:
+        raise ImportError(
+            "vLLM not installed. Install with: pip install vllm\n"
+            "Or use --annotator-backend ollama (default, no extra install)."
+        )
 
     print(f"Loading local annotator via vLLM: {cfg.local_annotator_model}")
     llm = LLM(
@@ -583,6 +596,9 @@ def _annotate_local_hf(
 
     Uses logit comparison (token "1" vs "0") instead of generate() for speed,
     but re-processes the full prompt for every decision. 10-50x slower than vLLM.
+
+    NOTE: cfg.local_annotator_model must be a HuggingFace model ID (e.g.,
+    "openai/gpt-oss-20b"), not an Ollama tag. Use --annotator-model to override.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
