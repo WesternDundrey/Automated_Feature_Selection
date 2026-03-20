@@ -66,8 +66,11 @@ class Config:
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API
-    local_annotator_model: str = "openai/gpt-oss-20b"
-    local_annotation_batch_size: int = 64
+    local_annotator_model: str = "gpt-oss:20b"  # Ollama model name
+    local_annotator_backend: str = "ollama"      # ollama, vllm, or hf
+    ollama_url: str = "http://localhost:11434"
+    local_annotation_concurrency: int = 32       # concurrent Ollama requests
+    local_annotation_batch_size: int = 64        # batch size for vLLM/HF fallback
 
     # ── Feature filtering ──────────────────────────────────────
     min_feature_positive_rate: float = 0.0  # disabled by default (rare features are intentional)

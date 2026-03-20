@@ -105,28 +105,37 @@ Decomposed single-feature single-token annotation:
 
 ```
 For each feature:
-  System prompt + feature description (KV-cached)
+  System: "You are a feature annotator. Feature: {desc}. Output only 0 or 1."
   For each (sequence, position):
     Context: tok1 tok2 >>target_tok<< tok4 ...
-    → logit("1") > logit("0") ? 1 : 0
+    → model outputs "0" or "1"
 ```
 
-Two backends:
+Three backends (selected via `--annotator-backend`):
 
-**vLLM (primary, recommended):** Automatic prefix caching means the system prompt + feature
-description (~60 tokens) is computed once per feature and reused across all sequences/positions.
-vLLM handles scheduling, batching, and KV cache management internally. Throughput: 10K–50K
-decisions/sec on H100. Install: `pip install vllm`.
+**Ollama (default):** HTTP calls to local Ollama server (`localhost:11434`). Ollama handles
+quantization (MXFP4 for gpt-oss:20b — 21B total params, 3.6B active per token, fits in 16GB),
+KV caching, and continuous batching out of the box. Async concurrent requests via `aiohttp`.
+No model loading logic in Python, no CUDA memory management, no tokenizer fiddling.
 
-**HuggingFace transformers (fallback):** Uses logit comparison (`logit["1"] > logit["0"]`)
-instead of `generate()` for speed, but re-processes the full prompt on every call — no prefix
-caching. Left-padded batching ensures last-position logit extraction works correctly.
-Throughput: ~500–2K decisions/sec. 10–50x slower than vLLM. Prints a warning at startup.
+**vLLM:** Offline batch inference with automatic prefix caching. Best raw throughput
+(10K–50K decisions/sec on H100). System prompt + feature description cached across all
+sequences/positions for a given feature.
+
+**HuggingFace transformers:** Logit comparison (`logit["1"] > logit["0"]`) fallback.
+No prefix caching. Slowest (~500–2K decisions/sec).
+
+**Default annotator model:** `gpt-oss:20b` (OpenAI, Apache 2.0). MoE architecture,
+only 3.6B active params per token. For the trivially simple binary annotation task
+(single feature, single token, full context), reasoning is unnecessary — system prompt
+explicitly suppresses chain-of-thought: "Output only 0 or 1. No other text."
 
 **Config:**
-- `use_local_annotator: bool = False` (API by default, for backward compatibility)
-- `local_annotator_model: str = "mistralai/Mistral-Small-24B-Instruct-2501"`
-- `local_annotation_batch_size: int = 64`
+- `use_local_annotator: bool = False` (API by default)
+- `local_annotator_model: str = "gpt-oss:20b"` (Ollama model name)
+- `local_annotator_backend: str = "ollama"` (ollama, vllm, or hf)
+- `ollama_url: str = "http://localhost:11434"`
+- `local_annotation_concurrency: int = 32`
 
 ### New: Ablation Variant (`ablation.py`)
 
