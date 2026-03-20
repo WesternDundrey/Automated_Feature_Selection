@@ -66,7 +66,7 @@ class Config:
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API
-    local_annotator_model: str = "mistralai/Mistral-Small-24B-Instruct-2501"
+    local_annotator_model: str = "openai/gpt-oss-20b"
     local_annotation_batch_size: int = 64
 
     # ── Feature filtering ──────────────────────────────────────
