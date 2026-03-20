@@ -375,7 +375,22 @@ def _annotate_local_vllm(
     T: int,
     cfg: Config,
 ) -> torch.Tensor:
-    """vLLM backend with automatic prefix caching."""
+    """vLLM backend with incremental prompts and prefix caching.
+
+    Throughput optimization: for a given (feature, sequence), position k's
+    prompt is a PREFIX of position k+1's prompt. vLLM caches the KV states
+    for the shared prefix, so each position only computes ~3-4 new tokens
+    instead of the full ~190 token prompt.
+
+    Prompt structure (position k shows tokens 0..k, annotates the LAST token):
+      "Feature: {desc}. 0 or 1 for LAST token.\nThe quick brown\nAnswer:"
+      "Feature: {desc}. 0 or 1 for LAST token.\nThe quick brown fox\nAnswer:"
+
+    Cache hierarchy:
+      Level 1: feature prefix (~40 tokens) — shared across all 50K×128 prompts
+      Level 2: + sequence tokens up to position k (~k tokens) — grows by 1 per step
+      Variable: just the new token + "\\nAnswer:" (~3 tokens)
+    """
     from vllm import LLM, SamplingParams
 
     print(f"Loading local annotator via vLLM: {cfg.local_annotator_model}")
@@ -392,35 +407,36 @@ def _annotate_local_vllm(
     completed = 0
     t_start = time.time()
 
-    # Chunk size: how many sequences to batch per vLLM call per feature.
-    # Each sequence produces T prompts, so chunk_size=500 → 64K prompts per call.
-    seq_chunk = max(1, 500_000 // T)  # aim for ~500K prompts per vLLM batch
+    # Chunk by sequences. Each sequence produces T incremental prompts.
+    seq_chunk = max(1, 200_000 // T)
 
     print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
-          f"= {total_decisions:,} decisions (vLLM, prefix caching enabled)")
+          f"= {total_decisions:,} decisions (vLLM, incremental prefix caching)")
 
     for fi, feat in enumerate(features):
-        system = (
-            "You are a feature annotator. You see a token highlighted "
-            "with >>token<< in context.\n"
+        # Feature prefix — cached across ALL prompts for this feature
+        feat_prefix = (
+            "You are a feature annotator. "
             f"Feature: {feat['description']}\n"
-            "Does the feature activate at the marked token? "
-            "Answer ONLY 0 or 1.\n\nContext: "
+            "Output only 0 or 1. 1 if the feature activates at the LAST token.\n\n"
         )
 
         for seq_start in range(0, N, seq_chunk):
             seq_end = min(seq_start + seq_chunk, N)
 
-            # Build all prompts for this chunk: (seq_end - seq_start) * T prompts
             prompts = []
             positions = []
+
             for seq_j in range(seq_start, seq_end):
+                # Build incremental prompts: position k shows tokens[0:k+1]
+                # Position k's prompt is a prefix of position k+1's prompt
+                # so vLLM reuses the KV cache, computing only ~3 new tokens/step
+                running = feat_prefix
                 for tok_k in range(T):
-                    ctx = _format_annotator_context(all_token_strs[seq_j], tok_k)
-                    prompts.append(f"{system}{ctx}\n\nAnswer:")
+                    running += all_token_strs[seq_j][tok_k]
+                    prompts.append(running + "\nAnswer:")
                     positions.append((seq_j, tok_k))
 
-            # vLLM processes all prompts with automatic scheduling and prefix caching
             outputs = llm.generate(prompts, params)
 
             for idx, output in enumerate(outputs):
@@ -485,12 +501,10 @@ def _annotate_local_hf(
           f"= {total_decisions:,} decisions (HF transformers, no prefix caching)")
 
     for fi, feat in enumerate(features):
-        system = (
-            "You are a feature annotator. You see a token highlighted "
-            "with >>token<< in context.\n"
+        feat_prefix = (
+            "You are a feature annotator. "
             f"Feature: {feat['description']}\n"
-            "Does the feature activate at the marked token? "
-            "Answer ONLY 0 or 1."
+            "Output only 0 or 1. 1 if the feature activates at the LAST token.\n\n"
         )
 
         for seq_start in range(0, N, batch_size):
@@ -500,8 +514,9 @@ def _annotate_local_hf(
             for tok_k in range(T):
                 prompts = []
                 for seq_j in batch_seqs:
-                    ctx = _format_annotator_context(all_token_strs[seq_j], tok_k)
-                    prompts.append(f"{system}\n\nContext: {ctx}\n\nAnswer:")
+                    # Incremental: show tokens 0..tok_k, annotate the last
+                    context = "".join(all_token_strs[seq_j][:tok_k + 1])
+                    prompts.append(f"{feat_prefix}{context}\nAnswer:")
 
                 inputs = ann_tokenizer(
                     prompts, return_tensors="pt", padding=True,
