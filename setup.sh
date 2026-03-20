@@ -1,6 +1,6 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────────────────
-# supsae vast.ai provisioning script
+# Automated Feature Selection — vast.ai provisioning script
 #
 # Set these environment variables in the vast.ai template:
 #   OPENROUTER_API_KEY   — for Step 1 (Claude Sonnet feature inventory)
@@ -11,7 +11,7 @@
 #   https://raw.githubusercontent.com/WesternDundrey/Automated_Feature_Selection/main/setup.sh
 # ──────────────────────────────────────────────────────────────────
 
-echo "Starting supsae setup"
+echo "Starting setup"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -44,9 +44,9 @@ ollama pull gpt-oss:20b
 echo -e "${GREEN}gpt-oss:20b ready${NC}"
 
 # ── Clone repo + install deps ────────────────────────────────────
-echo "Cloning supsae repo"
-git clone https://github.com/WesternDundrey/Automated_Feature_Selection.git /workspace/supsae
-cd /workspace/supsae
+echo "Cloning repo"
+git clone https://github.com/WesternDundrey/Automated_Feature_Selection.git /workspace/repo
+cd /workspace/repo
 
 echo "Installing Python dependencies"
 uv pip install --system -r pipeline/requirements.txt
@@ -81,14 +81,14 @@ fi
 # ── Summary ───────────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════════════"
-echo "  supsae setup complete"
+  Setup complete"
 echo ""
 echo "  Target model:    GPT-2 Small (downloads on first run)"
 echo "  Annotator:       gpt-oss:20b via Ollama (ready)"
 echo "  Supervision:     MSE feature dictionary (Makelov et al.)"
 echo ""
 echo "  To run:"
-echo "    cd /workspace/supsae"
+echo "    cd /workspace/repo"
 echo "    python -m pipeline.run --local-annotator --n_sequences 50000 --epochs 15"
 echo ""
 echo "  Use tmux so SSH disconnects don't kill the run."

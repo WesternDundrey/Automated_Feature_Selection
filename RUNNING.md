@@ -115,18 +115,18 @@ sleep 5
 ollama pull gpt-oss:20b
 
 # Clone repo and install deps
-git clone https://github.com/WesternDundrey/Automated_Feature_Selection.git /workspace/supsae
-cd /workspace/supsae
-uv pip install --system -r pipeline/requirements.txt
+# setup.sh handles clone + deps automatically (see Onstart Script below)
 ```
 
-GPT-2 Small is ~500MB — downloads in seconds on first load. No pre-download needed.
-No `HF_TOKEN` needed (GPT-2 is not gated).
+Or use the provisioning script directly as vast.ai on-start URL:
+```
+https://raw.githubusercontent.com/WesternDundrey/Automated_Feature_Selection/main/setup.sh
+```
 
 ### Run
 
 ```bash
-cd /workspace/supsae
+cd /workspace/repo
 python -m pipeline.run --local-annotator --n_sequences 50000 --epochs 15
 ```
 
@@ -135,7 +135,7 @@ Use `tmux` so SSH disconnects don't kill the run.
 ### Copy results
 
 ```bash
-scp -P <port> -r root@<ip>:/workspace/supsae/pipeline_data/ ./pipeline_data/
+scp -P <port> -r root@<ip>:/workspace/repo/pipeline_data/ ./pipeline_data/
 ```
 
 **Stop the instance when done.**
