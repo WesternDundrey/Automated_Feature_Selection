@@ -375,21 +375,22 @@ def _annotate_local_vllm(
     T: int,
     cfg: Config,
 ) -> torch.Tensor:
-    """vLLM backend with incremental prompts and prefix caching.
+    """vLLM backend — sequence-first prompts, features batched.
 
-    Throughput optimization: for a given (feature, sequence), position k's
-    prompt is a PREFIX of position k+1's prompt. vLLM caches the KV states
-    for the shared prefix, so each position only computes ~3-4 new tokens
-    instead of the full ~190 token prompt.
+    The sequence context is the PREFIX (cached, grows by 1 token per step).
+    The feature description is the SUFFIX (short, batched across all features).
 
-    Prompt structure (position k shows tokens 0..k, annotates the LAST token):
-      "Feature: {desc}. 0 or 1 for LAST token.\nThe quick brown\nAnswer:"
-      "Feature: {desc}. 0 or 1 for LAST token.\nThe quick brown fox\nAnswer:"
+    Prompt at (sequence j, position k, feature i):
+      "[tok_0 tok_1 ... tok_k]\\n0 or 1 for LAST token. Feature: {desc}\\n"
 
     Cache hierarchy:
-      Level 1: feature prefix (~40 tokens) — shared across all 50K×128 prompts
-      Level 2: + sequence tokens up to position k (~k tokens) — grows by 1 per step
-      Variable: just the new token + "\\nAnswer:" (~3 tokens)
+      Prefix: [tok_0 ... tok_k]  — shared across all 100 features at this position
+      Suffix: feature desc + instruction (~15 tokens) — varies per feature
+      Output: 1 token ("0" or "1")
+
+    At position k+1, the prefix extends by 1 token. vLLM reuses the cached
+    KV states for [tok_0 ... tok_k] and only computes tok_{k+1} + suffix.
+    Features are the batch dimension: 100 prompts sharing the same prefix.
     """
     from vllm import LLM, SamplingParams
 
@@ -407,52 +408,49 @@ def _annotate_local_vllm(
     completed = 0
     t_start = time.time()
 
-    # Chunk by sequences. Each sequence produces T incremental prompts.
-    seq_chunk = max(1, 200_000 // T)
-
-    print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
-          f"= {total_decisions:,} decisions (vLLM, incremental prefix caching)")
-
-    for fi, feat in enumerate(features):
-        # Feature prefix — cached across ALL prompts for this feature
-        feat_prefix = (
-            "You are a feature annotator. "
-            f"Feature: {feat['description']}\n"
-            "Output only 0 or 1. 1 if the feature activates at the LAST token.\n\n"
+    # Pre-build feature suffixes (short, appended after sequence prefix)
+    feat_suffixes = []
+    for feat in features:
+        feat_suffixes.append(
+            f"\n0 or 1 for LAST token. Feature: {feat['description']}\n"
         )
 
-        for seq_start in range(0, N, seq_chunk):
-            seq_end = min(seq_start + seq_chunk, N)
+    # Chunk by sequences. Each chunk produces seq_count × T × n_features prompts.
+    seq_chunk = max(1, 500_000 // (T * n_features))
 
-            prompts = []
-            positions = []
+    print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
+          f"= {total_decisions:,} decisions "
+          f"(vLLM, sequence-cached, features batched)")
 
-            for seq_j in range(seq_start, seq_end):
-                # Build incremental prompts: position k shows tokens[0:k+1]
-                # Position k's prompt is a prefix of position k+1's prompt
-                # so vLLM reuses the KV cache, computing only ~3 new tokens/step
-                running = feat_prefix
-                for tok_k in range(T):
-                    running += all_token_strs[seq_j][tok_k]
-                    prompts.append(running + "\nAnswer:")
-                    positions.append((seq_j, tok_k))
+    for seq_start in range(0, N, seq_chunk):
+        seq_end = min(seq_start + seq_chunk, N)
 
-            outputs = llm.generate(prompts, params)
+        prompts = []
+        positions = []  # (seq_j, tok_k, fi)
 
-            for idx, output in enumerate(outputs):
-                seq_j, tok_k = positions[idx]
-                token_text = output.outputs[0].text.strip()
-                annotations[seq_j, tok_k, fi] = 1.0 if token_text.startswith("1") else 0.0
+        for seq_j in range(seq_start, seq_end):
+            # Build sequence prefix incrementally
+            seq_prefix = ""
+            for tok_k in range(T):
+                seq_prefix += all_token_strs[seq_j][tok_k]
+                # Batch all features at this (sequence, position)
+                for fi in range(n_features):
+                    prompts.append(seq_prefix + feat_suffixes[fi])
+                    positions.append((seq_j, tok_k, fi))
 
-            completed += len(prompts)
+        outputs = llm.generate(prompts, params)
 
-        elapsed_total = time.time() - t_start
-        rate = completed / elapsed_total if elapsed_total > 0 else 0
+        for idx, output in enumerate(outputs):
+            seq_j, tok_k, fi = positions[idx]
+            token_text = output.outputs[0].text.strip()
+            annotations[seq_j, tok_k, fi] = 1.0 if token_text.startswith("1") else 0.0
+
+        completed += len(prompts)
+        elapsed = time.time() - t_start
+        rate = completed / elapsed if elapsed > 0 else 0
         eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
-        n_pos = int(annotations[:, :, fi].sum().item())
-        print(f"  [{fi+1}/{n_features}] {feat['id']:<36} "
-              f"pos={n_pos:>6} rate={rate:.0f}/s  "
-              f"ETA {eta_sec/3600:.1f}h")
+        print(f"  {completed:,}/{total_decisions:,} decisions  "
+              f"rate={rate:.0f}/s  ETA {eta_sec/3600:.1f}h")
 
     del llm
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
