@@ -516,7 +516,7 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
     last_err = None
     for attempt in range(3):
         try:
-            text = chat(client, cfg.organization_model, prompt, max_tokens=8000)
+            text = chat(client, cfg.organization_model, prompt, max_tokens=16000)
 
             catalog = _extract_json_object(text)
             if catalog is not None:
