@@ -414,8 +414,11 @@ def _annotate_local_vllm(
             f"\n0 or 1 for LAST token. Feature: {feat['description']}\n"
         )
 
-    # Chunk by sequences. Each chunk produces seq_count × T × n_features prompts.
-    seq_chunk = max(1, 500_000 // (T * n_features))
+    # Chunk by sequences. Keep chunks small so sequence prefixes stay hot
+    # in vLLM's KV cache for all T × n_features prompts before eviction.
+    # With 281K token cache / ~128 tokens per prefix, ~10 sequences keeps
+    # all prefixes resident while 10 × 128 × 96 = ~123K prompts process.
+    seq_chunk = max(1, min(10, N))
 
     print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
           f"= {total_decisions:,} decisions "
