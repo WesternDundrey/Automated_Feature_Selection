@@ -66,7 +66,7 @@ class Config:
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API
-    local_annotator_model: str = "openai/gpt-oss-20b"  # HuggingFace model ID
+    local_annotator_model: str = "Qwen/Qwen3-8B"  # HuggingFace model ID
     local_annotation_batch_size: int = 64
 
     # ── Feature filtering ──────────────────────────────────────

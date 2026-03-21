@@ -374,22 +374,18 @@ def _annotate_local_vllm(
     T: int,
     cfg: Config,
 ) -> torch.Tensor:
-    """vLLM backend — sequence-first prompts, features batched.
+    """vLLM backend — ChatML template, sequence-first prefix caching, features batched.
 
-    The sequence context is the PREFIX (cached, grows by 1 token per step).
-    The feature description is the SUFFIX (short, batched across all features).
+    Uses ChatML format with thinking disabled for Qwen3:
+      <|im_start|>system
+      {system_instruction}<|im_end|>
+      <|im_start|>user
+      {tok_0 tok_1 ... tok_k}          ← cached prefix, grows by 1 token/step
+      Feature: {desc}<|im_end|>         ← short suffix, varies per feature
+      <|im_start|>assistant
+      → model outputs "0" or "1"
 
-    Prompt at (sequence j, position k, feature i):
-      "[tok_0 tok_1 ... tok_k]\\n0 or 1 for LAST token. Feature: {desc}\\n"
-
-    Cache hierarchy:
-      Prefix: [tok_0 ... tok_k]  — shared across all 100 features at this position
-      Suffix: feature desc + instruction (~15 tokens) — varies per feature
-      Output: 1 token ("0" or "1")
-
-    At position k+1, the prefix extends by 1 token. vLLM reuses the cached
-    KV states for [tok_0 ... tok_k] and only computes tok_{k+1} + suffix.
-    Features are the batch dimension: 100 prompts sharing the same prefix.
+    No <think> block — manual ChatML construction bypasses thinking mode entirely.
     """
     from vllm import LLM, SamplingParams
 
@@ -398,7 +394,7 @@ def _annotate_local_vllm(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
-        max_model_len=512,
+        max_model_len=1024,
     )
     params = SamplingParams(max_tokens=1, temperature=0)
 
@@ -407,22 +403,27 @@ def _annotate_local_vllm(
     completed = 0
     t_start = time.time()
 
-    # Pre-build feature suffixes (short, appended after sequence prefix)
-    feat_suffixes = []
-    for feat in features:
-        feat_suffixes.append(
-            f"\n0 or 1 for LAST token. Feature: {feat['description']}\n"
-        )
+    # ChatML system block (constant across all prompts — cached at level 0)
+    SYS = (
+        "<|im_start|>system\n"
+        "Feature annotator. For the last token shown, output 1 if it matches "
+        "the feature, 0 if not. When it plausibly matches, output 1."
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+    )
+    # ChatML suffix per feature (short, appended after sequence tokens)
+    ASST = "<|im_end|>\n<|im_start|>assistant\n"
+    feat_suffixes = [
+        f"\nFeature: {feat['description']}{ASST}" for feat in features
+    ]
 
     # Chunk by sequences. Keep chunks small so sequence prefixes stay hot
     # in vLLM's KV cache for all T × n_features prompts before eviction.
-    # With 281K token cache / ~128 tokens per prefix, ~10 sequences keeps
-    # all prefixes resident while 10 × 128 × 96 = ~123K prompts process.
     seq_chunk = max(1, min(10, N))
 
     print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
           f"= {total_decisions:,} decisions "
-          f"(vLLM, sequence-cached, features batched)")
+          f"(vLLM, Qwen3 ChatML no-think, prefix cached)")
 
     for seq_start in range(0, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
@@ -431,8 +432,8 @@ def _annotate_local_vllm(
         positions = []  # (seq_j, tok_k, fi)
 
         for seq_j in range(seq_start, seq_end):
-            # Build sequence prefix incrementally
-            seq_prefix = ""
+            # Build sequence prefix incrementally inside ChatML user block
+            seq_prefix = SYS
             for tok_k in range(T):
                 seq_prefix += all_token_strs[seq_j][tok_k]
                 # Batch all features at this (sequence, position)
