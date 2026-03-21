@@ -256,8 +256,9 @@ def evaluate(cfg: Config = None):
         fve_vals = []
 
         for k, feat in enumerate(features):
-            pos_mask = gt[:, k]
-            n_pos = int(pos_mask.sum())
+            pos_mask_np = gt[:, k]
+            n_pos = int(pos_mask_np.sum())
+            pos_mask = torch.from_numpy(pos_mask_np)  # for torch indexing
             cos_k = cosines_all[k].item()
 
             if n_pos < 2:

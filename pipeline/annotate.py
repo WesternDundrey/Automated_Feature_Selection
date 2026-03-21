@@ -330,15 +330,14 @@ def annotate_local(
 ) -> torch.Tensor:
     """Decomposed single-feature single-token annotation with a local model.
 
-    For each (feature, sequence, position), the model sees:
-        System: You are a feature annotator...
-        Feature: <description>
-        Context: tok1 tok2 >>target_tok<< tok4 ...
+    For each (sequence, position, feature), the model sees:
+        [tok_0 tok_1 ... tok_k]
+        0 or 1 for LAST token. Feature: <description>
     And outputs a single token: "0" or "1".
 
-    Uses vLLM with prefix caching for high throughput. For a given feature,
-    all prompts share the same system prefix (~60 tokens). vLLM detects this
-    at the token level and caches the KV states.
+    Uses vLLM with prefix caching. The sequence is the cached prefix (grows
+    by 1 token per position, shared across all features). Features are the
+    batch dimension — short suffixes appended to the shared sequence prefix.
 
     Falls back to HuggingFace transformers if vLLM is unavailable (slower).
     """
