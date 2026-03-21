@@ -12,7 +12,7 @@ from pathlib import Path
 @dataclass
 class Config:
     # ── Base model ───────────────────────────────────────────────────
-    model_name: str = "openai-community/gpt2"
+    model_name: str = "gpt2"
     target_layer: int = 8
     hook_point: str = ""  # auto-set in __post_init__
     device: str = "cuda"
