@@ -4,6 +4,60 @@
 
 ---
 
+## [v4.1] — Qwen3-8B Annotator + ChatML + Calibration Fix
+
+**Date:** 2026-03-21
+
+### Problem
+
+Trial run with gpt-oss-20b produced near-empty annotations: most features had 0-3
+positives in 12,800 test positions. L0=47.3 (supervised latents firing everywhere
+without learning features). Root cause: the model was too conservative — answering "0"
+for almost everything. Two contributing factors:
+
+1. **No system instruction in vLLM path.** Prompts were raw text with no framing.
+   The model didn't understand the annotation task.
+2. **Base rate prior toward "0".** With greedy decoding, the model's prior for "0"
+   dominates since most tokens genuinely don't match any given feature.
+
+### Changes
+
+**Annotator model: `Qwen/Qwen3-8B`** (was `openai/gpt-oss-20b`). 8B dense model,
+~3-4x faster decode than 20B MoE. More VRAM free for KV cache = more prefix slots.
+
+**ChatML template with no-think.** Manual ChatML construction (`<|im_start|>system`,
+`<|im_start|>user`, `<|im_start|>assistant`) gives the model proper instruction framing.
+No `<think>` block — bypasses Qwen3's thinking mode entirely.
+
+**Calibration nudge.** System prompt includes "When it plausibly matches, output 1"
+to counteract the conservatism. The full system instruction:
+```
+Feature annotator. For the last token shown, output 1 if it matches
+the feature, 0 if not. When it plausibly matches, output 1.
+```
+
+**max_model_len: 512 → 1024.** Safety margin for longer sequences re-tokenized
+by Qwen3's vocabulary.
+
+Prompt structure preserves prefix caching:
+```
+Cached:   <|im_start|>system\n{instruction}<|im_end|>\n<|im_start|>user\n[tok0...tok_k]
+Variable: \nFeature: {desc}<|im_end|>\n<|im_start|>assistant\n
+Output:   1 token ("0" or "1")
+```
+
+### Files Changed
+
+| File | Changes |
+|------|---------|
+| `pipeline/config.py` | `local_annotator_model` → `Qwen/Qwen3-8B` |
+| `pipeline/annotate.py` | ChatML template, system prompt, calibration nudge |
+| `pipeline/run.py` | Updated help text |
+| `setup.sh` | Pre-downloads Qwen3-8B instead of gpt-oss-20b |
+| `RUNNING.md` | Updated all model references |
+
+---
+
 ## [v4.0] — MSE Feature Dictionary Loss + Local Annotation
 
 **Date:** 2026-03-19

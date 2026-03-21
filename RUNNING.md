@@ -58,7 +58,7 @@ python -m pipeline.run --step residual     # Step 7: propose new features from r
 | `--epochs` | 15 | Training epochs |
 | `--lista` | 0 | LISTA refinement steps (0 = disabled) |
 | `--local-annotator` | off | Use local model via vLLM with prefix caching |
-| `--annotator-model` | openai/gpt-oss-20b | HuggingFace model ID for local annotator |
+| `--annotator-model` | Qwen/Qwen3-8B | HuggingFace model ID for local annotator |
 | `--no-mse` | off | Use legacy BCE supervision instead of MSE |
 | `--output_dir` | pipeline_data | Output directory |
 | `--device` | cuda | Device (cuda/cpu) |
@@ -70,7 +70,7 @@ python -m pipeline.run --step residual     # Step 7: propose new features from r
 | Role | What it does | Default | Runs on |
 |------|-------------|---------|---------|
 | **Target model** | The model being analyzed. Forward pass extracts activations. | GPT-2 Small (124M) | GPU |
-| **Annotator model** | Labels tokens with feature presence/absence. | gpt-oss-20b (local via vLLM) | GPU |
+| **Annotator model** | Labels tokens with feature presence/absence. | Qwen3-8B (local via vLLM) | GPU |
 
 These never run simultaneously. The target model is freed from GPU before annotation starts.
 
@@ -81,7 +81,7 @@ provide analytically derived ground-truth feature directions for it. If the supe
 SAE's learned decoder directions converge to Makelov's directions, the MSE feature
 dictionary loss works. Any SAE failures are attributable to the pipeline, not annotation
 noise — GPT-2 features are trivially simple (punctuation, word categories, syntactic roles)
-and gpt-oss-20b labels them near-perfectly.
+and Qwen3-8B labels them near-perfectly.
 
 ## vast.ai Setup
 
@@ -101,7 +101,7 @@ https://raw.githubusercontent.com/WesternDundrey/Automated_Feature_Selection/mai
 Set `OPENROUTER_API_KEY` as an environment variable in the vast.ai template.
 
 The script installs uv, vLLM, clones the repo, installs deps, and pre-downloads
-gpt-oss-20b. GPT-2 Small (~500MB) downloads on first run.
+Qwen3-8B. GPT-2 Small (~500MB) downloads on first run.
 
 ### Run
 
@@ -125,7 +125,7 @@ scp -P <port> -r root@<ip>:/workspace/Automated_Feature_Selection/pipeline_data/
 | Step | Model | API Calls | Est. Cost |
 |------|-------|-----------|-----------|
 | Inventory | Sonnet 4.6 | ~40 | ~$1.90 |
-| Annotation | gpt-oss-20b (local) | 0 | $0 |
+| Annotation | Qwen3-8B (local) | 0 | $0 |
 | **Total** | | ~40 | **~$2** (+ GPU rental) |
 
 GPU rental: ~$0.30-0.50/hr on vast.ai, pipeline takes ~4-8 hours with local annotation.
