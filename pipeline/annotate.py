@@ -328,15 +328,14 @@ def annotate_local(
     base_tokenizer,
     cfg: Config,
 ) -> torch.Tensor:
-    """Local annotation with batch-positions approach.
+    """Per-token annotation with vLLM prefix caching.
 
-    For each (feature, sequence), the model sees the full sequence and outputs
-    T binary digits — one per token position. Feature description is in the
-    system prompt (cached across all sequences). Output constrained to "0"/"1"
-    token IDs via allowed_token_ids, guaranteeing exactly T digits.
+    For each (sequence, position, feature), the model sees tokens up to
+    position k and outputs 1 token: "0" or "1". Sequence is the cached
+    prefix (grows by 1 token per position), feature is the suffix.
 
-    vLLM (primary): n_features × N prompts, T output tokens each.
-    HF (fallback): n_features × N × T prompts, 1 output token each (slower).
+    vLLM (primary): n_features × N × T prompts, 1 output token each.
+    HF (fallback): same but without prefix caching (slower).
     """
     N, T = tokens.shape
     n_features = len(features)
@@ -371,104 +370,87 @@ def _annotate_local_vllm(
     T: int,
     cfg: Config,
 ) -> torch.Tensor:
-    """vLLM backend — batch-positions, feature-cached.
+    """vLLM per-token annotation with sequence-first prefix caching + ChatML.
 
-    Each prompt annotates ALL positions in a sequence for ONE feature.
-    Output is exactly T binary digits constrained by allowed_token_ids.
-
-    Prompt structure:
+    Prompt at (sequence j, position k, feature i):
       <|im_start|>system
-      {instruction + feature description}     ← cached across ALL N sequences
-      <|im_end|>
+      Feature annotator. Output 0 or 1 for the last token.
+      When it plausibly matches, output 1.<|im_end|>
       <|im_start|>user
-      {tok_0 tok_1 ... tok_127}               ← varies per sequence (~128 tokens)
-      <|im_end|>
+      [tok_0 tok_1 ... tok_k]       ← cached prefix, grows by 1 token/step
+      Feature: {desc}<|im_end|>      ← short suffix, varies per feature
       <|im_start|>assistant
-      → model outputs T digits: "00010001..."  (one per position)
+      → model outputs "0" or "1"
 
-    Prompts: n_features × N  (not n_features × N × T)
-    Output: T tokens per prompt, constrained to "0"/"1" token IDs
-    Cache: feature prefix (~80 tokens) shared across all N sequences
+    One decision per prompt, one output token. Sequence prefix is cached
+    across all features at the same position. Features are the batch dimension.
     """
     from vllm import LLM, SamplingParams
-    from transformers import AutoTokenizer
 
     print(f"Loading local annotator via vLLM: {cfg.local_annotator_model}")
-
-    # Get "0" and "1" token IDs for output constraint
-    ann_tokenizer = AutoTokenizer.from_pretrained(cfg.local_annotator_model)
-    tok_0 = ann_tokenizer.encode("0", add_special_tokens=False)[0]
-    tok_1 = ann_tokenizer.encode("1", add_special_tokens=False)[0]
-    del ann_tokenizer
-
     llm = LLM(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=1024,
     )
-    params = SamplingParams(
-        max_tokens=T,
-        temperature=0,
-        allowed_token_ids=[tok_0, tok_1],
-    )
+    params = SamplingParams(max_tokens=1, temperature=0)
 
     annotations = torch.zeros(N, T, n_features)
     total_decisions = n_features * N * T
     completed = 0
     t_start = time.time()
 
+    # ChatML system block (cached at level 0 — shared across everything)
+    SYS = (
+        "<|im_start|>system\n"
+        "Feature annotator. For the last token shown, output 1 if it "
+        "matches the feature, 0 if not. When it plausibly matches, output 1."
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+    )
+    # ChatML suffix per feature (short, appended after sequence tokens)
     ASST = "<|im_end|>\n<|im_start|>assistant\n"
+    feat_suffixes = [
+        f"\nFeature: {feat['description']}{ASST}" for feat in features
+    ]
 
-    # Pre-build full sequence texts (reused across all features)
-    seq_texts = ["".join(strs) for strs in all_token_strs]
+    # Process sequences in small chunks to keep prefixes hot in KV cache
+    seq_chunk = max(1, min(10, N))
 
-    # Larger chunks OK — only N prompts per feature, not N×T×n_features
-    seq_chunk = max(1, min(500, N))
-
-    n_prompts_total = n_features * N
     print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
           f"= {total_decisions:,} decisions "
-          f"({n_prompts_total:,} prompts, {T} output tokens each)")
+          f"(vLLM, per-token, ChatML, prefix cached)")
 
-    for fi, feat in enumerate(features):
-        # Feature-specific system prompt (cached across all sequences)
-        sys_prefix = (
-            "<|im_start|>system\n"
-            "Feature annotator. For each token in the sequence, output 0 or 1 "
-            "in order. 1 if the token matches the feature, 0 if not. "
-            "When it plausibly matches, output 1. "
-            f"Output exactly {T} digits, no spaces.\n\n"
-            f"Feature: {feat['description']}"
-            "<|im_end|>\n<|im_start|>user\n"
-        )
+    for seq_start in range(0, N, seq_chunk):
+        seq_end = min(seq_start + seq_chunk, N)
 
-        for seq_start in range(0, N, seq_chunk):
-            seq_end = min(seq_start + seq_chunk, N)
+        prompts = []
+        positions = []  # (seq_j, tok_k, fi)
 
-            prompts = [
-                f"{sys_prefix}{seq_texts[j]}{ASST}"
-                for j in range(seq_start, seq_end)
-            ]
+        for seq_j in range(seq_start, seq_end):
+            # Build sequence prefix incrementally inside ChatML user block
+            seq_prefix = SYS
+            for tok_k in range(T):
+                seq_prefix += all_token_strs[seq_j][tok_k]
+                # Batch all features at this (sequence, position)
+                for fi in range(n_features):
+                    prompts.append(seq_prefix + feat_suffixes[fi])
+                    positions.append((seq_j, tok_k, fi))
 
-            outputs = llm.generate(prompts, params)
+        outputs = llm.generate(prompts, params)
 
-            for j, output in enumerate(outputs):
-                seq_j = seq_start + j
-                # Parse output token IDs directly (more robust than string)
-                token_ids = output.outputs[0].token_ids
-                for tok_k, tid in enumerate(token_ids[:T]):
-                    annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1 else 0.0
+        for idx, output in enumerate(outputs):
+            seq_j, tok_k, fi = positions[idx]
+            token_text = output.outputs[0].text.strip()
+            annotations[seq_j, tok_k, fi] = 1.0 if token_text.startswith("1") else 0.0
 
-            completed += (seq_end - seq_start) * T
-
+        completed += len(prompts)
         elapsed = time.time() - t_start
         rate = completed / elapsed if elapsed > 0 else 0
         eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
-        n_pos = int(annotations[:, :, fi].sum().item())
-        print(f"  [{fi+1}/{n_features}] {feat['id']:<36} "
-              f"pos={n_pos:>6} rate={rate:.0f}/s  "
-              f"ETA {eta_sec/3600:.1f}h")
+        print(f"  {completed:,}/{total_decisions:,} decisions  "
+              f"rate={rate:.0f}/s  ETA {eta_sec/3600:.1f}h")
 
     del llm
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
