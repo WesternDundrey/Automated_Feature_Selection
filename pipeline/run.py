@@ -38,7 +38,9 @@ def main():
     parser.add_argument("--local-annotator", action="store_true",
                         help="Use local model for annotation (vLLM + prefix caching)")
     parser.add_argument("--annotator-model", default=None,
-                        help="Local annotator HF model ID (default: openai/gpt-oss-20b)")
+                        help="Local annotator HF model ID (default: Qwen/Qwen3-8B)")
+    parser.add_argument("--batch-positions", action="store_true",
+                        help="Output T tokens per prompt (faster but needs capable model)")
     parser.add_argument("--catalog", default=None,
                         help="Path to manual feature catalog JSON (skips inventory step)")
     parser.add_argument("--no-mse", action="store_true",
@@ -80,6 +82,8 @@ def main():
         overrides["use_local_annotator"] = True
     if args.annotator_model:
         overrides["local_annotator_model"] = args.annotator_model
+    if args.batch_positions:
+        overrides["batch_positions"] = True
     if args.catalog:
         overrides["manual_catalog"] = args.catalog
     if args.no_mse:
