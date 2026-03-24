@@ -370,27 +370,42 @@ def _annotate_local_vllm(
     T: int,
     cfg: Config,
 ) -> torch.Tensor:
-    """vLLM per-token annotation — plain text, brief thinking, parse first digit.
+    """vLLM per-token annotation — explicit target token, forced binary.
 
     Prompt at (sequence j, position k, feature i):
-      Tokens: tok_0 tok_1 ... tok_k         ← cached prefix, grows by 1/step
-      Is the last token {desc}? Answer 0 or 1:  ← suffix, varies per feature
-      → model outputs brief response, we extract first "0" or "1"
+      Tokens: tok_0 tok_1 ... tok_k              ← cached prefix
+      The token "{tok_k}" — {desc}? 0=no 1=yes:  ← suffix with explicit target
+      → forced "0" or "1" via allowed_token_ids
 
-    max_tokens=5 gives the model room to think ("No, 0" or "Yes. 1")
-    without forcing the very first token to carry all the signal.
-    No calibration nudge — neutral prompt, let the model decide.
+    Key insight: explicitly naming the target token in the suffix removes
+    ambiguity. The model doesn't need to figure out what "last token" means
+    in a BPE sequence — we tell it exactly which word to evaluate.
+
+    Suffix varies per (position, feature) — loses cross-feature caching at
+    each position, but the sequence prefix (~100+ tokens) is still cached.
     """
     from vllm import LLM, SamplingParams
+    from transformers import AutoTokenizer
 
     print(f"Loading local annotator via vLLM: {cfg.local_annotator_model}")
+
+    ann_tokenizer = AutoTokenizer.from_pretrained(cfg.local_annotator_model)
+    tok_0 = ann_tokenizer.encode("0", add_special_tokens=False)[0]
+    tok_1 = ann_tokenizer.encode("1", add_special_tokens=False)[0]
+    print(f"  Token IDs: '0'={tok_0}, '1'={tok_1}")
+    del ann_tokenizer
+
     llm = LLM(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=1024,
     )
-    params = SamplingParams(max_tokens=5, temperature=0)
+    params = SamplingParams(
+        max_tokens=1,
+        temperature=0,
+        allowed_token_ids=[tok_0, tok_1],
+    )
 
     annotations = torch.zeros(N, T, n_features)
     total_decisions = n_features * N * T
@@ -398,16 +413,15 @@ def _annotate_local_vllm(
     t_start = time.time()
 
     PREFIX = "Tokens:"
-    feat_suffixes = [
-        f'\nIs the last token {feat["description"].lower()}? Answer 0 or 1:'
-        for feat in features
-    ]
+
+    # Pre-build feature description strings (lowercase, no period)
+    feat_descs = [feat["description"].rstrip(".").lower() for feat in features]
 
     seq_chunk = max(1, min(10, N))
 
     print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
           f"= {total_decisions:,} decisions "
-          f"(vLLM, per-token, max_tokens=5, parse first digit)")
+          f"(vLLM, per-token, explicit target, forced binary)")
 
     for seq_start in range(0, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
@@ -419,25 +433,21 @@ def _annotate_local_vllm(
             seq_prefix = PREFIX
             for tok_k in range(T):
                 seq_prefix += all_token_strs[seq_j][tok_k]
+                tok_str = all_token_strs[seq_j][tok_k].strip()
                 for fi in range(n_features):
-                    prompts.append(seq_prefix + feat_suffixes[fi])
+                    suffix = (
+                        f'\nThe token "{tok_str}" — '
+                        f'{feat_descs[fi]}? 0=no 1=yes:'
+                    )
+                    prompts.append(seq_prefix + suffix)
                     positions.append((seq_j, tok_k, fi))
 
         outputs = llm.generate(prompts, params)
 
         for idx, output in enumerate(outputs):
             seq_j, tok_k, fi = positions[idx]
-            text = output.outputs[0].text
-            # Find first "0" or "1" in the output
-            label = 0.0
-            for ch in text:
-                if ch == "1":
-                    label = 1.0
-                    break
-                elif ch == "0":
-                    label = 0.0
-                    break
-            annotations[seq_j, tok_k, fi] = label
+            tid = output.outputs[0].token_ids[0]
+            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1 else 0.0
 
         completed += len(prompts)
         elapsed = time.time() - t_start
