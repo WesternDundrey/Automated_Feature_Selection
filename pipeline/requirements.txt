@@ -1,18 +1,21 @@
 # Core
-torch>=2.0,<3.0
-numpy>=1.24,<3.0
-tqdm>=4.60
+torch>=2.6
+numpy>=1.26
+tqdm>=4.66
 
 # Model loading
-transformer_lens>=2.0,<3.0
-sae-lens>=4.0,<6.0
+transformer_lens>=2.8
+sae-lens>=5.0
 
 # Data
-datasets>=2.14
-huggingface_hub>=0.20
+datasets>=3.0
+huggingface_hub>=0.27
 
 # LLM annotation (via OpenRouter, OpenAI-compatible API)
-openai>=1.0
+openai>=1.60
 
-# Local annotation (install separately: pip install vllm)
-# vllm>=0.6.0
+# Local annotation (vLLM with prefix caching)
+vllm>=0.8
+
+# Transformers (for tokenizer + HF fallback annotator)
+transformers>=4.48
