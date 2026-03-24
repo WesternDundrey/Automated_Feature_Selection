@@ -45,7 +45,7 @@ def main():
     parser.add_argument(
         "--step", default=None,
         choices=["inventory", "annotate", "train", "evaluate",
-                 "agreement", "ablation", "residual", "causal"],
+                 "agreement", "ablation", "residual", "causal", "ioi"],
         help="Run only this step",
     )
     args = parser.parse_args()
@@ -192,6 +192,17 @@ def main():
         from .causal import run as run_causal
         run_causal(cfg)
         print(f"Step 8 completed in {time.time() - t0:.1f}s")
+
+    # IOI validation (standalone, run with --step ioi)
+    if args.step == "ioi":
+        print("\n" + "=" * 70)
+        print("IOI VALIDATION (Makelov et al. 2024)")
+        print("=" * 70)
+        t0 = time.time()
+        from .ioi import run as run_ioi
+        skip_ann = not cfg.use_local_annotator
+        run_ioi(cfg, skip_annotator=skip_ann)
+        print(f"IOI validation completed in {time.time() - t0:.1f}s")
 
     print(f"\nTotal pipeline time: {time.time() - t_total:.1f}s")
 

@@ -1,0 +1,48 @@
+{
+  "_comment": "IOI (Indirect Object Identification) feature catalog for Makelov validation. Ground truth labels are deterministic from the template construction — no LLM needed.",
+  "features": [
+    {
+      "id": "name_role",
+      "description": "Role of the token as a name in the IOI circuit",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "name_role.indirect_object",
+      "description": "Token is the indirect object name (the name that appears only once)",
+      "type": "leaf",
+      "parent": "name_role"
+    },
+    {
+      "id": "name_role.subject_first",
+      "description": "Token is the first occurrence of the subject name (the repeated name)",
+      "type": "leaf",
+      "parent": "name_role"
+    },
+    {
+      "id": "name_role.subject_second",
+      "description": "Token is the second occurrence of the subject name",
+      "type": "leaf",
+      "parent": "name_role"
+    },
+
+    {
+      "id": "position_pattern",
+      "description": "Name ordering pattern in the sentence (sequence-level attribute)",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "position_pattern.abb",
+      "description": "The indirect object name appears before the subject name in the first clause",
+      "type": "leaf",
+      "parent": "position_pattern"
+    },
+    {
+      "id": "position_pattern.bab",
+      "description": "The subject name appears before the indirect object name in the first clause",
+      "type": "leaf",
+      "parent": "position_pattern"
+    }
+  ]
+}
