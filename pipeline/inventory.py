@@ -461,38 +461,44 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
         INITIAL DESCRIPTIONS:
         {desc_lines}
 
-        STRUCTURE RULE — GROUPS ARE CATEGORICAL VARIABLES:
+        STRUCTURE RULES:
 
-        Each group is a CATEGORICAL VARIABLE with 3-8 mutually exclusive values.
-        A token matches AT MOST ONE leaf per group. Think of each group as a
-        dimension, and each leaf as a possible value along that dimension.
+        Use CATEGORICAL groups where features are natural alternatives:
+          punctuation_type: comma, period, question_mark (a token is one or none)
+          semantic_domain: politics, sports, science (context belongs to one)
+        These are mutually exclusive by nature — don't force it.
 
-        GOOD example (mutually exclusive values of a category):
-          punctuation_type: comma, period, question_mark, colon, semicolon
-          syntactic_role: subject, verb, object, modifier, conjunction
-          semantic_domain: politics, sports, science, finance, health
+        Use NON-EXCLUSIVE groups where features genuinely co-occur:
+          token_properties: capitalized, numeric, multi_word (a token can be all)
+          text_features: contains_quote, contains_name, past_tense (co-occur freely)
 
-        BAD example (overlapping subtypes dressed as categories):
-          syntax_prepositions: of_after_leader_noun, after_idiomatic_phrase,
-            after_publication_verb — these overlap and are too narrow.
-          syntax_punctuation: comma_contrastive, comma_evaluative,
-            comma_enumerative — just have ONE "comma" feature.
+        The key rule: each feature must have a DISTINGUISHABLE activation pattern.
+        Two features that always co-occur on the same tokens are redundant — merge
+        them. But partial overlap is fine. "is a noun" and "is capitalized" overlap
+        on proper nouns but differ on common nouns and acronyms — both are useful.
 
-        Target: 8-15 groups x 4-6 leaves each = 40-80 total leaves.
-        Each leaf should fire on at least 1-5% of tokens in diverse web text.
-        If a feature would fire on fewer than 1 in 200 tokens, it is too narrow.
+        BAD: 4 subtypes of comma (comma_contrastive, comma_evaluative, etc.)
+          These fire on the same tokens (commas) and can't be distinguished.
+          Just have ONE "comma" feature.
+
+        GOOD: "comma" and "list_separator" — a comma in "red, blue, green" is
+          both a comma AND a list separator, but commas in other contexts aren't.
+          Distinguishable patterns, OK to co-occur.
+
+        Target: 8-15 groups, 40-80 total leaves.
+        Each leaf should fire on at least 1 in 200 tokens in diverse web text.
 
         YOUR TASKS:
-        1. IDENTIFY broad categorical dimensions from the descriptions. Look for
-           natural groupings where the values are alternatives, not subtypes:
-           punctuation type, part of speech, semantic domain, text genre, etc.
-        2. For each dimension, pick 3-8 BROAD leaves that partition the space.
+        1. IDENTIFY broad feature dimensions from the descriptions. Use categorical
+           groups where natural (punctuation type, part of speech, semantic domain).
+           Use non-exclusive groups where features genuinely co-occur.
+        2. For each group, pick 3-8 BROAD leaves.
            "comma" not "comma_contrastive". "politics" not "official_affiliation_adjective".
         3. FILL GAPS: if one value exists (e.g., "comma" among punctuation), add
            the other natural values (period, question_mark, etc.).
         4. REMOVE features that are too narrow (would match fewer than 1 in 200
-           tokens), too vague ("general language pattern"), or overlap with
-           another leaf in the same group.
+           tokens), too vague ("general language pattern"), or redundant (always
+           co-occur with another feature on the same tokens).
         5. Each leaf description must be short and operationally testable: a reader
            looks at a token in context and decides yes/no.
 
