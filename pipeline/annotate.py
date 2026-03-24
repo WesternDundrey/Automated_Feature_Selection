@@ -370,51 +370,36 @@ def _annotate_local_vllm(
     T: int,
     cfg: Config,
 ) -> torch.Tensor:
-    """vLLM per-token annotation — plain text prompt, forced binary output.
+    """vLLM per-token annotation — plain text, brief thinking, parse first digit.
 
     Prompt at (sequence j, position k, feature i):
-      Tokens: tok_0 tok_1 ... tok_k     ← cached prefix, grows by 1/step
-      Last token matches "{desc}"? 1=yes 0=no:  ← suffix, varies per feature
-      → model MUST output "0" or "1"    (allowed_token_ids constraint)
+      Tokens: tok_0 tok_1 ... tok_k         ← cached prefix, grows by 1/step
+      Is the last token {desc}? Answer 0 or 1:  ← suffix, varies per feature
+      → model outputs brief response, we extract first "0" or "1"
 
-    No ChatML. No special tokens. Plain text that any model can parse.
-    allowed_token_ids forces binary choice — no thinking, no whitespace.
-    Parse by token ID, not string.
+    max_tokens=5 gives the model room to think ("No, 0" or "Yes. 1")
+    without forcing the very first token to carry all the signal.
+    No calibration nudge — neutral prompt, let the model decide.
     """
     from vllm import LLM, SamplingParams
-    from transformers import AutoTokenizer
 
     print(f"Loading local annotator via vLLM: {cfg.local_annotator_model}")
-
-    # Get "0" and "1" token IDs for forced binary output
-    ann_tokenizer = AutoTokenizer.from_pretrained(cfg.local_annotator_model)
-    tok_0 = ann_tokenizer.encode("0", add_special_tokens=False)[0]
-    tok_1 = ann_tokenizer.encode("1", add_special_tokens=False)[0]
-    print(f"  Token IDs: '0'={tok_0}, '1'={tok_1}")
-    del ann_tokenizer
-
     llm = LLM(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=1024,
     )
-    params = SamplingParams(
-        max_tokens=1,
-        temperature=0,
-        allowed_token_ids=[tok_0, tok_1],
-    )
+    params = SamplingParams(max_tokens=5, temperature=0)
 
     annotations = torch.zeros(N, T, n_features)
     total_decisions = n_features * N * T
     completed = 0
     t_start = time.time()
 
-    # Plain text prefix (cached at level 0)
     PREFIX = "Tokens:"
-    # Short suffix per feature
     feat_suffixes = [
-        f'\nLast token matches "{feat["description"]}"? 1=yes 0=no:'
+        f'\nIs the last token {feat["description"].lower()}? Answer 0 or 1:'
         for feat in features
     ]
 
@@ -422,7 +407,7 @@ def _annotate_local_vllm(
 
     print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
           f"= {total_decisions:,} decisions "
-          f"(vLLM, per-token, allowed_token_ids=[{tok_0},{tok_1}])")
+          f"(vLLM, per-token, max_tokens=5, parse first digit)")
 
     for seq_start in range(0, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
@@ -442,8 +427,17 @@ def _annotate_local_vllm(
 
         for idx, output in enumerate(outputs):
             seq_j, tok_k, fi = positions[idx]
-            tid = output.outputs[0].token_ids[0]
-            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1 else 0.0
+            text = output.outputs[0].text
+            # Find first "0" or "1" in the output
+            label = 0.0
+            for ch in text:
+                if ch == "1":
+                    label = 1.0
+                    break
+                elif ch == "0":
+                    label = 0.0
+                    break
+            annotations[seq_j, tok_k, fi] = label
 
         completed += len(prompts)
         elapsed = time.time() - t_start
