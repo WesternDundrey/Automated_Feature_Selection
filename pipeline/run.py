@@ -37,7 +37,7 @@ def main():
     parser.add_argument("--local-annotator", action="store_true",
                         help="Use local model for annotation (vLLM + prefix caching)")
     parser.add_argument("--annotator-model", default=None,
-                        help="Local annotator HF model ID (default: Qwen/Qwen3-8B)")
+                        help="Local annotator HF model ID (default: Qwen/Qwen3-1.7B)")
     parser.add_argument("--no-mse", action="store_true",
                         help="Use legacy BCE supervision instead of MSE")
     parser.add_argument(

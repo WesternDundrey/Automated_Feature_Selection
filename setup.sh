@@ -25,7 +25,7 @@ uv pip install --system -r pipeline/requirements.txt
 uv pip install --system vllm
 
 # pre-download annotator model so first run doesn't block
-python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-8B')" || true
+python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-1.7B')" || true
 
 # git config if provided
 [ -n "$GIT_USERNAME" ] && [ -n "$GIT_EMAIL" ] && \
