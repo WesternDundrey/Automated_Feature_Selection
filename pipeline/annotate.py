@@ -370,70 +370,70 @@ def _annotate_local_vllm(
     T: int,
     cfg: Config,
 ) -> torch.Tensor:
-    """vLLM per-token annotation with sequence-first prefix caching + ChatML.
+    """vLLM per-token annotation — plain text prompt, forced binary output.
 
     Prompt at (sequence j, position k, feature i):
-      <|im_start|>system
-      Feature annotator. Output 0 or 1 for the last token.
-      When it plausibly matches, output 1.<|im_end|>
-      <|im_start|>user
-      [tok_0 tok_1 ... tok_k]       ← cached prefix, grows by 1 token/step
-      Feature: {desc}<|im_end|>      ← short suffix, varies per feature
-      <|im_start|>assistant
-      → model outputs "0" or "1"
+      Tokens: tok_0 tok_1 ... tok_k     ← cached prefix, grows by 1/step
+      Last token matches "{desc}"? 1=yes 0=no:  ← suffix, varies per feature
+      → model MUST output "0" or "1"    (allowed_token_ids constraint)
 
-    One decision per prompt, one output token. Sequence prefix is cached
-    across all features at the same position. Features are the batch dimension.
+    No ChatML. No special tokens. Plain text that any model can parse.
+    allowed_token_ids forces binary choice — no thinking, no whitespace.
+    Parse by token ID, not string.
     """
     from vllm import LLM, SamplingParams
+    from transformers import AutoTokenizer
 
     print(f"Loading local annotator via vLLM: {cfg.local_annotator_model}")
+
+    # Get "0" and "1" token IDs for forced binary output
+    ann_tokenizer = AutoTokenizer.from_pretrained(cfg.local_annotator_model)
+    tok_0 = ann_tokenizer.encode("0", add_special_tokens=False)[0]
+    tok_1 = ann_tokenizer.encode("1", add_special_tokens=False)[0]
+    print(f"  Token IDs: '0'={tok_0}, '1'={tok_1}")
+    del ann_tokenizer
+
     llm = LLM(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=1024,
     )
-    params = SamplingParams(max_tokens=1, temperature=0)
+    params = SamplingParams(
+        max_tokens=1,
+        temperature=0,
+        allowed_token_ids=[tok_0, tok_1],
+    )
 
     annotations = torch.zeros(N, T, n_features)
     total_decisions = n_features * N * T
     completed = 0
     t_start = time.time()
 
-    # ChatML system block (cached at level 0 — shared across everything)
-    SYS = (
-        "<|im_start|>system\n"
-        "Feature annotator. For the last token shown, output 1 if it "
-        "matches the feature, 0 if not. When it plausibly matches, output 1."
-        "<|im_end|>\n"
-        "<|im_start|>user\n"
-    )
-    # ChatML suffix per feature (short, appended after sequence tokens)
-    ASST = "<|im_end|>\n<|im_start|>assistant\n"
+    # Plain text prefix (cached at level 0)
+    PREFIX = "Tokens:"
+    # Short suffix per feature
     feat_suffixes = [
-        f"\nFeature: {feat['description']}{ASST}" for feat in features
+        f'\nLast token matches "{feat["description"]}"? 1=yes 0=no:'
+        for feat in features
     ]
 
-    # Process sequences in small chunks to keep prefixes hot in KV cache
     seq_chunk = max(1, min(10, N))
 
     print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
           f"= {total_decisions:,} decisions "
-          f"(vLLM, per-token, ChatML, prefix cached)")
+          f"(vLLM, per-token, allowed_token_ids=[{tok_0},{tok_1}])")
 
     for seq_start in range(0, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
 
         prompts = []
-        positions = []  # (seq_j, tok_k, fi)
+        positions = []
 
         for seq_j in range(seq_start, seq_end):
-            # Build sequence prefix incrementally inside ChatML user block
-            seq_prefix = SYS
+            seq_prefix = PREFIX
             for tok_k in range(T):
                 seq_prefix += all_token_strs[seq_j][tok_k]
-                # Batch all features at this (sequence, position)
                 for fi in range(n_features):
                     prompts.append(seq_prefix + feat_suffixes[fi])
                     positions.append((seq_j, tok_k, fi))
@@ -442,8 +442,8 @@ def _annotate_local_vllm(
 
         for idx, output in enumerate(outputs):
             seq_j, tok_k, fi = positions[idx]
-            token_text = output.outputs[0].text.strip()
-            annotations[seq_j, tok_k, fi] = 1.0 if token_text.startswith("1") else 0.0
+            tid = output.outputs[0].token_ids[0]
+            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1 else 0.0
 
         completed += len(prompts)
         elapsed = time.time() - t_start
