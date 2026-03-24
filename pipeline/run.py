@@ -38,6 +38,8 @@ def main():
                         help="Use local model for annotation (vLLM + prefix caching)")
     parser.add_argument("--annotator-model", default=None,
                         help="Local annotator HF model ID (default: openai/gpt-oss-20b)")
+    parser.add_argument("--catalog", default=None,
+                        help="Path to manual feature catalog JSON (skips inventory step)")
     parser.add_argument("--no-mse", action="store_true",
                         help="Use legacy BCE supervision instead of MSE")
     parser.add_argument(
@@ -77,6 +79,8 @@ def main():
         overrides["use_local_annotator"] = True
     if args.annotator_model:
         overrides["local_annotator_model"] = args.annotator_model
+    if args.catalog:
+        overrides["manual_catalog"] = args.catalog
     if args.no_mse:
         overrides["use_mse_supervision"] = False
 
@@ -96,8 +100,21 @@ def main():
 
     t_total = time.time()
 
-    # Step 1: Feature Inventory
-    if args.step is None or args.step == "inventory":
+    # Step 1: Feature Inventory (skipped if manual catalog provided)
+    if cfg.manual_catalog:
+        import json
+        import shutil
+        src = Path(cfg.manual_catalog)
+        if not src.exists():
+            raise FileNotFoundError(f"Manual catalog not found: {src}")
+        if not cfg.catalog_path.exists() or src.resolve() != cfg.catalog_path.resolve():
+            shutil.copy2(src, cfg.catalog_path)
+        catalog = json.loads(cfg.catalog_path.read_text())
+        n_g = sum(1 for f in catalog["features"] if f["type"] == "group")
+        n_l = sum(1 for f in catalog["features"] if f["type"] == "leaf")
+        print(f"\n  Using manual catalog: {src}")
+        print(f"  {n_g} groups, {n_l} leaves — skipping inventory step")
+    elif args.step is None or args.step == "inventory":
         print("\n" + "=" * 70)
         print("STEP 1: FEATURE INVENTORY")
         print("=" * 70)

@@ -1,0 +1,332 @@
+{
+  "_comment": "Manual feature catalog for GPT-2 Small validation. Broad categorical features with high positive rates. Designed to be comparable to Makelov et al. 2024's supervised dictionary approach.",
+  "features": [
+    {
+      "id": "punctuation_type",
+      "description": "Token is a punctuation mark",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "punctuation_type.comma",
+      "description": "Token is a comma",
+      "type": "leaf",
+      "parent": "punctuation_type"
+    },
+    {
+      "id": "punctuation_type.period",
+      "description": "Token is a period or full stop",
+      "type": "leaf",
+      "parent": "punctuation_type"
+    },
+    {
+      "id": "punctuation_type.question_mark",
+      "description": "Token is a question mark",
+      "type": "leaf",
+      "parent": "punctuation_type"
+    },
+    {
+      "id": "punctuation_type.colon_semicolon",
+      "description": "Token is a colon or semicolon",
+      "type": "leaf",
+      "parent": "punctuation_type"
+    },
+    {
+      "id": "punctuation_type.quotation_mark",
+      "description": "Token is a quotation mark (single or double)",
+      "type": "leaf",
+      "parent": "punctuation_type"
+    },
+    {
+      "id": "punctuation_type.dash_hyphen",
+      "description": "Token is a dash or hyphen",
+      "type": "leaf",
+      "parent": "punctuation_type"
+    },
+    {
+      "id": "punctuation_type.parenthesis_bracket",
+      "description": "Token is a parenthesis or bracket of any kind",
+      "type": "leaf",
+      "parent": "punctuation_type"
+    },
+
+    {
+      "id": "part_of_speech",
+      "description": "Broad syntactic category of the token",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "part_of_speech.noun",
+      "description": "Token is a noun (common or proper)",
+      "type": "leaf",
+      "parent": "part_of_speech"
+    },
+    {
+      "id": "part_of_speech.verb",
+      "description": "Token is a verb (any tense or form)",
+      "type": "leaf",
+      "parent": "part_of_speech"
+    },
+    {
+      "id": "part_of_speech.adjective",
+      "description": "Token is an adjective",
+      "type": "leaf",
+      "parent": "part_of_speech"
+    },
+    {
+      "id": "part_of_speech.adverb",
+      "description": "Token is an adverb",
+      "type": "leaf",
+      "parent": "part_of_speech"
+    },
+    {
+      "id": "part_of_speech.preposition",
+      "description": "Token is a preposition (in, on, at, of, for, with, etc.)",
+      "type": "leaf",
+      "parent": "part_of_speech"
+    },
+    {
+      "id": "part_of_speech.conjunction",
+      "description": "Token is a conjunction (and, but, or, because, etc.)",
+      "type": "leaf",
+      "parent": "part_of_speech"
+    },
+    {
+      "id": "part_of_speech.determiner",
+      "description": "Token is a determiner or article (the, a, an, this, that, etc.)",
+      "type": "leaf",
+      "parent": "part_of_speech"
+    },
+    {
+      "id": "part_of_speech.pronoun",
+      "description": "Token is a pronoun (he, she, it, they, who, etc.)",
+      "type": "leaf",
+      "parent": "part_of_speech"
+    },
+
+    {
+      "id": "capitalization",
+      "description": "Capitalization pattern of the token",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "capitalization.uppercase_start",
+      "description": "Token starts with an uppercase letter (sentence start or proper noun)",
+      "type": "leaf",
+      "parent": "capitalization"
+    },
+    {
+      "id": "capitalization.all_lowercase",
+      "description": "Token is entirely lowercase letters",
+      "type": "leaf",
+      "parent": "capitalization"
+    },
+    {
+      "id": "capitalization.all_uppercase",
+      "description": "Token is entirely uppercase (acronym or emphasis)",
+      "type": "leaf",
+      "parent": "capitalization"
+    },
+
+    {
+      "id": "token_length",
+      "description": "Character length of the token",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "token_length.single_char",
+      "description": "Token is a single character (letter, digit, or symbol)",
+      "type": "leaf",
+      "parent": "token_length"
+    },
+    {
+      "id": "token_length.short",
+      "description": "Token is 2-3 characters long",
+      "type": "leaf",
+      "parent": "token_length"
+    },
+    {
+      "id": "token_length.medium",
+      "description": "Token is 4-6 characters long",
+      "type": "leaf",
+      "parent": "token_length"
+    },
+    {
+      "id": "token_length.long",
+      "description": "Token is 7 or more characters long",
+      "type": "leaf",
+      "parent": "token_length"
+    },
+
+    {
+      "id": "numeric",
+      "description": "Token contains or is a number",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "numeric.digit",
+      "description": "Token is or contains a digit (0-9)",
+      "type": "leaf",
+      "parent": "numeric"
+    },
+    {
+      "id": "numeric.non_numeric",
+      "description": "Token contains no digits",
+      "type": "leaf",
+      "parent": "numeric"
+    },
+
+    {
+      "id": "word_frequency",
+      "description": "How common the token is in English text",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "word_frequency.function_word",
+      "description": "Token is a very common function word (the, is, of, to, in, and, a, etc.)",
+      "type": "leaf",
+      "parent": "word_frequency"
+    },
+    {
+      "id": "word_frequency.common_content",
+      "description": "Token is a common content word (said, people, time, new, etc.)",
+      "type": "leaf",
+      "parent": "word_frequency"
+    },
+    {
+      "id": "word_frequency.rare_word",
+      "description": "Token is an uncommon or specialized word",
+      "type": "leaf",
+      "parent": "word_frequency"
+    },
+
+    {
+      "id": "semantic_domain",
+      "description": "Topic or subject domain of the token in context",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "semantic_domain.politics_government",
+      "description": "Token relates to politics, government, or law in context",
+      "type": "leaf",
+      "parent": "semantic_domain"
+    },
+    {
+      "id": "semantic_domain.science_technology",
+      "description": "Token relates to science, technology, or computing in context",
+      "type": "leaf",
+      "parent": "semantic_domain"
+    },
+    {
+      "id": "semantic_domain.sports",
+      "description": "Token relates to sports or athletics in context",
+      "type": "leaf",
+      "parent": "semantic_domain"
+    },
+    {
+      "id": "semantic_domain.finance_business",
+      "description": "Token relates to finance, economics, or business in context",
+      "type": "leaf",
+      "parent": "semantic_domain"
+    },
+    {
+      "id": "semantic_domain.arts_entertainment",
+      "description": "Token relates to arts, music, film, or entertainment in context",
+      "type": "leaf",
+      "parent": "semantic_domain"
+    },
+    {
+      "id": "semantic_domain.everyday_general",
+      "description": "Token relates to everyday life, not a specialized domain",
+      "type": "leaf",
+      "parent": "semantic_domain"
+    },
+
+    {
+      "id": "position_in_sentence",
+      "description": "Where the token appears relative to sentence boundaries",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "position_in_sentence.sentence_start",
+      "description": "Token is the first word of a sentence (follows period, newline, or is BOS)",
+      "type": "leaf",
+      "parent": "position_in_sentence"
+    },
+    {
+      "id": "position_in_sentence.sentence_end",
+      "description": "Token is the last word before a sentence-ending punctuation mark",
+      "type": "leaf",
+      "parent": "position_in_sentence"
+    },
+    {
+      "id": "position_in_sentence.mid_sentence",
+      "description": "Token is in the middle of a sentence",
+      "type": "leaf",
+      "parent": "position_in_sentence"
+    },
+
+    {
+      "id": "named_entity",
+      "description": "Whether the token is part of a named entity",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "named_entity.person_name",
+      "description": "Token is a person's name or part of one",
+      "type": "leaf",
+      "parent": "named_entity"
+    },
+    {
+      "id": "named_entity.place_name",
+      "description": "Token is a place name (country, city, location)",
+      "type": "leaf",
+      "parent": "named_entity"
+    },
+    {
+      "id": "named_entity.organization",
+      "description": "Token is an organization or company name",
+      "type": "leaf",
+      "parent": "named_entity"
+    },
+    {
+      "id": "named_entity.not_entity",
+      "description": "Token is not part of any named entity",
+      "type": "leaf",
+      "parent": "named_entity"
+    },
+
+    {
+      "id": "verb_tense",
+      "description": "Tense of the token if it is a verb",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "verb_tense.past",
+      "description": "Token is a past-tense verb (walked, said, was)",
+      "type": "leaf",
+      "parent": "verb_tense"
+    },
+    {
+      "id": "verb_tense.present",
+      "description": "Token is a present-tense verb (walks, says, is)",
+      "type": "leaf",
+      "parent": "verb_tense"
+    },
+    {
+      "id": "verb_tense.infinitive_gerund",
+      "description": "Token is an infinitive or gerund form (to walk, walking)",
+      "type": "leaf",
+      "parent": "verb_tense"
+    }
+  ]
+}

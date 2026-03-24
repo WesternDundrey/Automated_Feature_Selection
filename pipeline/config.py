@@ -89,6 +89,9 @@ class Config:
     residual_top_k_positions: int = 100
     residual_model: str = "anthropic/claude-sonnet-4.6"
 
+    # ── Manual catalog (skips inventory step) ────────────────────
+    manual_catalog: str = ""  # path to JSON catalog; empty = use inventory
+
     # ── Output ──────────────────────────────────────────────────────
     output_dir: str = "pipeline_data"
 
