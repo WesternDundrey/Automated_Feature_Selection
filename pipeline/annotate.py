@@ -469,80 +469,67 @@ def _annotate_local_vllm_batch(
     T: int,
     cfg: Config,
 ) -> torch.Tensor:
-    """vLLM batch-positions: full sequence in, T binary digits out.
+    """vLLM batch-positions: full sequence + all features → JSON indices.
 
-    Feature description is the cached prefix (shared across all sequences).
-    Full sequence tokens are the variable input. Output constrained to
-    "0"/"1" token IDs, exactly T tokens.
+    Same prompt format as the API annotation path: show the full indexed
+    sequence, list all feature definitions, ask for JSON with position
+    indices per feature. One prompt per sequence (all features at once).
+
+    This gives the model full context for every token — critical for
+    features that depend on sentence structure (e.g., IOI name roles).
     """
     from vllm import LLM, SamplingParams
-    from transformers import AutoTokenizer
 
     print(f"Loading local annotator via vLLM: {cfg.local_annotator_model}")
-
-    ann_tokenizer = AutoTokenizer.from_pretrained(cfg.local_annotator_model)
-    tok_0 = ann_tokenizer.encode("0", add_special_tokens=False)[0]
-    tok_1 = ann_tokenizer.encode("1", add_special_tokens=False)[0]
-    print(f"  Token IDs: '0'={tok_0}, '1'={tok_1}")
-    del ann_tokenizer
-
     llm = LLM(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
-        max_model_len=1024,
+        max_model_len=2048,
     )
-    params = SamplingParams(
-        max_tokens=T,
-        temperature=0,
-        allowed_token_ids=[tok_0, tok_1],
-    )
+    # Generous output for JSON with position lists
+    max_out = max(500, n_features * 30)
+    params = SamplingParams(max_tokens=max_out, temperature=0)
 
     annotations = torch.zeros(N, T, n_features)
     total_decisions = n_features * N * T
-    completed = 0
     t_start = time.time()
 
-    ASST = "<|im_end|>\n<|im_start|>assistant\n"
-    seq_texts = ["".join(strs) for strs in all_token_strs]
-    seq_chunk = max(1, min(500, N))
+    seq_chunk = max(1, min(100, N))
 
     print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
           f"= {total_decisions:,} decisions "
-          f"(vLLM, batch-positions, {n_features * N:,} prompts)")
+          f"(vLLM, full-sequence JSON, {N} prompts)")
 
-    for fi, feat in enumerate(features):
-        sys_prefix = (
-            "<|im_start|>system\n"
-            "For each token in the sequence, output 0 or 1 in order. "
-            "1 if the token matches the feature, 0 if not. "
-            f"Output exactly {T} digits.\n\n"
-            f"Feature: {feat['description']}"
-            "<|im_end|>\n<|im_start|>user\n"
-        )
+    for seq_start in range(0, N, seq_chunk):
+        seq_end = min(seq_start + seq_chunk, N)
 
-        for seq_start in range(0, N, seq_chunk):
-            seq_end = min(seq_start + seq_chunk, N)
-            prompts = [
-                f"{sys_prefix}{seq_texts[j]}{ASST}"
-                for j in range(seq_start, seq_end)
-            ]
-            outputs = llm.generate(prompts, params)
+        prompts = []
+        for seq_j in range(seq_start, seq_end):
+            prompt_text = build_annotation_prompt(
+                all_token_strs[seq_j], features, 0,
+            )
+            prompts.append(prompt_text)
 
-            for j, output in enumerate(outputs):
-                seq_j = seq_start + j
-                token_ids = output.outputs[0].token_ids
-                for tok_k, tid in enumerate(token_ids[:T]):
-                    annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1 else 0.0
+        outputs = llm.generate(prompts, params)
 
-            completed += (seq_end - seq_start) * T
+        for j, output in enumerate(outputs):
+            seq_j = seq_start + j
+            text = output.outputs[0].text.strip()
+            result = _extract_json_object(text)
+            if result:
+                for k in range(n_features):
+                    key = f"F{k}"
+                    indices = result.get(key, [])
+                    for idx in indices:
+                        if isinstance(idx, int) and 0 <= idx < T:
+                            annotations[seq_j, idx, k] = 1.0
 
         elapsed = time.time() - t_start
-        rate = completed / elapsed if elapsed > 0 else 0
-        eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
-        n_pos = int(annotations[:, :, fi].sum().item())
-        print(f"  [{fi+1}/{n_features}] {feat['id']:<36} "
-              f"pos={n_pos:>6} rate={rate:.0f}/s  "
+        done = (seq_end) * n_features * T
+        rate = done / elapsed if elapsed > 0 else 0
+        eta_sec = (total_decisions - done) / rate if rate > 0 else 0
+        print(f"  {seq_end}/{N} sequences  rate={rate:.0f} decisions/s  "
               f"ETA {eta_sec/3600:.1f}h")
 
     del llm
