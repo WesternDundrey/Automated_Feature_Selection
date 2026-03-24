@@ -435,9 +435,11 @@ def _annotate_local_vllm(
                 seq_prefix += all_token_strs[seq_j][tok_k]
                 tok_str = all_token_strs[seq_j][tok_k].strip()
                 for fi in range(n_features):
+                    # Inverted framing: 1=no, 0=yes — exploits model's "1" bias
+                    # We flip the label when parsing (tid == tok_0 means positive)
                     suffix = (
                         f'\nThe token "{tok_str}" — '
-                        f'{feat_descs[fi]}? 0=no 1=yes:'
+                        f'{feat_descs[fi]}? 1=no 0=yes:'
                     )
                     prompts.append(seq_prefix + suffix)
                     positions.append((seq_j, tok_k, fi))
@@ -447,7 +449,8 @@ def _annotate_local_vllm(
         for idx, output in enumerate(outputs):
             seq_j, tok_k, fi = positions[idx]
             tid = output.outputs[0].token_ids[0]
-            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1 else 0.0
+            # Inverted: "0" in output means YES (feature present)
+            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_0 else 0.0
 
         completed += len(prompts)
         elapsed = time.time() - t_start
