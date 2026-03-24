@@ -461,52 +461,61 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
         INITIAL DESCRIPTIONS:
         {desc_lines}
 
+        STRUCTURE RULE — GROUPS ARE CATEGORICAL VARIABLES:
+
+        Each group is a CATEGORICAL VARIABLE with 3-8 mutually exclusive values.
+        A token matches AT MOST ONE leaf per group. Think of each group as a
+        dimension, and each leaf as a possible value along that dimension.
+
+        GOOD example (mutually exclusive values of a category):
+          punctuation_type: comma, period, question_mark, colon, semicolon
+          syntactic_role: subject, verb, object, modifier, conjunction
+          semantic_domain: politics, sports, science, finance, health
+
+        BAD example (overlapping subtypes dressed as categories):
+          syntax_prepositions: of_after_leader_noun, after_idiomatic_phrase,
+            after_publication_verb — these overlap and are too narrow.
+          syntax_punctuation: comma_contrastive, comma_evaluative,
+            comma_enumerative — just have ONE "comma" feature.
+
+        Target: 8-15 groups x 4-6 leaves each = 40-80 total leaves.
+        Each leaf should fire on at least 1-5% of tokens in diverse web text.
+        If a feature would fire on fewer than 1 in 200 tokens, it is too narrow.
+
         YOUR TASKS:
-        1. REWRITE each description to be short (one phrase or sentence), precise,
-           and operationally testable. A reader should be able to look at a token in
-           context and decide yes/no whether it matches.
-        2. GROUP related features under parent categories. Create 2-level hierarchy:
-           parent groups (e.g., "color_words", "sentiment", "syntax") and leaf features.
-           CRITICAL: Leaf features within the same group MUST be mutually exclusive —
-           a token should match at most one leaf per group. Across groups, features
-           should capture independent aspects of a token (e.g., syntactic role vs.
-           semantic domain vs. morphological structure). Minimize cross-group overlap
-           so that any given token activates only 1-3 leaf features total.
-        3. FILL GAPS: if one member of a natural family exists (e.g., "red" among
-           colors), add the missing members (blue, green, etc.). If a concept has a
-           natural opposite or complement, include both.
-        4. REMOVE features that are too vague ("general language pattern"),
-           redundant with other features, or not operationally crisp. Each
-           feature must be a well-defined concept that a reader can judge as
-           yes/no for any token in context. Reject features that are really
-           just surface-level correlates (e.g., "starts with cor-") rather
-           than genuine semantic or functional categories. Rare features are
-           fine — what matters is crispness, not base rate.
-        5. If a description would need many exceptions to be accurate ("starts with S
-           except snake, swim, ..."), the feature is poorly defined. Split it into
-           something cleaner or drop it.
-        6. Target 50-200 final features total (groups + leaves).
+        1. IDENTIFY broad categorical dimensions from the descriptions. Look for
+           natural groupings where the values are alternatives, not subtypes:
+           punctuation type, part of speech, semantic domain, text genre, etc.
+        2. For each dimension, pick 3-8 BROAD leaves that partition the space.
+           "comma" not "comma_contrastive". "politics" not "official_affiliation_adjective".
+        3. FILL GAPS: if one value exists (e.g., "comma" among punctuation), add
+           the other natural values (period, question_mark, etc.).
+        4. REMOVE features that are too narrow (would match fewer than 1 in 200
+           tokens), too vague ("general language pattern"), or overlap with
+           another leaf in the same group.
+        5. Each leaf description must be short and operationally testable: a reader
+           looks at a token in context and decides yes/no.
 
         OUTPUT FORMAT — reply with ONLY this JSON, no other text:
         {{
           "features": [
             {{
               "id": "group_name",
-              "description": "What this group represents",
+              "description": "What categorical dimension this group represents",
               "type": "group",
               "parent": null
             }},
             {{
-              "id": "group_name.leaf_name",
-              "description": "Precise operational description",
+              "id": "group_name.value_name",
+              "description": "Precise operational description of this value",
               "type": "leaf",
               "parent": "group_name"
             }}
           ]
         }}
 
-        Every leaf must have a parent group. Groups have type "group" and parent null
-        (or another group for nested hierarchy). Leaf IDs use dot notation: group.leaf.
+        Every leaf must have a parent group. Groups have type "group" and parent null.
+        Leaf IDs use dot notation: group.value.
     """)
 
     print(f"Organizing {len(descriptions)} descriptions into hierarchy "
