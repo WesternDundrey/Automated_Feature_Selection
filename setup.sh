@@ -21,11 +21,11 @@ git clone https://github.com/WesternDundrey/Automated_Feature_Selection.git /wor
 cd /workspace/Automated_Feature_Selection
 uv pip install --system -r pipeline/requirements.txt
 
-# vLLM for local annotation (prefix caching)
+# vLLM for local annotation
 uv pip install --system vllm
 
-# pre-download annotator model so first run doesn't block
-python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-8B')" || true
+# pre-download annotator model
+python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3.5-9B')" || true
 
 # git config if provided
 [ -n "$GIT_USERNAME" ] && [ -n "$GIT_EMAIL" ] && \
@@ -35,4 +35,5 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwe
 echo ""
 echo "Setup complete. Run:"
 echo "  cd /workspace/Automated_Feature_Selection"
-echo "  python -m pipeline.run --local-annotator --n_sequences 50000 --epochs 15"
+echo "  python -m pipeline.run --step ioi --n_sequences 500  # validate training (Q1)"
+echo "  python -m pipeline.run --local-annotator --n_sequences 2000 --epochs 10  # full run"

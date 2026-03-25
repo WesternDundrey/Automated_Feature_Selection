@@ -153,7 +153,7 @@ def extract_activations(model, tokens, cfg):
 
 # ── Question 1: SAE training validation ───────────────────────────────────
 
-def question1_sae_training(model, activations, labels, features, cfg):
+def question1_sae_training(activations, labels, features, cfg):
     """Train supervised SAE on ground-truth IOI labels, compare to mean dictionary.
 
     This validates the training procedure independently of annotation quality.
@@ -385,7 +385,7 @@ def run(cfg: Config = None, skip_annotator: bool = False):
 
     # Question 1: SAE training validation
     q1_results, sae = question1_sae_training(
-        None, activations, labels, features, cfg,
+        activations, labels, features, cfg,
     )
 
     results = {"question1": q1_results}

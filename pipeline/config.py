@@ -66,9 +66,10 @@ class Config:
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API
-    local_annotator_model: str = "openai/gpt-oss-20b"  # HuggingFace model ID (MoE, 3.6B active)
+    local_annotator_model: str = "Qwen/Qwen3.5-9B"  # HuggingFace model ID
     local_annotation_batch_size: int = 64
-    batch_positions: bool = False  # True = 128 output tokens per prompt, False = 1
+    batch_positions: bool = False  # True = full-sequence JSON, False = per-token
+    probe_gate_threshold: float = 0.1  # skip LLM when probe sigmoid < this (0 = disabled)
 
     # ── Feature filtering ──────────────────────────────────────
     min_feature_positive_rate: float = 0.0  # disabled by default (rare features are intentional)

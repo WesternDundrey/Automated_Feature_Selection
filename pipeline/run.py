@@ -36,11 +36,13 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--lista", type=int, default=None, help="LISTA refinement steps")
     parser.add_argument("--local-annotator", action="store_true",
-                        help="Use local model for annotation (vLLM + prefix caching)")
+                        help="Use local model for annotation (vLLM)")
     parser.add_argument("--annotator-model", default=None,
-                        help="Local annotator HF model ID (default: Qwen/Qwen3-8B)")
+                        help="Local annotator HF model ID (default: Qwen/Qwen3.5-9B)")
     parser.add_argument("--batch-positions", action="store_true",
-                        help="Output T tokens per prompt (faster but needs capable model)")
+                        help="Full-sequence JSON output (vs per-token)")
+    parser.add_argument("--probe-gate", type=float, default=None,
+                        help="Skip LLM for probe-confident negatives (default: 0.1, 0=disabled)")
     parser.add_argument("--catalog", default=None,
                         help="Path to manual feature catalog JSON (skips inventory step)")
     parser.add_argument("--no-mse", action="store_true",
@@ -84,6 +86,8 @@ def main():
         overrides["local_annotator_model"] = args.annotator_model
     if args.batch_positions:
         overrides["batch_positions"] = True
+    if args.probe_gate is not None:
+        overrides["probe_gate_threshold"] = args.probe_gate
     if args.catalog:
         overrides["manual_catalog"] = args.catalog
     if args.no_mse:

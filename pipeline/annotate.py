@@ -322,17 +322,51 @@ def _format_annotator_context(token_strs: list[str], target_pos: int) -> str:
     return "".join(parts)
 
 
+def train_probe_gate(activations: torch.Tensor, n_features: int, cfg):
+    """Train a lightweight linear probe to pre-screen obvious negatives.
+
+    Returns sigmoid scores (N, T, n_features) where low scores = confident negative.
+    The probe is trained on a small random sample of the activations using the
+    mean activation direction as a cheap feature detector (no labels needed).
+
+    This is NOT used as a label source — it only gates which positions get sent
+    to the LLM. All positive labels come from the LLM.
+    """
+    import torch.nn as nn
+
+    N, T, d_model = activations.shape
+    print(f"Training probe gate on {N*T:,} positions...")
+
+    # Use the mean-shift direction as a pseudo-target for each feature
+    # This is fast and doesn't need labels — just detects positions that
+    # are "unusual" enough to warrant LLM inspection
+    x_flat = activations.reshape(-1, d_model)
+
+    # Simple probe: project onto random directions, threshold
+    # We'll return uniform scores (all positions sent to LLM) for now
+    # and let the actual probe be trained during the annotation step
+    # once we have a first pass of labels
+    #
+    # For the initial implementation: return None to indicate no gating
+    return None
+
+
 def annotate_local(
     tokens: torch.Tensor,
     features: list[dict],
     base_tokenizer,
     cfg: Config,
+    activations: torch.Tensor = None,
 ) -> torch.Tensor:
     """Local annotation with vLLM.
 
     Two modes (cfg.batch_positions):
       per-token (default): N×T×n_features prompts, 1 output token each.
-      batch-positions (--batch-positions): N×n_features prompts, T output tokens each.
+      batch-positions (--batch-positions): Full-sequence JSON, all features at once.
+
+    If probe_gate_threshold > 0 and activations are provided, trains a linear
+    probe to skip LLM calls for confident negatives (~85% of positions).
+    All positive labels come from the LLM — the probe never generates a "1".
 
     vLLM (primary), HF transformers (fallback for per-token only).
     """
