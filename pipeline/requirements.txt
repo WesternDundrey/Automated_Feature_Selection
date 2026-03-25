@@ -14,8 +14,8 @@ huggingface_hub>=0.27
 # LLM annotation (via OpenRouter, OpenAI-compatible API)
 openai>=1.60
 
-# Local annotation (vLLM with prefix caching)
-vllm>=0.8
+# Transformers (for tokenizer + model loading)
+transformers>=5.0
 
-# Transformers (for tokenizer + HF fallback annotator)
-transformers>=4.48
+# Local annotation (vLLM with prefix caching)
+vllm>=0.18
