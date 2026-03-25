@@ -66,7 +66,7 @@ class Config:
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API
-    local_annotator_model: str = "Qwen/Qwen3.5-9B"  # HuggingFace model ID
+    local_annotator_model: str = "cyankiwi/Qwen3.5-9B-AWQ-4bit"  # 4-bit quantized for throughput
     local_annotation_batch_size: int = 64
     batch_positions: bool = False  # True = full-sequence JSON, False = per-token
     probe_gate_threshold: float = 0.1  # skip LLM when probe sigmoid < this (0 = disabled)

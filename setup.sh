@@ -25,7 +25,7 @@ uv pip install --system -r pipeline/requirements.txt
 uv pip install --system vllm
 
 # pre-download annotator model
-python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3.5-9B')" || true
+python -c "from huggingface_hub import snapshot_download; snapshot_download('cyankiwi/Qwen3.5-9B-AWQ-4bit')" || true
 
 # git config if provided
 [ -n "$GIT_USERNAME" ] && [ -n "$GIT_EMAIL" ] && \

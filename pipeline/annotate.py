@@ -425,7 +425,7 @@ def _annotate_local_vllm_pertoken(
 
     llm = LLM(
         model=cfg.local_annotator_model,
-        dtype="bfloat16",
+        dtype="auto",
         enable_prefix_caching=True,
         max_model_len=1024,
     )
@@ -517,7 +517,7 @@ def _annotate_local_vllm_batch(
     print(f"Loading local annotator via vLLM: {cfg.local_annotator_model}")
     llm = LLM(
         model=cfg.local_annotator_model,
-        dtype="bfloat16",
+        dtype="auto",
         enable_prefix_caching=True,
         max_model_len=2048,
     )
