@@ -3,10 +3,6 @@ torch>=2.6
 numpy>=1.26
 tqdm>=4.66
 
-# Model loading
-transformer_lens>=2.8
-sae-lens>=5.0
-
 # Data
 datasets>=3.0
 huggingface_hub>=0.27
@@ -14,6 +10,13 @@ huggingface_hub>=0.27
 # LLM annotation (via OpenRouter, OpenAI-compatible API)
 openai>=1.60
 
-# Transformers + vLLM (let uv resolve compatible versions)
+# Transformers
 transformers>=4.56
-vllm>=0.18
+
+# NOTE: vllm and sae-lens have conflicting numpy requirements.
+# Install them separately:
+#   uv pip install --system vllm>=0.18
+#   uv pip install --system sae-lens>=5.0 transformer-lens>=2.8 --no-deps
+# Or install vllm first, then sae-lens with --override:
+#   uv pip install --system vllm>=0.18
+#   uv pip install --system sae-lens transformer-lens --resolution lowest-direct
