@@ -89,18 +89,14 @@ def run(cfg: Config = None):
     if cfg is None:
         cfg = Config()
 
-    from transformer_lens import HookedTransformer
+    from transformers import AutoTokenizer
     from datasets import load_dataset
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model + tokenize corpus
-    print("Loading GPT-2 for tokenization...")
-    model = HookedTransformer.from_pretrained(
-        cfg.model_name, device="cpu", dtype=cfg.model_dtype,
-    )
-    tokenizer = model.tokenizer
-    del model
+    # Just get the tokenizer — don't load the full model (avoids CUDA init)
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
 
     n_seqs = min(50, cfg.n_sequences)  # small — just for validation
     T = cfg.seq_len

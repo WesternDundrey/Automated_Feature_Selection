@@ -100,15 +100,12 @@ class Config:
         if not self.hook_point:
             self.hook_point = f"blocks.{self.target_layer}.hook_resid_post"
         self.output_dir = Path(self.output_dir)
-        # Fallback to CPU if CUDA not available
+        # Fallback to CPU if CUDA not available.
+        # Use environment check to avoid initializing CUDA (which breaks vLLM fork).
         if self.device == "cuda":
-            try:
-                import torch
-                if not torch.cuda.is_available():
-                    print("WARNING: CUDA not available, falling back to CPU")
-                    self.device = "cpu"
-            except ImportError:
-                print("WARNING: torch not installed, defaulting to CPU")
+            import os
+            if os.environ.get("CUDA_VISIBLE_DEVICES", "") == "-1":
+                print("WARNING: CUDA disabled via env, falling back to CPU")
                 self.device = "cpu"
 
     @property
