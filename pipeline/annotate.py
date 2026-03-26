@@ -322,33 +322,92 @@ def _format_annotator_context(token_strs: list[str], target_pos: int) -> str:
     return "".join(parts)
 
 
-def train_probe_gate(activations: torch.Tensor, n_features: int, cfg):
-    """Train a lightweight linear probe to pre-screen obvious negatives.
+def train_probe_gate(
+    activations: torch.Tensor,
+    labels: torch.Tensor,
+    n_features: int,
+    device: str = "cuda",
+) -> "torch.nn.Linear":
+    """Train a linear probe on labeled activations for gating.
 
-    Returns sigmoid scores (N, T, n_features) where low scores = confident negative.
-    The probe is trained on a small random sample of the activations using the
-    mean activation direction as a cheap feature detector (no labels needed).
+    The probe predicts P(feature_i = 1 | activation) for each feature.
+    Positions where sigmoid(probe_output) < threshold are confident negatives
+    and can skip LLM annotation.
 
-    This is NOT used as a label source — it only gates which positions get sent
-    to the LLM. All positive labels come from the LLM.
+    Args:
+        activations: (N_sample, T, d_model) — activations from a small labeled sample
+        labels: (N_sample, T, n_features) — LLM annotations from the sample
+        n_features: number of leaf features
+        device: training device
+
+    Returns:
+        Trained nn.Linear(d_model, n_features) probe on CPU.
     """
     import torch.nn as nn
 
     N, T, d_model = activations.shape
-    print(f"Training probe gate on {N*T:,} positions...")
+    x = activations.reshape(-1, d_model)
+    y = labels.reshape(-1, n_features)
 
-    # Use the mean-shift direction as a pseudo-target for each feature
-    # This is fast and doesn't need labels — just detects positions that
-    # are "unusual" enough to warrant LLM inspection
-    x_flat = activations.reshape(-1, d_model)
+    # Class-balanced BCE for rare features
+    pos_counts = y.sum(dim=0).clamp(min=1.0)
+    neg_counts = y.shape[0] - pos_counts
+    pos_weight = (neg_counts / pos_counts).clamp(max=100.0).to(device)
 
-    # Simple probe: project onto random directions, threshold
-    # We'll return uniform scores (all positions sent to LLM) for now
-    # and let the actual probe be trained during the annotation step
-    # once we have a first pass of labels
-    #
-    # For the initial implementation: return None to indicate no gating
-    return None
+    probe = nn.Linear(d_model, n_features).to(device)
+    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    # Quick training: 5 epochs on the sample
+    batch_size = 2048
+    for epoch in range(5):
+        perm = torch.randperm(x.shape[0])
+        epoch_loss = 0.0
+        n_batches = 0
+        for i in range(0, x.shape[0], batch_size):
+            idx = perm[i:i + batch_size]
+            xb = x[idx].to(device)
+            yb = y[idx].to(device)
+            logits = probe(xb)
+            loss = loss_fn(logits, yb)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+
+    probe = probe.cpu().eval()
+    return probe
+
+
+def apply_probe_gate(
+    probe: "torch.nn.Linear",
+    activations: torch.Tensor,
+    threshold: float,
+    n_features: int,
+) -> torch.Tensor:
+    """Apply probe to identify positions that need LLM annotation.
+
+    Returns a boolean mask (N, T, n_features) where True = send to LLM.
+    Positions where probe sigmoid < threshold are confident negatives (False).
+    """
+    N, T, d_model = activations.shape
+    x = activations.reshape(-1, d_model)
+
+    with torch.no_grad():
+        logits = probe(x)  # (N*T, n_features)
+        scores = torch.sigmoid(logits)
+
+    mask = scores >= threshold  # True = ambiguous, needs LLM
+    mask = mask.reshape(N, T, n_features)
+
+    total = mask.numel()
+    sent = mask.sum().item()
+    skipped = total - sent
+    print(f"  Probe gate: {skipped:,}/{total:,} positions skipped "
+          f"({100 * skipped / total:.1f}%), {sent:,} sent to LLM")
+
+    return mask
 
 
 def annotate_local(
@@ -389,6 +448,7 @@ def annotate_local(
         else:
             return _annotate_local_vllm_pertoken(
                 tokens, features, all_token_strs, n_features, N, T, cfg,
+                activations=activations,
             )
     except ImportError:
         print("WARNING: vLLM not installed. Falling back to HuggingFace transformers.")
@@ -396,6 +456,29 @@ def annotate_local(
         return _annotate_local_hf(
             tokens, features, all_token_strs, n_features, N, T, cfg,
         )
+
+
+def _build_chunk_prompts(SYS, ASST, feat_descs, all_token_strs,
+                         seq_start, seq_end, T, n_features,
+                         gate_mask=None):
+    """Build per-token prompts for a chunk of sequences."""
+    prompts = []
+    positions = []
+    for seq_j in range(seq_start, seq_end):
+        seq_prefix = SYS
+        for tok_k in range(T):
+            seq_prefix += all_token_strs[seq_j][tok_k]
+            tok_str = all_token_strs[seq_j][tok_k].strip()
+            for fi in range(n_features):
+                if gate_mask is not None and not gate_mask[seq_j, tok_k, fi]:
+                    continue
+                suffix = (
+                    f'\nThe token is "{tok_str}". '
+                    f'Is it {feat_descs[fi]}?{ASST}'
+                )
+                prompts.append(seq_prefix + suffix)
+                positions.append((seq_j, tok_k, fi))
+    return prompts, positions
 
 
 def _benchmark_chunk_size(llm, params, SYS, ASST, feat_descs, all_token_strs,
@@ -493,6 +576,7 @@ def _annotate_local_vllm_pertoken(
     N: int,
     T: int,
     cfg: Config,
+    activations: torch.Tensor = None,
 ) -> torch.Tensor:
     """vLLM per-token with ChatML + allowed_token_ids.
 
@@ -544,10 +628,56 @@ def _annotate_local_vllm_pertoken(
         n_features, T, N,
     )
 
-    print(f"\nAnnotating: {n_features} features x {N} sequences x {T} tokens "
-          f"= {total_decisions:,} decisions (vLLM, per-token, chunk={seq_chunk})")
+    # ── Probe gate: two-pass annotation ──────────────────────────────
+    # Pass 1: annotate a small sample fully (no gating)
+    # Pass 2: train probe on those labels, gate the rest
+    gate_mask = None  # None = annotate everything
+    use_probe = (cfg.probe_gate_threshold > 0 and activations is not None
+                 and N > 200)
 
-    for seq_start in range(0, N, seq_chunk):
+    if use_probe:
+        sample_n = min(200, N // 5)
+        print(f"\n  Probe gate: annotating {sample_n} sequences fully (pass 1)...")
+
+        sample_prompts, sample_positions = _build_chunk_prompts(
+            SYS, ASST, feat_descs, all_token_strs, 0, sample_n, T, n_features,
+        )
+        sample_outputs = llm.generate(sample_prompts, params)
+        for idx, output in enumerate(sample_outputs):
+            seq_j, tok_k, fi = sample_positions[idx]
+            tid = output.outputs[0].token_ids[0]
+            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1 else 0.0
+
+        completed = len(sample_prompts)
+        print(f"    Pass 1 done: {completed:,} decisions")
+
+        # Train probe on sample labels
+        sample_acts = activations[:sample_n]
+        sample_labels = annotations[:sample_n]
+        probe = train_probe_gate(
+            sample_acts, sample_labels, n_features, cfg.device,
+        )
+        # Apply probe to ALL sequences (including sample — sample already annotated)
+        gate_mask = apply_probe_gate(
+            probe, activations, cfg.probe_gate_threshold, n_features,
+        )
+        # Mark sample sequences as already done
+        gate_mask[:sample_n] = False
+        del probe
+
+    total_with_gate = total_decisions
+    if gate_mask is not None:
+        total_with_gate = int(gate_mask.sum().item())
+
+    print(f"\nAnnotating: {n_features} features x {N} sequences x {T} tokens "
+          f"= {total_decisions:,} total decisions"
+          f"{f', {total_with_gate:,} after probe gate' if gate_mask is not None else ''}"
+          f" (vLLM, per-token, chunk={seq_chunk})")
+
+    # ── Main annotation loop ─────────────────────────────────────────
+    start_seq = (min(200, N // 5) if use_probe else 0)
+
+    for seq_start in range(start_seq, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
 
         prompts = []
@@ -559,6 +689,9 @@ def _annotate_local_vllm_pertoken(
                 seq_prefix += all_token_strs[seq_j][tok_k]
                 tok_str = all_token_strs[seq_j][tok_k].strip()
                 for fi in range(n_features):
+                    # Skip if probe says confident negative
+                    if gate_mask is not None and not gate_mask[seq_j, tok_k, fi]:
+                        continue
                     suffix = (
                         f'\nThe token is "{tok_str}". '
                         f'Is it {feat_descs[fi]}?{ASST}'
@@ -566,18 +699,19 @@ def _annotate_local_vllm_pertoken(
                     prompts.append(seq_prefix + suffix)
                     positions.append((seq_j, tok_k, fi))
 
-        outputs = llm.generate(prompts, params)
-
-        for idx, output in enumerate(outputs):
-            seq_j, tok_k, fi = positions[idx]
-            tid = output.outputs[0].token_ids[0]
-            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1 else 0.0
+        if prompts:
+            outputs = llm.generate(prompts, params)
+            for idx, output in enumerate(outputs):
+                seq_j, tok_k, fi = positions[idx]
+                tid = output.outputs[0].token_ids[0]
+                annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1 else 0.0
 
         completed += len(prompts)
         elapsed = time.time() - t_start
         rate = completed / elapsed if elapsed > 0 else 0
-        eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
-        print(f"  {completed:,}/{total_decisions:,} decisions  "
+        remaining = total_with_gate - completed
+        eta_sec = remaining / rate if rate > 0 else 0
+        print(f"  {completed:,}/{total_with_gate:,} decisions  "
               f"rate={rate:.0f}/s  ETA {eta_sec/3600:.1f}h")
 
     del llm
@@ -901,7 +1035,10 @@ def run(cfg: Config = None):
     else:
         if cfg.use_local_annotator:
             # v2: Decomposed single-feature single-token with local model
-            leaf_annotations = annotate_local(tokens, leaf_features, tokenizer_ref, cfg)
+            leaf_annotations = annotate_local(
+                tokens, leaf_features, tokenizer_ref, cfg,
+                activations=activations,
+            )
         else:
             # v1: API-based multi-feature annotation
             leaf_annotations = annotate_corpus(tokens, leaf_features, tokenizer_ref, cfg)
