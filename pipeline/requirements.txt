@@ -1,25 +1,16 @@
-# Core (numpy 2.x for vllm compat)
-torch>=2.6
-numpy>=2.0
-tqdm>=4.66
-
-# Transformers (4.56+ for Qwen3.5 support, <5 for vllm compat)
-transformers>=4.56,<5
-
-# vLLM (local annotation with prefix caching)
+# vLLM (pulls torch, numpy, transformers automatically)
 vllm>=0.18
 
 # Data
 datasets>=3.0
 huggingface_hub>=0.27
 
-# LLM annotation (via OpenRouter, OpenAI-compatible API)
+# LLM annotation (via OpenRouter)
 openai>=1.60
 
-# sae-lens and transformer-lens pin numpy<2 but work fine with numpy 2.x.
-# Install AFTER the above with --no-deps to avoid downgrading numpy:
+# Progress bars
+tqdm>=4.66
+
+# sae-lens + transformer-lens: install separately after the above.
+# They pin numpy<2 but work fine with numpy 2.x at runtime.
 #   pip install sae-lens transformer-lens --no-deps
-# Or just: pip install sae-lens transformer-lens
-# and ignore the numpy version warning — it works.
-sae-lens>=5.0
-transformer-lens>=2.8
