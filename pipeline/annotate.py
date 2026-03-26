@@ -370,82 +370,91 @@ def annotate_local(
 
 def _benchmark_vllm_ids(llm, params, sys_ids, tok_ids_per_seq, suffix_ids,
                          n_features, T, N):
-    """Benchmark vLLM with token-ID prompts. Verify caching, find optimal chunk.
+    """4-run cache isolation test.
 
-    Tests:
-      1. Cold vs warm (same prompts twice) — verifies cache persistence
-      2. Ordered vs shuffled positions — verifies incremental prefix caching
-      3. Chunk size sweep
+    Run 1: Cold — first time seeing these prompts
+    Run 2: Full cache hit — exact same prompts (should be 5-10x faster)
+    Run 3: Shared prefix — new suffixes, same sequence prefixes
+    Run 4: Cache miss — completely different text
+
+    If Run 2 isn't dramatically faster than Run 4, caching is broken.
     """
     import time as _time
-    import random as _random
 
-    bench_seqs = min(1, N)
-    bench_feats = min(5, n_features)  # small subset for speed
+    bench_feats = min(5, n_features)
 
-    def _build_ordered(n_seqs, n_feats):
-        """Build prompts in order: all features at pos 0, then pos 1, etc."""
+    def _build_seq(seq_j, n_feats, feat_offset=0):
         prompts = []
-        for seq_j in range(n_seqs):
-            prefix = list(sys_ids)
-            for tok_k in range(T):
-                prefix.extend(tok_ids_per_seq[seq_j][tok_k])
-                for fi in range(n_feats):
-                    prompts.append({"prompt_token_ids": prefix + suffix_ids[fi]})
+        prefix = list(sys_ids)
+        for tok_k in range(T):
+            prefix = prefix + list(tok_ids_per_seq[seq_j][tok_k])
+            for fi in range(feat_offset, min(feat_offset + n_feats, len(suffix_ids))):
+                prompts.append({"prompt_token_ids": prefix + suffix_ids[fi]})
         return prompts
 
-    ordered = _build_ordered(bench_seqs, bench_feats)
-    n = len(ordered)
-    print(f"\n  Benchmarking vLLM ({n} prompts, token-ID mode)...")
+    batch1 = _build_seq(0, bench_feats, feat_offset=0)
+    n = len(batch1)
+    print(f"\n  Cache isolation test ({n} prompts per batch)...")
 
-    # Test 1: Cold vs warm
+    # Run 1: Cold
     t0 = _time.time()
-    llm.generate(ordered, params)
-    cold = _time.time() - t0
+    llm.generate(batch1, params)
+    t_cold = _time.time() - t0
 
+    # Run 2: Full cache hit (exact same prompts)
     t0 = _time.time()
-    llm.generate(ordered, params)
-    warm = _time.time() - t0
+    llm.generate(batch1, params)
+    t_hit = _time.time() - t0
 
-    cold_rate = n / cold
-    warm_rate = n / warm
-    speedup = warm_rate / cold_rate if cold_rate > 0 else 1
-    print(f"    Cold: {cold_rate:.0f} p/s | Warm: {warm_rate:.0f} p/s | "
-          f"Speedup: {speedup:.2f}x {'CACHED' if speedup > 1.2 else 'NO CACHE'}")
-
-    # Test 2: Ordered vs shuffled (verifies incremental prefix caching)
-    shuffled = list(ordered)
-    _random.shuffle(shuffled)
+    # Run 3: Same prefixes, different suffixes
+    if n_features > bench_feats:
+        batch2 = _build_seq(0, bench_feats, feat_offset=bench_feats)
+    else:
+        batch2 = batch1
     t0 = _time.time()
-    llm.generate(shuffled, params)
-    shuffled_time = _time.time() - t0
-    shuffled_rate = n / shuffled_time
+    llm.generate(batch2, params)
+    t_shared = _time.time() - t0
 
-    order_benefit = warm_rate / shuffled_rate if shuffled_rate > 0 else 1
-    print(f"    Ordered: {warm_rate:.0f} p/s | Shuffled: {shuffled_rate:.0f} p/s | "
-          f"Order benefit: {order_benefit:.2f}x")
+    # Run 4: Completely different text (different sequence)
+    diff_seq = min(1, N - 1)
+    batch3 = _build_seq(diff_seq, bench_feats, feat_offset=0)
+    t0 = _time.time()
+    llm.generate(batch3, params)
+    t_miss = _time.time() - t0
 
-    # Sweep chunk sizes with full feature set
-    best_rate = warm_rate
-    best_chunk = min(5, N)
-    candidates = [c for c in [1, 2, 5, 10] if c <= N]
+    r_cold = n / t_cold
+    r_hit = n / t_hit
+    r_shared = n / t_shared
+    r_miss = n / t_miss
 
-    if len(candidates) > 1:
-        print(f"    Chunk sweep: {candidates}")
-        for chunk in candidates:
-            chunk_seqs = min(chunk, bench_seqs)
-            chunk_prompts = _build_ordered(chunk_seqs, bench_feats)
-            t0 = _time.time()
-            llm.generate(chunk_prompts, params)
-            elapsed = _time.time() - t0
-            rate = len(chunk_prompts) / elapsed if elapsed > 0 else 0
-            print(f"      chunk={chunk:>3}: {rate:.0f} p/s")
-            if rate > best_rate:
-                best_rate = rate
-                best_chunk = chunk
+    print(f"    Run 1 (cold):           {r_cold:>7.0f} p/s  ({t_cold:.1f}s)")
+    print(f"    Run 2 (full cache hit):  {r_hit:>7.0f} p/s  ({t_hit:.1f}s)")
+    print(f"    Run 3 (shared prefix):   {r_shared:>7.0f} p/s  ({t_shared:.1f}s)")
+    print(f"    Run 4 (cache miss):      {r_miss:>7.0f} p/s  ({t_miss:.1f}s)")
 
-    print(f"    Selected: seq_chunk={best_chunk} ({best_rate:.0f} p/s)")
-    return best_chunk
+    hit_vs_miss = r_hit / r_miss if r_miss > 0 else 1
+    shared_vs_miss = r_shared / r_miss if r_miss > 0 else 1
+
+    if hit_vs_miss > 5:
+        status = "EXCELLENT"
+    elif hit_vs_miss > 2:
+        status = "WORKING"
+    else:
+        status = "BROKEN"
+
+    print(f"    Hit/miss ratio: {hit_vs_miss:.1f}x — {status}")
+    print(f"    Prefix reuse:   {shared_vs_miss:.1f}x")
+
+    # Select chunk size based on cache health
+    if hit_vs_miss > 3:
+        chunk = min(5, N)
+    elif hit_vs_miss > 1.5:
+        chunk = min(2, N)
+    else:
+        chunk = 1
+
+    print(f"    Selected: seq_chunk={chunk}")
+    return chunk
 
 
 def _annotate_local_vllm_pertoken(
