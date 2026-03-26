@@ -66,7 +66,7 @@ class Config:
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API
-    local_annotator_model: str = "Qwen/Qwen3.5-4B"  # small + fast decode
+    local_annotator_model: str = "Qwen/Qwen3-8B"  # pure transformer, prefix caching works
     local_annotation_batch_size: int = 64
     batch_positions: bool = False  # True = full-sequence JSON, False = per-token
 

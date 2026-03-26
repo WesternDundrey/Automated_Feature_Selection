@@ -1,16 +1,15 @@
-# vLLM (pulls torch, numpy, transformers automatically)
+# Install with: pip install -r pipeline/requirements.txt && pip install sae-lens transformer-lens --no-deps
+# Or use setup.sh which handles the install order.
+
+# Inference engine (pulls torch, numpy>=2, transformers>=4.56 automatically)
 vllm>=0.18
 
-# Data
+# Data loading
 datasets>=3.0
 huggingface_hub>=0.27
 
-# LLM annotation (via OpenRouter)
+# API annotation (OpenRouter)
 openai>=1.60
 
 # Progress bars
 tqdm>=4.66
-
-# sae-lens + transformer-lens: install separately after the above.
-# They pin numpy<2 but work fine with numpy 2.x at runtime.
-#   pip install sae-lens transformer-lens --no-deps
