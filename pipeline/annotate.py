@@ -368,72 +368,83 @@ def annotate_local(
         )
 
 
-def _benchmark_vllm(llm, params, SYS, feat_suffixes, all_token_strs,
-                     n_features, T, N):
-    """Benchmark vLLM: verify prefix caching, sweep chunk sizes.
+def _benchmark_vllm_ids(llm, params, sys_ids, tok_ids_per_seq, suffix_ids,
+                         n_features, T, N):
+    """Benchmark vLLM with token-ID prompts. Verify caching, find optimal chunk.
 
-    Uses the new architecture (feature defs in system, ID suffix).
-    Returns optimal seq_chunk.
+    Tests:
+      1. Cold vs warm (same prompts twice) — verifies cache persistence
+      2. Ordered vs shuffled positions — verifies incremental prefix caching
+      3. Chunk size sweep
     """
     import time as _time
+    import random as _random
 
-    bench_seqs = min(2, N)
+    bench_seqs = min(1, N)
+    bench_feats = min(5, n_features)  # small subset for speed
 
-    def _build(n_seqs):
+    def _build_ordered(n_seqs, n_feats):
+        """Build prompts in order: all features at pos 0, then pos 1, etc."""
         prompts = []
         for seq_j in range(n_seqs):
-            seq_prefix = SYS
+            prefix = list(sys_ids)
             for tok_k in range(T):
-                seq_prefix += all_token_strs[seq_j][tok_k]
-                for fi in range(n_features):
-                    prompts.append(seq_prefix + feat_suffixes[fi])
+                prefix.extend(tok_ids_per_seq[seq_j][tok_k])
+                for fi in range(n_feats):
+                    prompts.append({"prompt_token_ids": prefix + suffix_ids[fi]})
         return prompts
 
-    prompts = _build(bench_seqs)
-    n_prompts = len(prompts)
-    print(f"\n  Benchmarking vLLM ({n_prompts} prompts, {bench_seqs} sequences)...")
+    ordered = _build_ordered(bench_seqs, bench_feats)
+    n = len(ordered)
+    print(f"\n  Benchmarking vLLM ({n} prompts, token-ID mode)...")
 
-    # Cold run
+    # Test 1: Cold vs warm
     t0 = _time.time()
-    llm.generate(prompts, params)
-    cold_time = _time.time() - t0
-    cold_rate = n_prompts / cold_time
+    llm.generate(ordered, params)
+    cold = _time.time() - t0
 
-    # Warm run (same prompts — cache should help)
     t0 = _time.time()
-    llm.generate(prompts, params)
-    warm_time = _time.time() - t0
-    warm_rate = n_prompts / warm_time
+    llm.generate(ordered, params)
+    warm = _time.time() - t0
 
-    cache_speedup = warm_rate / cold_rate if cold_rate > 0 else 1.0
-    print(f"    Cold: {cold_rate:.0f} prompts/s ({cold_time:.1f}s)")
-    print(f"    Warm: {warm_rate:.0f} prompts/s ({warm_time:.1f}s)")
-    print(f"    Cache speedup: {cache_speedup:.2f}x "
-          f"({'ACTIVE' if cache_speedup > 1.2 else 'NOT DETECTED'})")
+    cold_rate = n / cold
+    warm_rate = n / warm
+    speedup = warm_rate / cold_rate if cold_rate > 0 else 1
+    print(f"    Cold: {cold_rate:.0f} p/s | Warm: {warm_rate:.0f} p/s | "
+          f"Speedup: {speedup:.2f}x {'CACHED' if speedup > 1.2 else 'NO CACHE'}")
 
-    # Sweep chunk sizes
+    # Test 2: Ordered vs shuffled (verifies incremental prefix caching)
+    shuffled = list(ordered)
+    _random.shuffle(shuffled)
+    t0 = _time.time()
+    llm.generate(shuffled, params)
+    shuffled_time = _time.time() - t0
+    shuffled_rate = n / shuffled_time
+
+    order_benefit = warm_rate / shuffled_rate if shuffled_rate > 0 else 1
+    print(f"    Ordered: {warm_rate:.0f} p/s | Shuffled: {shuffled_rate:.0f} p/s | "
+          f"Order benefit: {order_benefit:.2f}x")
+
+    # Sweep chunk sizes with full feature set
     best_rate = warm_rate
-    best_chunk = min(10, N)
-    candidates = [c for c in [1, 2, 5, 10, 20] if c <= N]
+    best_chunk = min(5, N)
+    candidates = [c for c in [1, 2, 5, 10] if c <= N]
 
-    if len(candidates) > 1 and n_prompts > 500:
-        print(f"    Sweeping chunk sizes: {candidates}")
-        prompts_per_seq = T * n_features
+    if len(candidates) > 1:
+        print(f"    Chunk sweep: {candidates}")
         for chunk in candidates:
-            n_chunk = min(chunk, bench_seqs) * prompts_per_seq
-            chunk_prompts = prompts[:n_chunk]
-            if not chunk_prompts:
-                continue
+            chunk_seqs = min(chunk, bench_seqs)
+            chunk_prompts = _build_ordered(chunk_seqs, bench_feats)
             t0 = _time.time()
             llm.generate(chunk_prompts, params)
             elapsed = _time.time() - t0
             rate = len(chunk_prompts) / elapsed if elapsed > 0 else 0
-            print(f"      chunk={chunk:>3}: {rate:.0f} prompts/s")
+            print(f"      chunk={chunk:>3}: {rate:.0f} p/s")
             if rate > best_rate:
                 best_rate = rate
                 best_chunk = chunk
 
-    print(f"    Best: seq_chunk={best_chunk} ({best_rate:.0f} prompts/s)")
+    print(f"    Selected: seq_chunk={best_chunk} ({best_rate:.0f} p/s)")
     return best_chunk
 
 
@@ -446,19 +457,16 @@ def _annotate_local_vllm_pertoken(
     T: int,
     cfg: Config,
 ) -> torch.Tensor:
-    """vLLM per-token with perfect prefix caching architecture.
+    """vLLM per-token with guaranteed-perfect prefix caching.
 
-    All feature definitions are in the system prompt (Level 0 cache).
-    Sequence tokens grow incrementally (Level 1 cache).
-    The suffix is just a feature ID (~6 tokens) — minimal non-cached compute.
+    All prompts built as TOKEN ID lists (not strings) to guarantee
+    token-level prefix alignment. BPE merges across string boundaries
+    can't break the prefix match when IDs are pre-tokenized separately.
 
-    Cache hierarchy (for 80 features at position 64):
-      Level 0: System + all feature defs (~200 tokens) — computed ONCE
-      Level 1: + tok_0...tok_64 (~64 tokens) — grows by 1 per position
-      Variable: "\\nF12\\n" + ASST (~6 tokens) — only non-cached part
-
-    Total non-cached compute: 6 tokens per prompt
-    vs previous architecture: ~20 tokens per prompt (3.3x improvement)
+    Cache hierarchy:
+      Level 0: sys_ids (~200 tokens) — shared across ALL prompts
+      Level 1: + tok_ids[0:k+1] — grows by exact token IDs per position
+      Variable: suffix_ids[fi] (~6 tokens) — only non-cached part
     """
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
@@ -469,6 +477,45 @@ def _annotate_local_vllm_pertoken(
     tok_0_id = ann_tokenizer.encode("0", add_special_tokens=False)[0]
     tok_1_id = ann_tokenizer.encode("1", add_special_tokens=False)[0]
     print(f"  Token IDs: '0'={tok_0_id}, '1'={tok_1_id}")
+
+    # ── Pre-tokenize everything as token IDs ─────────────────────────
+    # This guarantees prefix alignment: concatenating ID lists is exact,
+    # unlike concatenating strings then tokenizing (BPE boundary merges).
+
+    feat_defs = "\n".join(
+        f"F{i}: {feat['description']}" for i, feat in enumerate(features)
+    )
+    SYS_STR = (
+        "<|im_start|>system\n"
+        "Feature annotator. For the last token shown, answer which "
+        "feature ID matches. Answer 0 (no) or 1 (yes).\n\n"
+        f"{feat_defs}<|im_end|>\n"
+        "<|im_start|>user\n"
+    )
+    ASST_STR = "<|im_end|>\n<|im_start|>assistant\n"
+
+    sys_ids = ann_tokenizer.encode(SYS_STR, add_special_tokens=False)
+    print(f"  System prompt: {len(sys_ids)} tokens (cached L0)")
+
+    # Pre-tokenize each GPT-2 token string individually
+    print("  Pre-tokenizing sequence tokens...")
+    tok_ids_per_seq = []
+    for seq_j in range(N):
+        seq_tok_ids = []
+        for tok_k in range(T):
+            piece = all_token_strs[seq_j][tok_k]
+            ids = ann_tokenizer.encode(piece, add_special_tokens=False)
+            seq_tok_ids.append(ids)
+        tok_ids_per_seq.append(seq_tok_ids)
+
+    # Pre-tokenize feature suffixes
+    suffix_ids = []
+    for fi in range(n_features):
+        s = f"\nF{fi}{ASST_STR}"
+        ids = ann_tokenizer.encode(s, add_special_tokens=False)
+        suffix_ids.append(ids)
+
+    print(f"  Suffix tokens: {len(suffix_ids[0])} per feature")
     del ann_tokenizer
 
     llm = LLM(
@@ -489,34 +536,15 @@ def _annotate_local_vllm_pertoken(
     completed = 0
     t_start = time.time()
 
-    # ── Build system prompt with ALL feature definitions (Level 0 cache) ──
-    # This is ~200 tokens, computed once, shared across every prompt.
-    feat_defs = "\n".join(
-        f"F{i}: {feat['description']}" for i, feat in enumerate(features)
-    )
-    SYS = (
-        "<|im_start|>system\n"
-        "Feature annotator. For the last token shown, answer which "
-        "feature ID matches. Answer 0 (no) or 1 (yes).\n\n"
-        f"{feat_defs}<|im_end|>\n"
-        "<|im_start|>user\n"
-    )
-    ASST = "<|im_end|>\n<|im_start|>assistant\n"
-
-    # Feature suffixes — just the ID, ~6 tokens each
-    feat_suffixes = [f"\nF{i}{ASST}" for i in range(n_features)]
-
-    # Benchmark chunk size and verify caching
-    seq_chunk = _benchmark_vllm(
-        llm, params, SYS, feat_suffixes, all_token_strs,
+    # ── Benchmark: verify caching with token IDs ─────────────────────
+    seq_chunk = _benchmark_vllm_ids(
+        llm, params, sys_ids, tok_ids_per_seq, suffix_ids,
         n_features, T, N,
     )
 
     print(f"\nAnnotating: {n_features} features x {N} sequences x {T} tokens "
           f"= {total_decisions:,} decisions "
-          f"(vLLM, per-token, prefix-cached, chunk={seq_chunk})")
-    print(f"  System prompt: {len(SYS)} chars (~{len(SYS)//4} tokens, cached L0)")
-    print(f"  Suffix per prompt: ~6 tokens (feature ID only)")
+          f"(vLLM, token-ID prefixes, chunk={seq_chunk})")
 
     for seq_start in range(0, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
@@ -525,11 +553,13 @@ def _annotate_local_vllm_pertoken(
         positions = []
 
         for seq_j in range(seq_start, seq_end):
-            seq_prefix = SYS
+            # Build prefix incrementally as token ID list
+            prefix_ids = list(sys_ids)
             for tok_k in range(T):
-                seq_prefix += all_token_strs[seq_j][tok_k]
+                prefix_ids.extend(tok_ids_per_seq[seq_j][tok_k])
                 for fi in range(n_features):
-                    prompts.append(seq_prefix + feat_suffixes[fi])
+                    prompt_ids = prefix_ids + suffix_ids[fi]
+                    prompts.append({"prompt_token_ids": prompt_ids})
                     positions.append((seq_j, tok_k, fi))
 
         outputs = llm.generate(prompts, params)
