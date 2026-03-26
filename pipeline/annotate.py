@@ -591,10 +591,12 @@ def _annotate_local_vllm_pertoken(
         max_model_len=1024,
         gpu_memory_utilization=0.95,
     )
+    # Qwen3 needs to "think" before answering — allowed_token_ids
+    # forces the first token and the model always picks "0".
+    # Let it think (max_tokens=20), parse answer after </think>.
     params = SamplingParams(
-        max_tokens=1,
+        max_tokens=20,
         temperature=0,
-        allowed_token_ids=[tok_0_id, tok_1_id],
     )
 
     annotations = torch.zeros(N, T, n_features)
@@ -655,8 +657,17 @@ def _annotate_local_vllm_pertoken(
 
         for idx, output in enumerate(outputs):
             seq_j, tok_k, fi = positions[idx]
-            tid = output.outputs[0].token_ids[0]
-            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1_id else 0.0
+            text = output.outputs[0].text
+            if "</think>" in text:
+                text = text.split("</think>", 1)[1]
+            label = 0.0
+            for ch in text:
+                if ch == "1":
+                    label = 1.0
+                    break
+                elif ch == "0":
+                    break
+            annotations[seq_j, tok_k, fi] = label
 
         completed += len(prompts)
         elapsed = time.time() - t_start
