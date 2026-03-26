@@ -1,22 +1,13 @@
-# Install with: uv pip install --system -r pipeline/requirements.txt
+# DO NOT use this file directly. Run: bash install.sh
+# The install script handles the numpy version conflict properly.
 #
-# numpy conflict: vllm needs >=2, sae-lens pins <2.
-# We force numpy>=2 and it works fine at runtime.
+# If you must use this file:
+#   pip install -r pipeline/requirements.txt
+#   pip install sae-lens transformer-lens --no-deps
+#   pip install jaxtyping einops fancy-einsum torchtyping typeguard wandb
 
-# Inference + model loading
 vllm>=0.18
-sae-lens>=5.0
-transformer-lens>=2.8
-
-# Force numpy 2.x (sae-lens pins <2 but works fine with 2.x)
-numpy>=2.0
-
-# Data
 datasets>=3.0
 huggingface_hub>=0.27
-
-# API annotation
 openai>=1.60
-
-# Misc
 tqdm>=4.66
