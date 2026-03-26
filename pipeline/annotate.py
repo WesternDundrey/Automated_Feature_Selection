@@ -546,20 +546,29 @@ def _annotate_local_vllm_pertoken(
           f"= {total_decisions:,} decisions "
           f"(vLLM, token-ID prefixes, chunk={seq_chunk})")
 
+    # Convert suffix_ids to tuples for faster concatenation
+    sys_tuple = tuple(sys_ids)
+    suffix_tuples = [tuple(s) for s in suffix_ids]
+    tok_id_tuples = [
+        [tuple(tok_ids_per_seq[j][k]) for k in range(T)]
+        for j in range(N)
+    ]
+
     for seq_start in range(0, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
 
+        # Pre-build all prefix tuples for this chunk, then generate prompts
         prompts = []
         positions = []
 
         for seq_j in range(seq_start, seq_end):
-            # Build prefix incrementally as token ID list
-            prefix_ids = list(sys_ids)
+            prefix = sys_tuple
             for tok_k in range(T):
-                prefix_ids.extend(tok_ids_per_seq[seq_j][tok_k])
+                prefix = prefix + tok_id_tuples[seq_j][tok_k]
                 for fi in range(n_features):
-                    prompt_ids = prefix_ids + suffix_ids[fi]
-                    prompts.append({"prompt_token_ids": prompt_ids})
+                    prompts.append({
+                        "prompt_token_ids": list(prefix + suffix_tuples[fi])
+                    })
                     positions.append((seq_j, tok_k, fi))
 
         outputs = llm.generate(prompts, params)

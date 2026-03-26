@@ -48,7 +48,8 @@ def main():
     parser.add_argument(
         "--step", default=None,
         choices=["inventory", "annotate", "train", "evaluate",
-                 "agreement", "ablation", "residual", "causal", "ioi"],
+                 "agreement", "ablation", "residual", "causal", "ioi",
+                 "validate-annotator"],
         help="Run only this step",
     )
     args = parser.parse_args()
@@ -208,6 +209,16 @@ def main():
         skip_ann = not cfg.use_local_annotator
         run_ioi(cfg, skip_annotator=skip_ann)
         print(f"IOI validation completed in {time.time() - t0:.1f}s")
+
+    # Annotator validation on trivial features
+    if args.step == "validate-annotator":
+        print("\n" + "=" * 70)
+        print("ANNOTATOR VALIDATION (trivial features)")
+        print("=" * 70)
+        t0 = time.time()
+        from .validate_annotator import run as run_validate
+        run_validate(cfg)
+        print(f"Validation completed in {time.time() - t0:.1f}s")
 
     print(f"\nTotal pipeline time: {time.time() - t_total:.1f}s")
 
