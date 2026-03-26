@@ -504,8 +504,9 @@ def _annotate_local_vllm_pertoken(
 
     SYS_STR = (
         "<|im_start|>system\n"
-        "You are a feature annotator. You will see text tokens and a question "
-        "about the last token. Answer 0 for no or 1 for yes."
+        "/no_think\n"
+        "You annotate tokens. You see text ending with a token, then a yes/no "
+        "question about that token. Answer only 0 (no) or 1 (yes)."
         "<|im_end|>\n"
         "<|im_start|>user\n"
     )
@@ -525,19 +526,20 @@ def _annotate_local_vllm_pertoken(
             seq_tok_ids.append(ids)
         tok_ids_per_seq.append(seq_tok_ids)
 
-    # Pre-tokenize feature suffixes — include the full question
-    suffix_ids = []
+    # Pre-tokenize feature descriptions (suffix varies per feature AND position)
+    feat_descs_encoded = []
     for fi, feat in enumerate(features):
         desc = feat["description"].rstrip(".").lower()
-        s = f"\nIs the last token {desc}?{ASST_STR}"
-        ids = ann_tokenizer.encode(s, add_special_tokens=False)
-        suffix_ids.append(ids)
+        feat_descs_encoded.append(desc)
 
-    print(f"  Suffix tokens: {len(suffix_ids[0])} per feature")
+    # Suffix builder: includes the actual token text for clarity
+    def make_suffix(tok_str, feat_desc):
+        s = f'\nToken: "{tok_str.strip()}". {feat_desc}?{ASST_STR}'
+        return ann_tokenizer.encode(s, add_special_tokens=False)
 
-    # Debug: show first prompt decoded so we can verify format
-    sample_prefix = list(sys_ids) + tok_ids_per_seq[0][0]
-    sample_prompt = sample_prefix + suffix_ids[0]
+    # Debug: show sample prompt
+    sample_suffix = make_suffix(all_token_strs[0][0], feat_descs_encoded[0])
+    sample_prompt = list(sys_ids) + tok_ids_per_seq[0][0] + sample_suffix
     print(f"\n  Sample prompt (seq=0, pos=0, feat=0):")
     print(f"  {ann_tokenizer.decode(sample_prompt)}")
     print()
@@ -586,18 +588,35 @@ def _annotate_local_vllm_pertoken(
           f"= {total_decisions:,} decisions "
           f"(vLLM, token-ID prefixes, chunk={seq_chunk})")
 
-    # Convert suffix_ids to tuples for faster concatenation
+    # Convert to tuples for faster concatenation
     sys_tuple = tuple(sys_ids)
-    suffix_tuples = [tuple(s) for s in suffix_ids]
     tok_id_tuples = [
         [tuple(tok_ids_per_seq[j][k]) for k in range(T)]
         for j in range(N)
     ]
 
+    # Pre-encode suffixes for each (seq, pos, feat) — includes the token text
+    # This is O(N*T*F) strings but each is short (~15 tokens)
+    print("  Pre-encoding suffixes...")
+    from transformers import AutoTokenizer as _AT
+    _tok = _AT.from_pretrained(cfg.local_annotator_model)
+    ASST_ENC = _tok.encode(ASST_STR, add_special_tokens=False)
+    suffix_cache = {}  # (tok_str, fi) -> tuple of token IDs
+    for seq_j in range(N):
+        for tok_k in range(T):
+            tok_str = all_token_strs[seq_j][tok_k].strip()
+            for fi in range(n_features):
+                key = (tok_str, fi)
+                if key not in suffix_cache:
+                    s = f'\nToken: "{tok_str}". {feat_descs_encoded[fi]}?'
+                    ids = _tok.encode(s, add_special_tokens=False) + ASST_ENC
+                    suffix_cache[key] = tuple(ids)
+    del _tok
+    print(f"  Cached {len(suffix_cache)} unique suffixes")
+
     for seq_start in range(0, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
 
-        # Pre-build all prefix tuples for this chunk, then generate prompts
         prompts = []
         positions = []
 
@@ -605,9 +624,11 @@ def _annotate_local_vllm_pertoken(
             prefix = sys_tuple
             for tok_k in range(T):
                 prefix = prefix + tok_id_tuples[seq_j][tok_k]
+                tok_str = all_token_strs[seq_j][tok_k].strip()
                 for fi in range(n_features):
+                    suf = suffix_cache[(tok_str, fi)]
                     prompts.append({
-                        "prompt_token_ids": list(prefix + suffix_tuples[fi])
+                        "prompt_token_ids": list(prefix + suf)
                     })
                     positions.append((seq_j, tok_k, fi))
 
