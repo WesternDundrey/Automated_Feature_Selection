@@ -26,7 +26,7 @@ uv pip install --system vllm>=0.18
 uv pip install --system sae-lens>=5.0 transformer-lens>=2.8 --no-deps
 
 # pre-download annotator model
-python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3.5-9B')" || true
+python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3.5-4B')" || true
 
 # git config if provided
 [ -n "$GIT_USERNAME" ] && [ -n "$GIT_EMAIL" ] && \

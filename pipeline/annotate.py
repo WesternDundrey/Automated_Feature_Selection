@@ -322,112 +322,23 @@ def _format_annotator_context(token_strs: list[str], target_pos: int) -> str:
     return "".join(parts)
 
 
-def train_probe_gate(
-    activations: torch.Tensor,
-    labels: torch.Tensor,
-    n_features: int,
-    device: str = "cuda",
-) -> "torch.nn.Linear":
-    """Train a linear probe on labeled activations for gating.
-
-    The probe predicts P(feature_i = 1 | activation) for each feature.
-    Positions where sigmoid(probe_output) < threshold are confident negatives
-    and can skip LLM annotation.
-
-    Args:
-        activations: (N_sample, T, d_model) — activations from a small labeled sample
-        labels: (N_sample, T, n_features) — LLM annotations from the sample
-        n_features: number of leaf features
-        device: training device
-
-    Returns:
-        Trained nn.Linear(d_model, n_features) probe on CPU.
-    """
-    import torch.nn as nn
-
-    N, T, d_model = activations.shape
-    x = activations.reshape(-1, d_model)
-    y = labels.reshape(-1, n_features)
-
-    # Class-balanced BCE for rare features
-    pos_counts = y.sum(dim=0).clamp(min=1.0)
-    neg_counts = y.shape[0] - pos_counts
-    pos_weight = (neg_counts / pos_counts).clamp(max=100.0).to(device)
-
-    probe = nn.Linear(d_model, n_features).to(device)
-    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-    # Quick training: 5 epochs on the sample
-    batch_size = 2048
-    for epoch in range(5):
-        perm = torch.randperm(x.shape[0])
-        epoch_loss = 0.0
-        n_batches = 0
-        for i in range(0, x.shape[0], batch_size):
-            idx = perm[i:i + batch_size]
-            xb = x[idx].to(device)
-            yb = y[idx].to(device)
-            logits = probe(xb)
-            loss = loss_fn(logits, yb)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            epoch_loss += loss.item()
-            n_batches += 1
-
-    probe = probe.cpu().eval()
-    return probe
-
-
-def apply_probe_gate(
-    probe: "torch.nn.Linear",
-    activations: torch.Tensor,
-    threshold: float,
-    n_features: int,
-) -> torch.Tensor:
-    """Apply probe to identify positions that need LLM annotation.
-
-    Returns a boolean mask (N, T, n_features) where True = send to LLM.
-    Positions where probe sigmoid < threshold are confident negatives (False).
-    """
-    N, T, d_model = activations.shape
-    x = activations.reshape(-1, d_model)
-
-    with torch.no_grad():
-        logits = probe(x)  # (N*T, n_features)
-        scores = torch.sigmoid(logits)
-
-    mask = scores >= threshold  # True = ambiguous, needs LLM
-    mask = mask.reshape(N, T, n_features)
-
-    total = mask.numel()
-    sent = mask.sum().item()
-    skipped = total - sent
-    print(f"  Probe gate: {skipped:,}/{total:,} positions skipped "
-          f"({100 * skipped / total:.1f}%), {sent:,} sent to LLM")
-
-    return mask
-
-
 def annotate_local(
     tokens: torch.Tensor,
     features: list[dict],
     base_tokenizer,
     cfg: Config,
-    activations: torch.Tensor = None,
 ) -> torch.Tensor:
-    """Local annotation with vLLM.
+    """Local annotation with vLLM, optimized prefix caching.
 
-    Two modes (cfg.batch_positions):
-      per-token (default): N×T×n_features prompts, 1 output token each.
-      batch-positions (--batch-positions): Full-sequence JSON, all features at once.
+    Architecture for maximum cache reuse:
+      Level 0: System prompt with ALL feature definitions (~200 tokens)
+               Computed ONCE, cached across every prompt in the run.
+      Level 1: Sequence tokens up to position k (~k tokens)
+               Grows by 1 token per position, cached across all features.
+      Variable: Feature ID "\\nF12\\n" + assistant tag (~6 tokens)
+               The only non-cached part per prompt.
 
-    If probe_gate_threshold > 0 and activations are provided, trains a linear
-    probe to skip LLM calls for confident negatives (~85% of positions).
-    All positive labels come from the LLM — the probe never generates a "1".
-
-    vLLM (primary), HF transformers (fallback for per-token only).
+    vLLM (primary), HF transformers (fallback).
     """
     N, T = tokens.shape
     n_features = len(features)
@@ -448,7 +359,6 @@ def annotate_local(
         else:
             return _annotate_local_vllm_pertoken(
                 tokens, features, all_token_strs, n_features, N, T, cfg,
-                activations=activations,
             )
     except ImportError:
         print("WARNING: vLLM not installed. Falling back to HuggingFace transformers.")
@@ -458,111 +368,70 @@ def annotate_local(
         )
 
 
-def _build_chunk_prompts(SYS, ASST, feat_descs, all_token_strs,
-                         seq_start, seq_end, T, n_features,
-                         gate_mask=None):
-    """Build per-token prompts for a chunk of sequences."""
-    prompts = []
-    positions = []
-    for seq_j in range(seq_start, seq_end):
-        seq_prefix = SYS
-        for tok_k in range(T):
-            seq_prefix += all_token_strs[seq_j][tok_k]
-            tok_str = all_token_strs[seq_j][tok_k].strip()
-            for fi in range(n_features):
-                if gate_mask is not None and not gate_mask[seq_j, tok_k, fi]:
-                    continue
-                suffix = (
-                    f'\nThe token is "{tok_str}". '
-                    f'Is it {feat_descs[fi]}?{ASST}'
-                )
-                prompts.append(seq_prefix + suffix)
-                positions.append((seq_j, tok_k, fi))
-    return prompts, positions
+def _benchmark_vllm(llm, params, SYS, feat_suffixes, all_token_strs,
+                     n_features, T, N):
+    """Benchmark vLLM: verify prefix caching, sweep chunk sizes.
 
-
-def _benchmark_chunk_size(llm, params, SYS, ASST, feat_descs, all_token_strs,
-                          n_features, T, N):
-    """Sweep chunk sizes to find optimal throughput, verify prefix caching.
-
-    Runs ~1000 prompts at each chunk size using the first few sequences.
-    Also runs the same prompts twice to verify caching is active.
-    Takes ~1-2 minutes. Returns the best seq_chunk value.
+    Uses the new architecture (feature defs in system, ID suffix).
+    Returns optimal seq_chunk.
     """
     import time as _time
 
-    # Use first 2 sequences for benchmarking (2 × 128 × n_features prompts per chunk)
     bench_seqs = min(2, N)
-    prompts_per_seq = T * n_features
 
-    def _build_prompts(n_seqs):
+    def _build(n_seqs):
         prompts = []
         for seq_j in range(n_seqs):
             seq_prefix = SYS
             for tok_k in range(T):
                 seq_prefix += all_token_strs[seq_j][tok_k]
-                tok_str = all_token_strs[seq_j][tok_k].strip()
                 for fi in range(n_features):
-                    suffix = (
-                        f'\nThe token is "{tok_str}". '
-                        f'Is it {feat_descs[fi]}?{ASST}'
-                    )
-                    prompts.append(seq_prefix + suffix)
+                    prompts.append(seq_prefix + feat_suffixes[fi])
         return prompts
 
-    prompts = _build_prompts(bench_seqs)
+    prompts = _build(bench_seqs)
     n_prompts = len(prompts)
-
     print(f"\n  Benchmarking vLLM ({n_prompts} prompts, {bench_seqs} sequences)...")
 
-    # Run 1: cold cache
+    # Cold run
     t0 = _time.time()
     llm.generate(prompts, params)
     cold_time = _time.time() - t0
     cold_rate = n_prompts / cold_time
 
-    # Run 2: warm cache (same prompts — should be faster if caching works)
+    # Warm run (same prompts — cache should help)
     t0 = _time.time()
     llm.generate(prompts, params)
     warm_time = _time.time() - t0
     warm_rate = n_prompts / warm_time
 
     cache_speedup = warm_rate / cold_rate if cold_rate > 0 else 1.0
-    caching_active = cache_speedup > 1.2
-
     print(f"    Cold: {cold_rate:.0f} prompts/s ({cold_time:.1f}s)")
     print(f"    Warm: {warm_rate:.0f} prompts/s ({warm_time:.1f}s)")
     print(f"    Cache speedup: {cache_speedup:.2f}x "
-          f"({'ACTIVE' if caching_active else 'NOT DETECTED'})")
+          f"({'ACTIVE' if cache_speedup > 1.2 else 'NOT DETECTED'})")
 
-    # Sweep chunk sizes: try 1, 2, 5, 10, 20 sequences per chunk
-    # Use the benchmark prompts split into different chunk sizes
-    best_rate = 0
-    best_chunk = 1
+    # Sweep chunk sizes
+    best_rate = warm_rate
+    best_chunk = min(10, N)
     candidates = [c for c in [1, 2, 5, 10, 20] if c <= N]
 
     if len(candidates) > 1 and n_prompts > 500:
         print(f"    Sweeping chunk sizes: {candidates}")
+        prompts_per_seq = T * n_features
         for chunk in candidates:
-            n_chunk_prompts = min(chunk, bench_seqs) * prompts_per_seq
-            chunk_prompts = prompts[:n_chunk_prompts]
+            n_chunk = min(chunk, bench_seqs) * prompts_per_seq
+            chunk_prompts = prompts[:n_chunk]
             if not chunk_prompts:
                 continue
-
             t0 = _time.time()
             llm.generate(chunk_prompts, params)
             elapsed = _time.time() - t0
             rate = len(chunk_prompts) / elapsed if elapsed > 0 else 0
-
-            print(f"      chunk={chunk:>3}: {rate:.0f} prompts/s "
-                  f"({len(chunk_prompts)} prompts in {elapsed:.1f}s)")
-
+            print(f"      chunk={chunk:>3}: {rate:.0f} prompts/s")
             if rate > best_rate:
                 best_rate = rate
                 best_chunk = chunk
-    else:
-        best_chunk = min(10, N)
-        best_rate = warm_rate
 
     print(f"    Best: seq_chunk={best_chunk} ({best_rate:.0f} prompts/s)")
     return best_chunk
@@ -576,12 +445,20 @@ def _annotate_local_vllm_pertoken(
     N: int,
     T: int,
     cfg: Config,
-    activations: torch.Tensor = None,
 ) -> torch.Tensor:
-    """vLLM per-token with ChatML + allowed_token_ids.
+    """vLLM per-token with perfect prefix caching architecture.
 
-    Sequence-first prefix caching. Explicit target token in suffix.
-    Forced binary output via allowed_token_ids.
+    All feature definitions are in the system prompt (Level 0 cache).
+    Sequence tokens grow incrementally (Level 1 cache).
+    The suffix is just a feature ID (~6 tokens) — minimal non-cached compute.
+
+    Cache hierarchy (for 80 features at position 64):
+      Level 0: System + all feature defs (~200 tokens) — computed ONCE
+      Level 1: + tok_0...tok_64 (~64 tokens) — grows by 1 per position
+      Variable: "\\nF12\\n" + ASST (~6 tokens) — only non-cached part
+
+    Total non-cached compute: 6 tokens per prompt
+    vs previous architecture: ~20 tokens per prompt (3.3x improvement)
     """
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
@@ -589,9 +466,9 @@ def _annotate_local_vllm_pertoken(
     print(f"Loading local annotator via vLLM: {cfg.local_annotator_model}")
 
     ann_tokenizer = AutoTokenizer.from_pretrained(cfg.local_annotator_model)
-    tok_0 = ann_tokenizer.encode("0", add_special_tokens=False)[0]
-    tok_1 = ann_tokenizer.encode("1", add_special_tokens=False)[0]
-    print(f"  Token IDs: '0'={tok_0}, '1'={tok_1}")
+    tok_0_id = ann_tokenizer.encode("0", add_special_tokens=False)[0]
+    tok_1_id = ann_tokenizer.encode("1", add_special_tokens=False)[0]
+    print(f"  Token IDs: '0'={tok_0_id}, '1'={tok_1_id}")
     del ann_tokenizer
 
     llm = LLM(
@@ -599,11 +476,12 @@ def _annotate_local_vllm_pertoken(
         dtype="auto",
         enable_prefix_caching=True,
         max_model_len=1024,
+        gpu_memory_utilization=0.95,
     )
     params = SamplingParams(
         max_tokens=1,
         temperature=0,
-        allowed_token_ids=[tok_0, tok_1],
+        allowed_token_ids=[tok_0_id, tok_1_id],
     )
 
     annotations = torch.zeros(N, T, n_features)
@@ -611,73 +489,36 @@ def _annotate_local_vllm_pertoken(
     completed = 0
     t_start = time.time()
 
-    # ChatML system (cached level 0)
+    # ── Build system prompt with ALL feature definitions (Level 0 cache) ──
+    # This is ~200 tokens, computed once, shared across every prompt.
+    feat_defs = "\n".join(
+        f"F{i}: {feat['description']}" for i, feat in enumerate(features)
+    )
     SYS = (
         "<|im_start|>system\n"
-        "You are a feature annotator. You will be shown text tokens "
-        "and asked if the last token matches a feature. "
-        "Answer only 0 (no) or 1 (yes).<|im_end|>\n"
+        "Feature annotator. For the last token shown, answer which "
+        "feature ID matches. Answer 0 (no) or 1 (yes).\n\n"
+        f"{feat_defs}<|im_end|>\n"
         "<|im_start|>user\n"
     )
     ASST = "<|im_end|>\n<|im_start|>assistant\n"
-    feat_descs = [feat["description"].rstrip(".").lower() for feat in features]
 
-    # Benchmark to find optimal chunk size and verify caching
-    seq_chunk = _benchmark_chunk_size(
-        llm, params, SYS, ASST, feat_descs, all_token_strs,
+    # Feature suffixes — just the ID, ~6 tokens each
+    feat_suffixes = [f"\nF{i}{ASST}" for i in range(n_features)]
+
+    # Benchmark chunk size and verify caching
+    seq_chunk = _benchmark_vllm(
+        llm, params, SYS, feat_suffixes, all_token_strs,
         n_features, T, N,
     )
 
-    # ── Probe gate: two-pass annotation ──────────────────────────────
-    # Pass 1: annotate a small sample fully (no gating)
-    # Pass 2: train probe on those labels, gate the rest
-    gate_mask = None  # None = annotate everything
-    use_probe = (cfg.probe_gate_threshold > 0 and activations is not None
-                 and N > 200)
-
-    if use_probe:
-        sample_n = min(200, N // 5)
-        print(f"\n  Probe gate: annotating {sample_n} sequences fully (pass 1)...")
-
-        sample_prompts, sample_positions = _build_chunk_prompts(
-            SYS, ASST, feat_descs, all_token_strs, 0, sample_n, T, n_features,
-        )
-        sample_outputs = llm.generate(sample_prompts, params)
-        for idx, output in enumerate(sample_outputs):
-            seq_j, tok_k, fi = sample_positions[idx]
-            tid = output.outputs[0].token_ids[0]
-            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1 else 0.0
-
-        completed = len(sample_prompts)
-        print(f"    Pass 1 done: {completed:,} decisions")
-
-        # Train probe on sample labels
-        sample_acts = activations[:sample_n]
-        sample_labels = annotations[:sample_n]
-        probe = train_probe_gate(
-            sample_acts, sample_labels, n_features, cfg.device,
-        )
-        # Apply probe to ALL sequences (including sample — sample already annotated)
-        gate_mask = apply_probe_gate(
-            probe, activations, cfg.probe_gate_threshold, n_features,
-        )
-        # Mark sample sequences as already done
-        gate_mask[:sample_n] = False
-        del probe
-
-    total_with_gate = total_decisions
-    if gate_mask is not None:
-        total_with_gate = int(gate_mask.sum().item())
-
     print(f"\nAnnotating: {n_features} features x {N} sequences x {T} tokens "
-          f"= {total_decisions:,} total decisions"
-          f"{f', {total_with_gate:,} after probe gate' if gate_mask is not None else ''}"
-          f" (vLLM, per-token, chunk={seq_chunk})")
+          f"= {total_decisions:,} decisions "
+          f"(vLLM, per-token, prefix-cached, chunk={seq_chunk})")
+    print(f"  System prompt: {len(SYS)} chars (~{len(SYS)//4} tokens, cached L0)")
+    print(f"  Suffix per prompt: ~6 tokens (feature ID only)")
 
-    # ── Main annotation loop ─────────────────────────────────────────
-    start_seq = (min(200, N // 5) if use_probe else 0)
-
-    for seq_start in range(start_seq, N, seq_chunk):
+    for seq_start in range(0, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
 
         prompts = []
@@ -687,31 +528,22 @@ def _annotate_local_vllm_pertoken(
             seq_prefix = SYS
             for tok_k in range(T):
                 seq_prefix += all_token_strs[seq_j][tok_k]
-                tok_str = all_token_strs[seq_j][tok_k].strip()
                 for fi in range(n_features):
-                    # Skip if probe says confident negative
-                    if gate_mask is not None and not gate_mask[seq_j, tok_k, fi]:
-                        continue
-                    suffix = (
-                        f'\nThe token is "{tok_str}". '
-                        f'Is it {feat_descs[fi]}?{ASST}'
-                    )
-                    prompts.append(seq_prefix + suffix)
+                    prompts.append(seq_prefix + feat_suffixes[fi])
                     positions.append((seq_j, tok_k, fi))
 
-        if prompts:
-            outputs = llm.generate(prompts, params)
-            for idx, output in enumerate(outputs):
-                seq_j, tok_k, fi = positions[idx]
-                tid = output.outputs[0].token_ids[0]
-                annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1 else 0.0
+        outputs = llm.generate(prompts, params)
+
+        for idx, output in enumerate(outputs):
+            seq_j, tok_k, fi = positions[idx]
+            tid = output.outputs[0].token_ids[0]
+            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1_id else 0.0
 
         completed += len(prompts)
         elapsed = time.time() - t_start
         rate = completed / elapsed if elapsed > 0 else 0
-        remaining = total_with_gate - completed
-        eta_sec = remaining / rate if rate > 0 else 0
-        print(f"  {completed:,}/{total_with_gate:,} decisions  "
+        eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
+        print(f"  {completed:,}/{total_decisions:,} decisions  "
               f"rate={rate:.0f}/s  ETA {eta_sec/3600:.1f}h")
 
     del llm
@@ -1035,10 +867,7 @@ def run(cfg: Config = None):
     else:
         if cfg.use_local_annotator:
             # v2: Decomposed single-feature single-token with local model
-            leaf_annotations = annotate_local(
-                tokens, leaf_features, tokenizer_ref, cfg,
-                activations=activations,
-            )
+            leaf_annotations = annotate_local(tokens, leaf_features, tokenizer_ref, cfg)
         else:
             # v1: API-based multi-feature annotation
             leaf_annotations = annotate_corpus(tokens, leaf_features, tokenizer_ref, cfg)
