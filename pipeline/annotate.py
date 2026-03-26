@@ -496,33 +496,27 @@ def _annotate_local_vllm_pertoken(
     ann_tokenizer = AutoTokenizer.from_pretrained(cfg.local_annotator_model)
     tok_0_id = ann_tokenizer.encode("0", add_special_tokens=False)[0]
     tok_1_id = ann_tokenizer.encode("1", add_special_tokens=False)[0]
-    print(f"  Token IDs: '0'={tok_0_id}, '1'={tok_1_id}")
+
+    # Get the <think> token ID so we can ban it
+    think_token_id = ann_tokenizer.encode("<think>", add_special_tokens=False)[0]
+    print(f"  Token IDs: '0'={tok_0_id}, '1'={tok_1_id}, '<think>'={think_token_id}")
 
     # ── Pre-tokenize everything as token IDs ─────────────────────────
-    # This guarantees prefix alignment: concatenating ID lists is exact,
-    # unlike concatenating strings then tokenizing (BPE boundary merges).
-
-    # Use apply_chat_template with enable_thinking=False to get proper
-    # no-think token IDs. This adds the right special tokens so the model
-    # skips the <think> block entirely and outputs the answer directly.
     SYS_MSG = (
         "You annotate tokens. You see text ending with a token, then a yes/no "
         "question about that token. Answer only 0 (no) or 1 (yes)."
     )
-    # Build system prefix token IDs using the chat template
     _sys_template = ann_tokenizer.apply_chat_template(
         [{"role": "system", "content": SYS_MSG}],
         tokenize=True,
         add_generation_prompt=False,
         enable_thinking=False,
     )
-    # Add the user turn start
     _user_start = ann_tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
     sys_ids = _sys_template + _user_start
-    # Assistant turn ending (after user message)
     ASST_STR = "<|im_end|>\n<|im_start|>assistant\n"
 
-    print(f"  System prompt: {len(sys_ids)} tokens (cached L0, thinking disabled)")
+    print(f"  System prompt: {len(sys_ids)} tokens (cached L0)")
 
     # Pre-tokenize each GPT-2 token string individually
     print("  Pre-tokenizing sequence tokens...")
@@ -591,12 +585,13 @@ def _annotate_local_vllm_pertoken(
         max_model_len=1024,
         gpu_memory_utilization=0.95,
     )
-    # enable_thinking=False in apply_chat_template (above) should
-    # prevent the <think> block. max_tokens=1, no constraints.
-    # Parse first character — should be "0" or "1" directly.
+    # Ban the <think> token so the model can't enter thinking mode.
+    # max_tokens=1, no other constraints — model picks freely from
+    # the full vocab minus <think>.
     params = SamplingParams(
         max_tokens=1,
         temperature=0,
+        bad_token_ids=[think_token_id],
     )
 
     annotations = torch.zeros(N, T, n_features)
