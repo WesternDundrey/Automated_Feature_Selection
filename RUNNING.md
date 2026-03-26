@@ -59,7 +59,7 @@ python -m pipeline.run --n_sequences 2000 --epochs 10
 | `--epochs` | 15 | Training epochs |
 | `--lista` | 0 | LISTA refinement steps |
 | `--local-annotator` | off | Use local model via vLLM |
-| `--annotator-model` | Qwen/Qwen3.5-9B | HuggingFace model ID |
+| `--annotator-model` | Qwen/Qwen3-8B-Base | HuggingFace model ID |
 | `--batch-positions` | off | Full-sequence JSON output (vs per-token) |
 | `--probe-gate` | 0.1 | Skip LLM for probe-confident negatives (0=disabled) |
 | `--catalog` | (auto) | Manual feature catalog JSON path |
@@ -74,7 +74,7 @@ python -m pipeline.run --n_sequences 2000 --epochs 10
 | Role | Default | Runs on |
 |------|---------|---------|
 | **Target model** (activations) | GPT-2 Small | GPU |
-| **Annotator** (token labeling) | Qwen3.5-9B via vLLM | GPU |
+| **Annotator** (token labeling) | Qwen3-8B-Base via vLLM | GPU |
 
 Never run simultaneously. Target model freed before annotation starts.
 
@@ -111,7 +111,7 @@ Use `tmux` so SSH disconnects don't kill the run.
 | Step | Model | Cost |
 |------|-------|------|
 | Inventory | Sonnet 4.6 (API) | ~$2 |
-| Annotation (local) | Qwen3.5-9B (GPU) | $0 |
+| Annotation (local) | Qwen3-8B-Base (GPU) | $0 |
 | Annotation (API) | Haiku 4.5 | ~$30 |
 | IOI validation | none | $0 |
 

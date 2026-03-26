@@ -29,13 +29,7 @@ from .config import Config
 # ── Trivial features with deterministic ground truth ───────────────────────
 
 VALIDATION_FEATURES = [
-    {
-        "id": "bos_token",
-        "description": "Token is the very first token in the sequence (position 0)",
-        "type": "leaf",
-        "parent": None,
-        "check": lambda tok_str, pos, all_strs: pos == 0,
-    },
+    # Trivial (token-level)
     {
         "id": "comma",
         "description": "Token is a comma",
@@ -45,7 +39,7 @@ VALIDATION_FEATURES = [
     },
     {
         "id": "period",
-        "description": "Token is a period",
+        "description": "Token is a period or full stop",
         "type": "leaf",
         "parent": None,
         "check": lambda tok_str, pos, all_strs: tok_str.strip() == ".",
@@ -65,6 +59,69 @@ VALIDATION_FEATURES = [
         "check": lambda tok_str, pos, all_strs: (
             len(tok_str.strip()) > 0 and tok_str.strip()[0].isupper()
         ),
+    },
+    {
+        "id": "digit",
+        "description": "Token contains a digit",
+        "type": "leaf",
+        "parent": None,
+        "check": lambda tok_str, pos, all_strs: any(c.isdigit() for c in tok_str),
+    },
+    # Medium (requires basic word knowledge)
+    {
+        "id": "preposition",
+        "description": "Token is a preposition like in, on, at, of, for, with, to, from, by",
+        "type": "leaf",
+        "parent": None,
+        "check": lambda tok_str, pos, all_strs: tok_str.strip().lower() in {
+            "in", "on", "at", "of", "for", "with", "to", "from", "by",
+            "about", "into", "through", "during", "before", "after",
+            "above", "below", "between", "under", "over",
+        },
+    },
+    {
+        "id": "conjunction",
+        "description": "Token is a conjunction like and, but, or, so, yet, nor",
+        "type": "leaf",
+        "parent": None,
+        "check": lambda tok_str, pos, all_strs: tok_str.strip().lower() in {
+            "and", "but", "or", "so", "yet", "nor", "for",
+        },
+    },
+    {
+        "id": "pronoun",
+        "description": "Token is a pronoun like he, she, it, they, we, I, you, him, her",
+        "type": "leaf",
+        "parent": None,
+        "check": lambda tok_str, pos, all_strs: tok_str.strip().lower() in {
+            "i", "me", "my", "mine", "myself",
+            "you", "your", "yours", "yourself",
+            "he", "him", "his", "himself",
+            "she", "her", "hers", "herself",
+            "it", "its", "itself",
+            "we", "us", "our", "ours", "ourselves",
+            "they", "them", "their", "theirs", "themselves",
+            "who", "whom", "whose", "which", "that",
+        },
+    },
+    # Harder (requires context / semantic knowledge)
+    {
+        "id": "number_word",
+        "description": "Token is a number word like one, two, three, hundred, million",
+        "type": "leaf",
+        "parent": None,
+        "check": lambda tok_str, pos, all_strs: tok_str.strip().lower() in {
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+            "nine", "ten", "eleven", "twelve", "hundred", "thousand",
+            "million", "billion", "dozen", "first", "second", "third",
+        },
+    },
+    {
+        "id": "question_mark",
+        "description": "Token is a question mark",
+        "type": "leaf",
+        "parent": None,
+        "check": lambda tok_str, pos, all_strs: tok_str.strip() == "?",
     },
 ]
 
