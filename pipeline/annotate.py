@@ -502,18 +502,27 @@ def _annotate_local_vllm_pertoken(
     # This guarantees prefix alignment: concatenating ID lists is exact,
     # unlike concatenating strings then tokenizing (BPE boundary merges).
 
-    SYS_STR = (
-        "<|im_start|>system\n"
-        "/no_think\n"
+    # Use apply_chat_template with enable_thinking=False to get proper
+    # no-think token IDs. This adds the right special tokens so the model
+    # skips the <think> block entirely and outputs the answer directly.
+    SYS_MSG = (
         "You annotate tokens. You see text ending with a token, then a yes/no "
         "question about that token. Answer only 0 (no) or 1 (yes)."
-        "<|im_end|>\n"
-        "<|im_start|>user\n"
     )
+    # Build system prefix token IDs using the chat template
+    _sys_template = ann_tokenizer.apply_chat_template(
+        [{"role": "system", "content": SYS_MSG}],
+        tokenize=True,
+        add_generation_prompt=False,
+        enable_thinking=False,
+    )
+    # Add the user turn start
+    _user_start = ann_tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
+    sys_ids = _sys_template + _user_start
+    # Assistant turn ending (after user message)
     ASST_STR = "<|im_end|>\n<|im_start|>assistant\n"
 
-    sys_ids = ann_tokenizer.encode(SYS_STR, add_special_tokens=False)
-    print(f"  System prompt: {len(sys_ids)} tokens (cached L0)")
+    print(f"  System prompt: {len(sys_ids)} tokens (cached L0, thinking disabled)")
 
     # Pre-tokenize each GPT-2 token string individually
     print("  Pre-tokenizing sequence tokens...")
@@ -583,8 +592,9 @@ def _annotate_local_vllm_pertoken(
         gpu_memory_utilization=0.95,
     )
     params = SamplingParams(
-        max_tokens=20,  # enough to get past <think>\n</think> block
+        max_tokens=1,
         temperature=0,
+        allowed_token_ids=[tok_0_id, tok_1_id],
     )
 
     annotations = torch.zeros(N, T, n_features)
@@ -645,18 +655,8 @@ def _annotate_local_vllm_pertoken(
 
         for idx, output in enumerate(outputs):
             seq_j, tok_k, fi = positions[idx]
-            text = output.outputs[0].text
-            # Strip <think>...</think> block if present
-            if "</think>" in text:
-                text = text.split("</think>", 1)[1]
-            label = 0.0
-            for ch in text:
-                if ch == "1":
-                    label = 1.0
-                    break
-                elif ch == "0":
-                    break
-            annotations[seq_j, tok_k, fi] = label
+            tid = output.outputs[0].token_ids[0]
+            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1_id else 0.0
 
         completed += len(prompts)
         elapsed = time.time() - t_start
