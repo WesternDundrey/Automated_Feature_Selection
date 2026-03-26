@@ -583,7 +583,7 @@ def _annotate_local_vllm_pertoken(
         gpu_memory_utilization=0.95,
     )
     params = SamplingParams(
-        max_tokens=3,
+        max_tokens=20,  # enough to get past <think>\n</think> block
         temperature=0,
     )
 
@@ -646,6 +646,9 @@ def _annotate_local_vllm_pertoken(
         for idx, output in enumerate(outputs):
             seq_j, tok_k, fi = positions[idx]
             text = output.outputs[0].text
+            # Strip <think>...</think> block if present
+            if "</think>" in text:
+                text = text.split("</think>", 1)[1]
             label = 0.0
             for ch in text:
                 if ch == "1":
