@@ -496,29 +496,22 @@ def _annotate_local_vllm_pertoken(
     ann_tokenizer = AutoTokenizer.from_pretrained(cfg.local_annotator_model)
     tok_0_id = ann_tokenizer.encode("0", add_special_tokens=False)[0]
     tok_1_id = ann_tokenizer.encode("1", add_special_tokens=False)[0]
+    print(f"  Token IDs: '0'={tok_0_id}, '1'={tok_1_id}")
 
-    # Get the <think> token ID so we can ban it
-    think_token_id = ann_tokenizer.encode("<think>", add_special_tokens=False)[0]
-    print(f"  Token IDs: '0'={tok_0_id}, '1'={tok_1_id}, '<think>'={think_token_id}")
-
-    # ── Pre-tokenize everything as token IDs ─────────────────────────
-    SYS_MSG = (
-        "You annotate tokens. You see text ending with a token, then a yes/no "
-        "question about that token. Answer only 0 (no) or 1 (yes)."
+    # ── Raw completion prompt (base model, no chat template) ─────────
+    # Format: few-shot examples + sequence + question → model completes "0" or "1"
+    SYS_STR = (
+        'Answer 0 (no) or 1 (yes).\n\n'
+        'Text: "The cat sat on the mat ,"\nToken: ",". A comma? 1\n'
+        'Text: "The cat sat on the mat ,"\nToken: "mat". A comma? 0\n'
+        'Text: "The cat sat on the mat ,"\nToken: "The". Starts with uppercase? 1\n'
+        'Text: "The cat sat on the mat ,"\nToken: "cat". Starts with uppercase? 0\n\n'
     )
-    _sys_template = ann_tokenizer.apply_chat_template(
-        [{"role": "system", "content": SYS_MSG}],
-        tokenize=True,
-        add_generation_prompt=False,
-        enable_thinking=False,
-    )
-    _user_start = ann_tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
-    sys_ids = _sys_template + _user_start
-    ASST_STR = "<|im_end|>\n<|im_start|>assistant\n"
 
-    print(f"  System prompt: {len(sys_ids)} tokens (cached L0)")
+    sys_ids = ann_tokenizer.encode(SYS_STR, add_special_tokens=False)
+    print(f"  System prompt: {len(sys_ids)} tokens (few-shot, cached L0)")
 
-    # Pre-tokenize each GPT-2 token string individually
+    # Pre-tokenize each GPT-2 token string
     print("  Pre-tokenizing sequence tokens...")
     tok_ids_per_seq = []
     for seq_j in range(N):
@@ -529,20 +522,16 @@ def _annotate_local_vllm_pertoken(
             seq_tok_ids.append(ids)
         tok_ids_per_seq.append(seq_tok_ids)
 
-    # Pre-tokenize feature descriptions (suffix varies per feature AND position)
+    # Pre-tokenize feature descriptions
     feat_descs_encoded = []
     for fi, feat in enumerate(features):
         desc = feat["description"].rstrip(".").lower()
         feat_descs_encoded.append(desc)
 
-    # Suffix builder: includes the actual token text for clarity
-    def make_suffix(tok_str, feat_desc):
-        s = f'\nToken: "{tok_str.strip()}". {feat_desc}?{ASST_STR}'
-        return ann_tokenizer.encode(s, add_special_tokens=False)
-
-    # Pre-encode all suffixes: (tok_str, fi) -> tuple of token IDs
+    # Pre-encode suffixes: (tok_str, fi) -> tuple of token IDs
+    # Format: \nToken: "X". description? <space>
+    # The trailing space primes the model to output a digit next
     print("  Pre-encoding suffixes...")
-    ASST_ENC = ann_tokenizer.encode(ASST_STR, add_special_tokens=False)
     suffix_cache = {}
     for seq_j in range(N):
         for tok_k in range(T):
@@ -550,14 +539,19 @@ def _annotate_local_vllm_pertoken(
             for fi in range(n_features):
                 key = (tok_str, fi)
                 if key not in suffix_cache:
-                    s = f'\nToken: "{tok_str}". {feat_descs_encoded[fi]}?'
-                    ids = ann_tokenizer.encode(s, add_special_tokens=False) + ASST_ENC
+                    s = f'"\nToken: "{tok_str}". {feat_descs_encoded[fi]}? '
+                    ids = ann_tokenizer.encode(s, add_special_tokens=False)
                     suffix_cache[key] = tuple(ids)
     print(f"  Cached {len(suffix_cache)} unique suffixes")
 
+    # Encode the text wrapper: 'Text: "' before sequence, '"' after
+    text_open_ids = ann_tokenizer.encode('Text: "', add_special_tokens=False)
+    text_close_ids = ann_tokenizer.encode('"', add_special_tokens=False)
+
     # Debug: show sample prompt
     sample_key = (all_token_strs[0][0].strip(), 0)
-    sample_prompt = list(sys_ids) + tok_ids_per_seq[0][0] + list(suffix_cache[sample_key])
+    sample_prefix = sys_ids + text_open_ids + tok_ids_per_seq[0][0]
+    sample_prompt = sample_prefix + list(suffix_cache[sample_key])
     print(f"\n  Sample prompt (seq=0, pos=0, feat=0):")
     print(f"  {ann_tokenizer.decode(sample_prompt)}")
     print()
@@ -585,13 +579,12 @@ def _annotate_local_vllm_pertoken(
         max_model_len=1024,
         gpu_memory_utilization=0.95,
     )
-    # Ban the <think> token so the model can't enter thinking mode.
-    # max_tokens=1, no other constraints — model picks freely from
-    # the full vocab minus <think>.
+    # Base model: no thinking, no chat template. Just completes text.
+    # allowed_token_ids forces "0" or "1" — safe on base models.
     params = SamplingParams(
         max_tokens=1,
         temperature=0,
-        bad_token_ids=[think_token_id],
+        allowed_token_ids=[tok_0_id, tok_1_id],
     )
 
     annotations = torch.zeros(N, T, n_features)
@@ -612,6 +605,7 @@ def _annotate_local_vllm_pertoken(
 
     # Convert to tuples for faster concatenation
     sys_tuple = tuple(sys_ids)
+    text_open_tuple = tuple(text_open_ids)
     tok_id_tuples = [
         [tuple(tok_ids_per_seq[j][k]) for k in range(T)]
         for j in range(N)
@@ -624,7 +618,7 @@ def _annotate_local_vllm_pertoken(
         positions = []
 
         for seq_j in range(seq_start, seq_end):
-            prefix = sys_tuple
+            prefix = sys_tuple + text_open_tuple
             for tok_k in range(T):
                 prefix = prefix + tok_id_tuples[seq_j][tok_k]
                 tok_str = all_token_strs[seq_j][tok_k].strip()
@@ -649,8 +643,8 @@ def _annotate_local_vllm_pertoken(
 
         for idx, output in enumerate(outputs):
             seq_j, tok_k, fi = positions[idx]
-            text = output.outputs[0].text.strip()
-            annotations[seq_j, tok_k, fi] = 1.0 if text.startswith("1") else 0.0
+            tid = output.outputs[0].token_ids[0]
+            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1_id else 0.0
 
         completed += len(prompts)
         elapsed = time.time() - t_start
