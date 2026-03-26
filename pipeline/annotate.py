@@ -591,11 +591,11 @@ def _annotate_local_vllm_pertoken(
         max_model_len=1024,
         gpu_memory_utilization=0.95,
     )
-    # Qwen3 needs to "think" before answering — allowed_token_ids
-    # forces the first token and the model always picks "0".
-    # Let it think (max_tokens=20), parse answer after </think>.
+    # enable_thinking=False in apply_chat_template (above) should
+    # prevent the <think> block. max_tokens=1, no constraints.
+    # Parse first character — should be "0" or "1" directly.
     params = SamplingParams(
-        max_tokens=20,
+        max_tokens=1,
         temperature=0,
     )
 
@@ -604,15 +604,12 @@ def _annotate_local_vllm_pertoken(
     completed = 0
     t_start = time.time()
 
-    # Build flat suffix_ids list for benchmark (use first token's suffixes)
-    first_tok = all_token_strs[0][0].strip()
-    _bench_suffixes = [suffix_cache.get((first_tok, fi), suffix_cache[next(iter(suffix_cache))]) for fi in range(n_features)]
-    _bench_suffix_ids = [list(s) for s in _bench_suffixes]
-
-    seq_chunk = _benchmark_vllm_ids(
-        llm, params, sys_ids, tok_ids_per_seq, _bench_suffix_ids,
-        n_features, T, N,
-    )
+    # Aggressive chunk size — vLLM handles internal batching and scheduling.
+    # Bigger chunks = fewer generate() calls = less Python overhead.
+    # KV cache is 98K tokens, each prefix ~110 tokens avg.
+    # 20 sequences × 128 positions = 2560 prefixes × 110 = 282K — may evict.
+    # 10 sequences = 1280 prefixes × 110 = 141K — tight but OK.
+    seq_chunk = min(10, N)
 
     print(f"\nAnnotating: {n_features} features x {N} sequences x {T} tokens "
           f"= {total_decisions:,} decisions "
@@ -657,17 +654,8 @@ def _annotate_local_vllm_pertoken(
 
         for idx, output in enumerate(outputs):
             seq_j, tok_k, fi = positions[idx]
-            text = output.outputs[0].text
-            if "</think>" in text:
-                text = text.split("</think>", 1)[1]
-            label = 0.0
-            for ch in text:
-                if ch == "1":
-                    label = 1.0
-                    break
-                elif ch == "0":
-                    break
-            annotations[seq_j, tok_k, fi] = label
+            text = output.outputs[0].text.strip()
+            annotations[seq_j, tok_k, fi] = 1.0 if text.startswith("1") else 0.0
 
         completed += len(prompts)
         elapsed = time.time() - t_start
