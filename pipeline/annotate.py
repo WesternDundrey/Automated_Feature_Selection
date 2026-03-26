@@ -502,14 +502,11 @@ def _annotate_local_vllm_pertoken(
     # This guarantees prefix alignment: concatenating ID lists is exact,
     # unlike concatenating strings then tokenizing (BPE boundary merges).
 
-    feat_defs = "\n".join(
-        f"F{i}: {feat['description']}" for i, feat in enumerate(features)
-    )
     SYS_STR = (
         "<|im_start|>system\n"
-        "Feature annotator. For the last token shown, answer which "
-        "feature ID matches. Answer 0 (no) or 1 (yes).\n\n"
-        f"{feat_defs}<|im_end|>\n"
+        "You are a feature annotator. You will see text tokens and a question "
+        "about the last token. Answer 0 for no or 1 for yes."
+        "<|im_end|>\n"
         "<|im_start|>user\n"
     )
     ASST_STR = "<|im_end|>\n<|im_start|>assistant\n"
@@ -528,14 +525,22 @@ def _annotate_local_vllm_pertoken(
             seq_tok_ids.append(ids)
         tok_ids_per_seq.append(seq_tok_ids)
 
-    # Pre-tokenize feature suffixes
+    # Pre-tokenize feature suffixes — include the full question
     suffix_ids = []
-    for fi in range(n_features):
-        s = f"\nF{fi}{ASST_STR}"
+    for fi, feat in enumerate(features):
+        desc = feat["description"].rstrip(".").lower()
+        s = f"\nIs the last token {desc}?{ASST_STR}"
         ids = ann_tokenizer.encode(s, add_special_tokens=False)
         suffix_ids.append(ids)
 
     print(f"  Suffix tokens: {len(suffix_ids[0])} per feature")
+
+    # Debug: show first prompt decoded so we can verify format
+    sample_prefix = list(sys_ids) + tok_ids_per_seq[0][0]
+    sample_prompt = sample_prefix + suffix_ids[0]
+    print(f"\n  Sample prompt (seq=0, pos=0, feat=0):")
+    print(f"  {ann_tokenizer.decode(sample_prompt)}")
+    print()
     del ann_tokenizer
 
     # vLLM spawns a subprocess for the engine. If CUDA was already
