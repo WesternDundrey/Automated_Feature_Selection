@@ -444,23 +444,25 @@ def _benchmark_vllm_ids(llm, params, sys_ids, tok_ids_per_seq, suffix_ids,
     hit_vs_miss = r_hit / r_miss if r_miss > 0 else 1
     shared_vs_miss = r_shared / r_miss if r_miss > 0 else 1
 
-    if hit_vs_miss > 5:
+    if hit_vs_miss > 3:
         status = "EXCELLENT"
-    elif hit_vs_miss > 2:
+    elif hit_vs_miss > 1.2:
         status = "WORKING"
     else:
-        status = "BROKEN"
+        status = "NO BENEFIT"
 
     print(f"    Hit/miss ratio: {hit_vs_miss:.1f}x — {status}")
     print(f"    Prefix reuse:   {shared_vs_miss:.1f}x")
 
-    # Select chunk size based on cache health
-    if hit_vs_miss > 3:
-        chunk = min(5, N)
-    elif hit_vs_miss > 1.5:
-        chunk = min(2, N)
+    # Select chunk size — use the warm rate as the baseline
+    # More sequences per chunk = more prompts per llm.generate() call
+    # vLLM handles the internal batching, so bigger chunks are fine
+    if r_hit > 500:
+        chunk = min(5, N)   # fast model, can handle more
+    elif r_hit > 100:
+        chunk = min(3, N)
     else:
-        chunk = 1
+        chunk = min(2, N)
 
     print(f"    Selected: seq_chunk={chunk}")
     return chunk
