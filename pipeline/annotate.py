@@ -578,9 +578,13 @@ def _annotate_local_vllm_pertoken(
     completed = 0
     t_start = time.time()
 
-    # ── Benchmark: verify caching with token IDs ─────────────────────
+    # Build flat suffix_ids list for benchmark (use first token's suffixes)
+    first_tok = all_token_strs[0][0].strip()
+    _bench_suffixes = [suffix_cache.get((first_tok, fi), suffix_cache[next(iter(suffix_cache))]) for fi in range(n_features)]
+    _bench_suffix_ids = [list(s) for s in _bench_suffixes]
+
     seq_chunk = _benchmark_vllm_ids(
-        llm, params, sys_ids, tok_ids_per_seq, suffix_ids,
+        llm, params, sys_ids, tok_ids_per_seq, _bench_suffix_ids,
         n_features, T, N,
     )
 
