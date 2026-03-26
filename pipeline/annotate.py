@@ -13,6 +13,15 @@ Usage:
     python -m pipeline.annotate
 """
 
+# vLLM requires 'spawn' multiprocessing to avoid CUDA re-init in forks.
+# Must be set before any CUDA initialization happens.
+import multiprocessing
+if multiprocessing.get_start_method(allow_none=True) != "spawn":
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
 import asyncio
 import json
 import logging
@@ -526,6 +535,21 @@ def _annotate_local_vllm_pertoken(
 
     print(f"  Suffix tokens: {len(suffix_ids[0])} per feature")
     del ann_tokenizer
+
+    # vLLM spawns a subprocess for the engine. If CUDA was already
+    # initialized (e.g., by HookedTransformer), the fork fails.
+    # Force 'spawn' start method so the subprocess gets a clean CUDA context.
+    import multiprocessing
+    if multiprocessing.get_start_method(allow_none=True) != "spawn":
+        try:
+            multiprocessing.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass  # already set
+
+    # Free any CUDA memory from previous steps
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     llm = LLM(
         model=cfg.local_annotator_model,
