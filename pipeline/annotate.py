@@ -537,9 +537,24 @@ def _annotate_local_vllm_pertoken(
         s = f'\nToken: "{tok_str.strip()}". {feat_desc}?{ASST_STR}'
         return ann_tokenizer.encode(s, add_special_tokens=False)
 
+    # Pre-encode all suffixes: (tok_str, fi) -> tuple of token IDs
+    print("  Pre-encoding suffixes...")
+    ASST_ENC = ann_tokenizer.encode(ASST_STR, add_special_tokens=False)
+    suffix_cache = {}
+    for seq_j in range(N):
+        for tok_k in range(T):
+            tok_str = all_token_strs[seq_j][tok_k].strip()
+            for fi in range(n_features):
+                key = (tok_str, fi)
+                if key not in suffix_cache:
+                    s = f'\nToken: "{tok_str}". {feat_descs_encoded[fi]}?'
+                    ids = ann_tokenizer.encode(s, add_special_tokens=False) + ASST_ENC
+                    suffix_cache[key] = tuple(ids)
+    print(f"  Cached {len(suffix_cache)} unique suffixes")
+
     # Debug: show sample prompt
-    sample_suffix = make_suffix(all_token_strs[0][0], feat_descs_encoded[0])
-    sample_prompt = list(sys_ids) + tok_ids_per_seq[0][0] + sample_suffix
+    sample_key = (all_token_strs[0][0].strip(), 0)
+    sample_prompt = list(sys_ids) + tok_ids_per_seq[0][0] + list(suffix_cache[sample_key])
     print(f"\n  Sample prompt (seq=0, pos=0, feat=0):")
     print(f"  {ann_tokenizer.decode(sample_prompt)}")
     print()
@@ -598,25 +613,6 @@ def _annotate_local_vllm_pertoken(
         [tuple(tok_ids_per_seq[j][k]) for k in range(T)]
         for j in range(N)
     ]
-
-    # Pre-encode suffixes for each (seq, pos, feat) — includes the token text
-    # This is O(N*T*F) strings but each is short (~15 tokens)
-    print("  Pre-encoding suffixes...")
-    from transformers import AutoTokenizer as _AT
-    _tok = _AT.from_pretrained(cfg.local_annotator_model)
-    ASST_ENC = _tok.encode(ASST_STR, add_special_tokens=False)
-    suffix_cache = {}  # (tok_str, fi) -> tuple of token IDs
-    for seq_j in range(N):
-        for tok_k in range(T):
-            tok_str = all_token_strs[seq_j][tok_k].strip()
-            for fi in range(n_features):
-                key = (tok_str, fi)
-                if key not in suffix_cache:
-                    s = f'\nToken: "{tok_str}". {feat_descs_encoded[fi]}?'
-                    ids = _tok.encode(s, add_special_tokens=False) + ASST_ENC
-                    suffix_cache[key] = tuple(ids)
-    del _tok
-    print(f"  Cached {len(suffix_cache)} unique suffixes")
 
     for seq_start in range(0, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
