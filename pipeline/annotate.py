@@ -583,9 +583,8 @@ def _annotate_local_vllm_pertoken(
         gpu_memory_utilization=0.95,
     )
     params = SamplingParams(
-        max_tokens=1,
+        max_tokens=3,
         temperature=0,
-        allowed_token_ids=[tok_0_id, tok_1_id],
     )
 
     annotations = torch.zeros(N, T, n_features)
@@ -634,10 +633,27 @@ def _annotate_local_vllm_pertoken(
 
         outputs = llm.generate(prompts, params)
 
+        # Debug: print first 10 raw outputs from first chunk
+        if seq_start == 0:
+            print("\n  First 10 raw outputs:")
+            for di in range(min(10, len(outputs))):
+                sj, tk, fi_d = positions[di]
+                raw = outputs[di].outputs[0].text
+                tok = all_token_strs[sj][tk].strip()
+                print(f"    [{di}] tok='{tok}' feat={fi_d} -> '{raw}'")
+            print()
+
         for idx, output in enumerate(outputs):
             seq_j, tok_k, fi = positions[idx]
-            tid = output.outputs[0].token_ids[0]
-            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1_id else 0.0
+            text = output.outputs[0].text
+            label = 0.0
+            for ch in text:
+                if ch == "1":
+                    label = 1.0
+                    break
+                elif ch == "0":
+                    break
+            annotations[seq_j, tok_k, fi] = label
 
         completed += len(prompts)
         elapsed = time.time() - t_start
