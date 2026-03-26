@@ -1,15 +1,22 @@
-# Install with: pip install -r pipeline/requirements.txt && pip install sae-lens transformer-lens --no-deps
-# Or use setup.sh which handles the install order.
+# Install with: uv pip install --system -r pipeline/requirements.txt
+#
+# numpy conflict: vllm needs >=2, sae-lens pins <2.
+# We force numpy>=2 and it works fine at runtime.
 
-# Inference engine (pulls torch, numpy>=2, transformers>=4.56 automatically)
+# Inference + model loading
 vllm>=0.18
+sae-lens>=5.0
+transformer-lens>=2.8
 
-# Data loading
+# Force numpy 2.x (sae-lens pins <2 but works fine with 2.x)
+numpy>=2.0
+
+# Data
 datasets>=3.0
 huggingface_hub>=0.27
 
-# API annotation (OpenRouter)
+# API annotation
 openai>=1.60
 
-# Progress bars
+# Misc
 tqdm>=4.66

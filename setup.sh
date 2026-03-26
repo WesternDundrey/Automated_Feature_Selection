@@ -18,12 +18,8 @@ echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
 git clone https://github.com/WesternDundrey/Automated_Feature_Selection.git /workspace/Automated_Feature_Selection
 cd /workspace/Automated_Feature_Selection
 
-# Install deps in the right order to avoid numpy conflicts:
-# 1. vllm (gets numpy>=2, torch, transformers>=4.56)
-# 2. sae-lens + transformer-lens with --no-deps (they pin numpy<2 but work fine with 2.x)
-# 3. Everything else
-uv pip install --system -r pipeline/requirements.txt
-uv pip install --system sae-lens transformer-lens --no-deps
+# Install all deps. Override numpy>=2 (sae-lens pins <2 but works fine with 2.x)
+uv pip install --system -r pipeline/requirements.txt --overrides pipeline/overrides.txt
 
 # Pre-download annotator model
 python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-8B')" || true
