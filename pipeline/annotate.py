@@ -398,6 +398,93 @@ def annotate_local(
         )
 
 
+def _benchmark_chunk_size(llm, params, SYS, ASST, feat_descs, all_token_strs,
+                          n_features, T, N):
+    """Sweep chunk sizes to find optimal throughput, verify prefix caching.
+
+    Runs ~1000 prompts at each chunk size using the first few sequences.
+    Also runs the same prompts twice to verify caching is active.
+    Takes ~1-2 minutes. Returns the best seq_chunk value.
+    """
+    import time as _time
+
+    # Use first 2 sequences for benchmarking (2 × 128 × n_features prompts per chunk)
+    bench_seqs = min(2, N)
+    prompts_per_seq = T * n_features
+
+    def _build_prompts(n_seqs):
+        prompts = []
+        for seq_j in range(n_seqs):
+            seq_prefix = SYS
+            for tok_k in range(T):
+                seq_prefix += all_token_strs[seq_j][tok_k]
+                tok_str = all_token_strs[seq_j][tok_k].strip()
+                for fi in range(n_features):
+                    suffix = (
+                        f'\nThe token is "{tok_str}". '
+                        f'Is it {feat_descs[fi]}?{ASST}'
+                    )
+                    prompts.append(seq_prefix + suffix)
+        return prompts
+
+    prompts = _build_prompts(bench_seqs)
+    n_prompts = len(prompts)
+
+    print(f"\n  Benchmarking vLLM ({n_prompts} prompts, {bench_seqs} sequences)...")
+
+    # Run 1: cold cache
+    t0 = _time.time()
+    llm.generate(prompts, params)
+    cold_time = _time.time() - t0
+    cold_rate = n_prompts / cold_time
+
+    # Run 2: warm cache (same prompts — should be faster if caching works)
+    t0 = _time.time()
+    llm.generate(prompts, params)
+    warm_time = _time.time() - t0
+    warm_rate = n_prompts / warm_time
+
+    cache_speedup = warm_rate / cold_rate if cold_rate > 0 else 1.0
+    caching_active = cache_speedup > 1.2
+
+    print(f"    Cold: {cold_rate:.0f} prompts/s ({cold_time:.1f}s)")
+    print(f"    Warm: {warm_rate:.0f} prompts/s ({warm_time:.1f}s)")
+    print(f"    Cache speedup: {cache_speedup:.2f}x "
+          f"({'ACTIVE' if caching_active else 'NOT DETECTED'})")
+
+    # Sweep chunk sizes: try 1, 2, 5, 10, 20 sequences per chunk
+    # Use the benchmark prompts split into different chunk sizes
+    best_rate = 0
+    best_chunk = 1
+    candidates = [c for c in [1, 2, 5, 10, 20] if c <= N]
+
+    if len(candidates) > 1 and n_prompts > 500:
+        print(f"    Sweeping chunk sizes: {candidates}")
+        for chunk in candidates:
+            n_chunk_prompts = min(chunk, bench_seqs) * prompts_per_seq
+            chunk_prompts = prompts[:n_chunk_prompts]
+            if not chunk_prompts:
+                continue
+
+            t0 = _time.time()
+            llm.generate(chunk_prompts, params)
+            elapsed = _time.time() - t0
+            rate = len(chunk_prompts) / elapsed if elapsed > 0 else 0
+
+            print(f"      chunk={chunk:>3}: {rate:.0f} prompts/s "
+                  f"({len(chunk_prompts)} prompts in {elapsed:.1f}s)")
+
+            if rate > best_rate:
+                best_rate = rate
+                best_chunk = chunk
+    else:
+        best_chunk = min(10, N)
+        best_rate = warm_rate
+
+    print(f"    Best: seq_chunk={best_chunk} ({best_rate:.0f} prompts/s)")
+    return best_chunk
+
+
 def _annotate_local_vllm_pertoken(
     tokens: torch.Tensor,
     features: list[dict],
@@ -451,10 +538,14 @@ def _annotate_local_vllm_pertoken(
     ASST = "<|im_end|>\n<|im_start|>assistant\n"
     feat_descs = [feat["description"].rstrip(".").lower() for feat in features]
 
-    seq_chunk = max(1, min(10, N))
+    # Benchmark to find optimal chunk size and verify caching
+    seq_chunk = _benchmark_chunk_size(
+        llm, params, SYS, ASST, feat_descs, all_token_strs,
+        n_features, T, N,
+    )
 
-    print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
-          f"= {total_decisions:,} decisions (vLLM, per-token, ChatML)")
+    print(f"\nAnnotating: {n_features} features x {N} sequences x {T} tokens "
+          f"= {total_decisions:,} decisions (vLLM, per-token, chunk={seq_chunk})")
 
     for seq_start in range(0, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
