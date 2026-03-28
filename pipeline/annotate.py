@@ -574,8 +574,7 @@ def _annotate_local_vllm_pertoken(
 
     llm = LLM(
         model=cfg.local_annotator_model,
-        quantization="fp8",
-        kv_cache_dtype="fp8",
+        dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=1024,
         gpu_memory_utilization=0.95,
