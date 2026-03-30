@@ -92,7 +92,8 @@ def mse_supervision_loss(
 
     Two components:
       A) Direction loss: cosine alignment of decoder columns to target directions
-      B) Magnitude loss: at positive positions, activation ≈ projection onto target
+      B) Magnitude loss: at positive positions, activation ≈ projection onto target;
+         at negative positions, activation → 0 (selectivity)
 
     Args:
         decoder_weight: (d_model, n_total) — sae.decoder.weight
@@ -113,11 +114,21 @@ def mse_supervision_loss(
     cosines = (dec_cols * target_dirs.T).sum(dim=0)  # (n_sup,)
     direction_loss = (1 - cosines).mean()
 
-    # B) Magnitude: at positive positions, sup_act ≈ activation projected onto target
+    # B) Magnitude: at positive positions, sup_act ≈ activation projected onto target;
+    #              at negative positions, sup_act ≈ 0 (selectivity)
     target_mag = activations @ target_dirs.T  # (batch, n_sup)
-    mag_err = (sup_acts - target_mag) ** 2  # (batch, n_sup)
+
+    # Positive: activation should match projection onto target direction
+    pos_err = (sup_acts - target_mag) ** 2
     n_positive = labels.sum().clamp(min=1.0)
-    magnitude_loss = (mag_err * labels).sum() / n_positive
+    pos_loss = (pos_err * labels).sum() / n_positive
+
+    # Negative: activation should be zero (class-balanced so rare features aren't drowned)
+    neg_labels = 1.0 - labels
+    n_negative = neg_labels.sum().clamp(min=1.0)
+    neg_loss = (sup_acts ** 2 * neg_labels).sum() / n_negative
+
+    magnitude_loss = pos_loss + neg_loss
 
     total = cfg.direction_loss_weight * direction_loss + cfg.magnitude_loss_weight * magnitude_loss
     return total, direction_loss, magnitude_loss
