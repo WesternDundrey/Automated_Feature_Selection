@@ -274,9 +274,10 @@ def train_supervised_sae(
         x_test.mean(0, keepdim=True).expand_as(x_test), x_test
     ).item()
 
-    # v2: Compute target directions for MSE supervision
+    # Compute target directions for direction alignment (hybrid and mse modes)
     target_dirs = None
-    if cfg.use_mse_supervision:
+    need_dirs = cfg.supervision_mode in ("hybrid", "mse")
+    if need_dirs:
         target_dirs, raw_norms, dir_counts = compute_target_directions(
             x_train, y_train, n_supervised,
         )
@@ -337,6 +338,7 @@ def train_supervised_sae(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     print(f"\nTraining: {cfg.epochs} epochs, {len(loader)} steps/epoch")
+    print(f"  supervision_mode={cfg.supervision_mode}")
     print(f"  n_supervised={n_supervised}  n_unsupervised={cfg.n_unsupervised}"
           f"  lista_steps={cfg.n_lista_steps}")
     print(f"  lambda_sup={cfg.lambda_sup}  lambda_sparse={cfg.lambda_sparse}  "
@@ -354,11 +356,20 @@ def train_supervised_sae(
             recon, sup_pre, sup_acts, all_acts = sae(x_b)
 
             loss_recon = F.mse_loss(recon, x_b)
-            if cfg.use_mse_supervision:
+            if cfg.supervision_mode == "hybrid":
+                # BCE for selectivity (encoder) + direction for alignment (decoder)
+                loss_bce = F.binary_cross_entropy_with_logits(
+                    sup_pre, y_b, pos_weight=pos_weight
+                )
+                dec_cols = sae.decoder.weight[:, :n_supervised]
+                cosines = (dec_cols * target_dirs.T).sum(dim=0)
+                loss_dir = (1 - cosines).mean()
+                loss_sup = loss_bce + cfg.direction_loss_weight * loss_dir
+            elif cfg.supervision_mode == "mse":
                 loss_sup, loss_dir, loss_mag = mse_supervision_loss(
                     sae.decoder.weight, sup_acts, target_dirs, x_b, y_b, cfg,
                 )
-            else:
+            else:  # "bce"
                 loss_sup = F.binary_cross_entropy_with_logits(
                     sup_pre, y_b, pos_weight=pos_weight
                 )
@@ -409,7 +420,15 @@ def train_supervised_sae(
                 yv = y_test[i : i + cfg.batch_size].to(cfg.device)
                 recon_v, sup_pre_v, sup_acts_v, _ = sae(xv)
                 val_recon += F.mse_loss(recon_v, xv).item()
-                if cfg.use_mse_supervision:
+                if cfg.supervision_mode == "hybrid":
+                    vbce = F.binary_cross_entropy_with_logits(
+                        sup_pre_v, yv, pos_weight=pos_weight
+                    ).item()
+                    vdc = sae.decoder.weight[:, :n_supervised]
+                    vcos = (vdc * target_dirs.T).sum(dim=0)
+                    vdir = (1 - vcos).mean().item()
+                    val_sup += vbce + cfg.direction_loss_weight * vdir
+                elif cfg.supervision_mode == "mse":
                     vs, _, _ = mse_supervision_loss(
                         sae.decoder.weight, sup_acts_v, target_dirs, xv, yv, cfg,
                     )
@@ -450,7 +469,8 @@ def train_supervised_sae(
                 "n_supervised": n_supervised,
                 "n_unsupervised": cfg.n_unsupervised,
                 "n_lista_steps": cfg.n_lista_steps,
-                "use_mse_supervision": cfg.use_mse_supervision,
+                "supervision_mode": cfg.supervision_mode,
+                "use_mse_supervision": cfg.supervision_mode in ("mse", "hybrid"),
             },
             cfg.checkpoint_config_path,
         )

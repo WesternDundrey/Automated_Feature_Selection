@@ -45,6 +45,9 @@ def main():
                         help="Path to manual feature catalog JSON (skips inventory step)")
     parser.add_argument("--no-mse", action="store_true",
                         help="Use legacy BCE supervision instead of MSE")
+    parser.add_argument("--supervision", default=None,
+                        choices=["hybrid", "mse", "bce"],
+                        help="Supervision mode: hybrid (BCE+direction), mse, bce")
     parser.add_argument(
         "--step", default=None,
         choices=["inventory", "annotate", "train", "evaluate",
@@ -87,8 +90,10 @@ def main():
         overrides["batch_positions"] = True
     if args.catalog:
         overrides["manual_catalog"] = args.catalog
+    if args.supervision:
+        overrides["supervision_mode"] = args.supervision
     if args.no_mse:
-        overrides["use_mse_supervision"] = False
+        overrides["supervision_mode"] = "bce"
 
     cfg = Config(**overrides)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)

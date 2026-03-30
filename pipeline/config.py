@@ -59,10 +59,14 @@ class Config:
     seed: int = 42
     n_lista_steps: int = 0  # LISTA refinement iterations (0 = disabled)
 
-    # ── v2: MSE feature dictionary supervision (Makelov et al. 2024) ──
-    use_mse_supervision: bool = True    # False = legacy BCE mode
-    direction_loss_weight: float = 1.0  # α: decoder direction alignment
-    magnitude_loss_weight: float = 0.5  # β: activation magnitude alignment
+    # ── v2: Supervision mode ────────────────────────────────────────
+    # "hybrid" = BCE selectivity + cosine direction alignment (recommended)
+    # "mse"    = MSE magnitude + cosine direction (Makelov-inspired)
+    # "bce"    = legacy BCE only (no decoder alignment)
+    supervision_mode: str = "hybrid"
+    use_mse_supervision: bool = True    # DEPRECATED: use supervision_mode instead
+    direction_loss_weight: float = 1.0  # α: decoder direction alignment (hybrid/mse)
+    magnitude_loss_weight: float = 0.5  # β: activation magnitude alignment (mse only)
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API

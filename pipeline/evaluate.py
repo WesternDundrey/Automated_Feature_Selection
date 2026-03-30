@@ -36,6 +36,18 @@ def precision_recall_f1(y_true: np.ndarray, y_pred: np.ndarray):
     return p, r, f1
 
 
+def optimal_threshold_f1(y_true: np.ndarray, scores: np.ndarray,
+                          n_thresholds: int = 200) -> tuple[float, float, float, float]:
+    """Find the threshold maximizing F1. Returns (best_f1, best_p, best_r, best_thresh)."""
+    lo, hi = float(scores.min()), float(scores.max())
+    best_f1, best_p, best_r, best_t = 0.0, 0.0, 0.0, 0.0
+    for t in np.linspace(lo, hi, n_thresholds):
+        p, r, f1 = precision_recall_f1(y_true, scores > t)
+        if f1 > best_f1:
+            best_f1, best_p, best_r, best_t = f1, p, r, float(t)
+    return best_f1, best_p, best_r, best_t
+
+
 def auroc(y_true: np.ndarray, scores: np.ndarray) -> float:
     """Compute AUROC without sklearn dependency using the trapezoidal rule."""
     n_pos = y_true.sum()
@@ -185,6 +197,26 @@ def evaluate(cfg: Config = None):
     mean_auroc = float(np.mean(auroc_scores)) if auroc_scores else 0.0
     print(f"\n  Mean F1 (features with positives):    {mean_f1:.3f}")
     print(f"  Mean AUROC (features with positives): {mean_auroc:.3f}")
+
+    # ── 2b. Optimal-threshold F1 (calibration-independent) ──────────
+    print(f"\n  OPTIMAL-THRESHOLD F1 (best per-feature threshold):")
+    print(f"  {'Feature':<36} {'optF1':>6} {'optP':>6} {'optR':>6} {'thresh':>8}")
+    print("  " + "-" * 65)
+
+    opt_f1_scores = []
+    for k, feat in enumerate(features):
+        n_pos = int(gt[:, k].sum())
+        if n_pos == 0:
+            continue
+        opt_f1, opt_p, opt_r, opt_t = optimal_threshold_f1(gt[:, k], scores[:, k])
+        opt_f1_scores.append(opt_f1)
+        tag = " [G]" if feat["type"] == "group" else ""
+        print(f"  {feat['id']:<36} {opt_f1:>6.3f} {opt_p:>6.3f} {opt_r:>6.3f} {opt_t:>8.3f}{tag}")
+        feature_results[k]["opt_f1"] = round(opt_f1, 4)
+        feature_results[k]["opt_threshold"] = round(opt_t, 4)
+
+    opt_mean_f1 = float(np.mean(opt_f1_scores)) if opt_f1_scores else 0.0
+    print(f"\n  Mean optimal F1: {opt_mean_f1:.3f}  (vs threshold=0: {mean_f1:.3f})")
 
     # ── 3. Sparsity ─────────────────────────────────────────────────────
     l0_supervised = (sup_acts > 0).float().sum(dim=-1).mean().item()
