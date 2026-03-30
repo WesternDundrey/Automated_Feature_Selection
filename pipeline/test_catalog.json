@@ -1,0 +1,73 @@
+{
+  "_comment": "Small test catalog: 8 well-defined features for end-to-end pipeline validation. All verified on Qwen3-8B-Base annotator.",
+  "features": [
+    {
+      "id": "punctuation",
+      "description": "Token is a punctuation mark",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "punctuation.comma",
+      "description": "Token is a comma",
+      "type": "leaf",
+      "parent": "punctuation"
+    },
+    {
+      "id": "punctuation.period",
+      "description": "Token is a period or full stop",
+      "type": "leaf",
+      "parent": "punctuation"
+    },
+
+    {
+      "id": "function_word",
+      "description": "Token is a common function word",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "function_word.preposition",
+      "description": "Token is a preposition (in, on, at, of, for, with, to, from, by)",
+      "type": "leaf",
+      "parent": "function_word"
+    },
+    {
+      "id": "function_word.pronoun",
+      "description": "Token is a pronoun (he, she, it, they, we, I, you, him, her)",
+      "type": "leaf",
+      "parent": "function_word"
+    },
+    {
+      "id": "function_word.determiner",
+      "description": "Token is a determiner or article (the, a, an, this, that)",
+      "type": "leaf",
+      "parent": "function_word"
+    },
+
+    {
+      "id": "surface",
+      "description": "Surface-level token properties",
+      "type": "group",
+      "parent": null
+    },
+    {
+      "id": "surface.capitalized",
+      "description": "Token starts with an uppercase letter",
+      "type": "leaf",
+      "parent": "surface"
+    },
+    {
+      "id": "surface.digit",
+      "description": "Token contains a digit (0-9)",
+      "type": "leaf",
+      "parent": "surface"
+    },
+    {
+      "id": "surface.short",
+      "description": "Token is 1-2 characters long (excluding leading space)",
+      "type": "leaf",
+      "parent": "surface"
+    }
+  ]
+}
