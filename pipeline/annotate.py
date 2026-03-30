@@ -577,7 +577,7 @@ def _annotate_local_vllm_pertoken(
         dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=1024,
-        gpu_memory_utilization=0.95,
+        gpu_memory_utilization=0.85,  # leave headroom for lingering PyTorch allocs from prior steps
     )
     # Base model: no thinking, no chat template. Just completes text.
     # allowed_token_ids forces "0" or "1" — safe on base models.
