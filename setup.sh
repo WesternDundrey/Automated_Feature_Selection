@@ -11,7 +11,7 @@ cd /workspace/Automated_Feature_Selection
 bash install.sh
 
 # Pre-download annotator model
-python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-8B-Base')" || true
+python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-4B-Base')" || true
 
 # Git config if provided
 [ -n "$GIT_USERNAME" ] && [ -n "$GIT_EMAIL" ] && \
