@@ -1,13 +1,25 @@
-# DO NOT use this file directly. Run: bash install.sh
-# The install script handles the numpy version conflict properly.
-#
-# If you must use this file:
-#   pip install -r pipeline/requirements.txt
-#   pip install sae-lens transformer-lens --no-deps
-#   pip install jaxtyping einops fancy-einsum torchtyping typeguard wandb
-
-vllm>=0.18
-datasets>=3.0
-huggingface_hub>=0.27
-openai>=1.60
-tqdm>=4.66
+transformer-lens
+sae-lens
+datasets
+huggingface-hub
+openai
+tqdm
+jaxtyping
+einops
+fancy-einsum
+typeguard
+wandb
+safetensors
+accelerate
+beartype
+sentencepiece
+rich
+protobuf
+pydantic
+python-dotenv
+pyyaml
+simple-parsing
+tenacity
+plotly
+nltk
+vllm
