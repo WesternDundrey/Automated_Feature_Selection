@@ -980,40 +980,59 @@ def run(cfg: Config = None):
     leaf_indices = [i for i, f in enumerate(features) if f["type"] == "leaf"]
     print(f"Feature catalog: {len(features)} total, {len(leaf_features)} leaves to annotate")
 
-    # Load model for tokenization and activation extraction
-    from transformer_lens import HookedTransformer
+    # ── Tokenization + activation extraction ──────────────────────────
+    # Run in a subprocess if needed so CUDA context doesn't corrupt vLLM.
+    # The subprocess loads GPT-2, extracts, saves to disk, and exits cleanly.
+    need_tokens = not cfg.tokens_path.exists()
+    need_acts = not cfg.activations_path.exists()
 
-    print("Loading model...")
-    model = HookedTransformer.from_pretrained(
-        cfg.model_name, device=cfg.device, dtype=cfg.model_dtype
-    )
-    model.eval()
-    tokenizer = model.tokenizer
+    if need_tokens or need_acts:
+        import subprocess, sys
+        print("Extracting tokens/activations in subprocess (isolates CUDA context)...")
+        extract_script = f"""
+import torch
+from transformer_lens import HookedTransformer
+from pipeline.annotate import prepare_corpus, extract_activations
+from pipeline.config import Config
 
-    # Tokenize corpus (or load cached)
-    if cfg.tokens_path.exists():
-        print(f"Loading cached tokens: {cfg.tokens_path}")
-        tokens = torch.load(cfg.tokens_path, weights_only=True)
-    else:
-        tokens = prepare_corpus(model, cfg)
-        torch.save(tokens, cfg.tokens_path)
-        print(f"Saved tokens: {cfg.tokens_path}")
+cfg = Config(
+    model_name="{cfg.model_name}", device="{cfg.device}",
+    model_dtype="{cfg.model_dtype}", n_sequences={cfg.n_sequences},
+    seq_len={cfg.seq_len}, corpus_batch_size={cfg.corpus_batch_size},
+    target_layer={cfg.target_layer}, output_dir="{cfg.output_dir}",
+)
+cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract activations (or load cached)
-    if cfg.activations_path.exists():
-        print(f"Loading cached activations: {cfg.activations_path}")
-        activations = torch.load(cfg.activations_path, weights_only=True)
-    else:
-        activations = extract_activations(model, tokens, cfg)
-        torch.save(activations, cfg.activations_path)
-        print(f"Saved activations: {cfg.activations_path}")
+model = HookedTransformer.from_pretrained(cfg.model_name, device=cfg.device, dtype=cfg.model_dtype)
+model.eval()
 
-    # Save tokenizer ref before freeing model
-    tokenizer_ref = tokenizer
+if not cfg.tokens_path.exists():
+    tokens = prepare_corpus(model, cfg)
+    torch.save(tokens, cfg.tokens_path)
+    print(f"Saved tokens: {{cfg.tokens_path}}")
+else:
+    tokens = torch.load(cfg.tokens_path, weights_only=True)
 
-    # Free GPU
-    del model
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+if not cfg.activations_path.exists():
+    activations = extract_activations(model, tokens, cfg)
+    torch.save(activations, cfg.activations_path)
+    print(f"Saved activations: {{cfg.activations_path}}")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", extract_script],
+            check=True,
+        )
+        print("Subprocess complete. CUDA context cleaned up.")
+
+    # Load cached data (extracted by subprocess or previous run)
+    print(f"Loading cached tokens: {cfg.tokens_path}")
+    tokens = torch.load(cfg.tokens_path, weights_only=True)
+    print(f"Loading cached activations: {cfg.activations_path}")
+    activations = torch.load(cfg.activations_path, weights_only=True)
+
+    # Get tokenizer without loading the full model onto GPU
+    from transformers import AutoTokenizer
+    tokenizer_ref = AutoTokenizer.from_pretrained(cfg.model_name)
 
     # Annotate (or load cached)
     if cfg.annotations_path.exists():
