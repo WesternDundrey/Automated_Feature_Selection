@@ -586,7 +586,7 @@ def _annotate_local_vllm_pertoken(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
-        max_model_len=1024,
+        max_model_len=4096,  # needs headroom for large feature catalogs in prefix
         gpu_memory_utilization=0.85,  # leave headroom for lingering PyTorch allocs from prior steps
     )
     # Base model: no thinking, no chat template. Just completes text.
