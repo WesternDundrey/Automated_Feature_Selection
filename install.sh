@@ -2,10 +2,9 @@
 # One-shot install. Run once on a fresh vast.ai instance.
 # Usage: bash install.sh
 #
-# Handles the numpy version conflict:
-#   sae-lens pins numpy<2, vllm needs numpy>=2.
-#   Solution: install vllm first (pulls numpy>=2), then sae-lens/transformer-lens
-#   with --no-deps to skip their numpy<2 pin, then their real deps separately.
+# The numpy conflict: transformer-lens pins numpy<2, vllm needs numpy>=2.
+# Solution: install vllm first, then sae-lens+transformer-lens with --no-deps,
+# then every single one of their real dependencies manually (minus numpy).
 set -e
 
 echo "=== Installing pipeline dependencies ==="
@@ -18,33 +17,50 @@ if ! command -v uv &> /dev/null; then
     echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
 fi
 
-# Step 1: Install vllm (brings numpy>=2 and torch)
-echo "--- Step 1: vllm + numpy>=2 ---"
+# Step 1: vllm (brings torch, numpy>=2, transformers)
+echo "--- Step 1/3: vllm ---"
 uv pip install --system "vllm>=0.18"
 
-# Step 2: Install sae-lens and transformer-lens WITHOUT their deps
-# (their numpy<2 pin would downgrade numpy and break vllm)
-echo "--- Step 2: sae-lens + transformer-lens (--no-deps) ---"
+# Step 2: sae-lens + transformer-lens WITHOUT deps (skip numpy<2 pin)
+echo "--- Step 2/3: sae-lens + transformer-lens (--no-deps) ---"
 uv pip install --system --no-deps "sae-lens>=5.0" "transformer-lens>=2.8"
 
-# Step 3: Install the actual dependencies of sae-lens/transformer-lens
-# that don't conflict with numpy>=2
-echo "--- Step 3: remaining dependencies ---"
+# Step 3: Every dependency of sae-lens and transformer-lens, EXCEPT numpy
+# Sources:
+#   transformer-lens 2.18: pyproject.toml
+#   sae-lens 6.39: pyproject.toml
+echo "--- Step 3/3: all sub-dependencies ---"
 uv pip install --system \
-    "datasets>=3.0" \
-    "huggingface_hub>=0.27" \
-    "openai>=1.60" \
-    "tqdm>=4.66" \
-    "jaxtyping" \
-    "einops" \
-    "fancy-einsum" \
-    "torchtyping" \
-    "typeguard<4.0" \
-    "wandb" \
-    "safetensors" \
-    "pydantic"
+    "accelerate>=0.23.0" \
+    "beartype>=0.14.1,<0.15.0" \
+    "better-abc>=0.0.3,<0.0.4" \
+    "datasets>=3.1.0" \
+    "einops>=0.6.0" \
+    "fancy-einsum>=0.0.3" \
+    "huggingface-hub>=0.23.2,<1.0" \
+    "jaxtyping>=0.2.11" \
+    "protobuf>=3.20.0" \
+    "rich>=12.6.0" \
+    "sentencepiece" \
+    "tqdm>=4.64.1" \
+    "transformers>=4.57" \
+    "transformers-stream-generator>=0.0.5,<0.0.6" \
+    "typeguard>=4.2,<5.0" \
+    "typing-extensions>=4.10.0,<5.0.0" \
+    "wandb>=0.13.5" \
+    "pandas>=2.1" \
+    "babe>=0.0.7,<0.0.8" \
+    "nltk>=3.8.1,<4.0.0" \
+    "plotly>=5.19.0" \
+    "plotly-express>=0.4.1" \
+    "python-dotenv>=1.0.1" \
+    "pyyaml>=6.0.1,<7.0.0" \
+    "safetensors>=0.4.2,<1.0.0" \
+    "simple-parsing>=0.1.6,<0.2.0" \
+    "tenacity>=9.0.0" \
+    "openai>=1.60"
 
-# Verify all imports
+# Verify
 echo ""
 echo "=== Verifying imports ==="
 python -c "
@@ -58,6 +74,12 @@ for mod, name in [
     ('numpy', 'numpy'),
     ('datasets', 'datasets'),
     ('einops', 'einops'),
+    ('wandb', 'wandb'),
+    ('safetensors', 'safetensors'),
+    ('accelerate', 'accelerate'),
+    ('jaxtyping', 'jaxtyping'),
+    ('rich', 'rich'),
+    ('plotly', 'plotly'),
 ]:
     try:
         m = __import__(mod)
@@ -72,11 +94,12 @@ if not ok:
     sys.exit(1)
 
 import numpy as np
-if int(np.__version__.split('.')[0]) < 2:
-    print(f'\nWARNING: numpy {np.__version__} < 2.0 — vllm may break.')
-    print('Run: uv pip install --system \"numpy>=2.0\"')
+v = int(np.__version__.split('.')[0])
+if v < 2:
+    print(f'\nERROR: numpy {np.__version__} < 2.0 — vllm will break.')
+    sys.exit(1)
 
-print('\nAll imports successful.')
+print(f'\nAll imports successful. numpy={np.__version__} (>=2.0 OK)')
 "
 
 echo ""
