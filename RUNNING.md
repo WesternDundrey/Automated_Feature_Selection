@@ -16,14 +16,19 @@ The on-start script clones the repo and downloads Qwen3-4B-Base.
 ```bash
 cd /workspace/Automated_Feature_Selection
 
-# sae-lens and transformer-lens pin numpy<2 which conflicts with vllm.
-# --no-deps skips the pin. Their real deps are installed separately.
-pip install --no-deps sae-lens transformer-lens
-pip install -r pipeline/requirements.txt
+# Step 1: sae-lens + transformer-lens WITHOUT their deps
+# (they pin numpy<2 which would break vllm)
+uv pip install --system --no-deps sae-lens transformer-lens
 
-# Set API key for Sonnet (feature inventory step)
+# Step 2: their actual dependencies (minus torch/numpy/vllm)
+uv pip install --system -r pipeline/requirements.txt
+uv pip install --system babe plotly-express
+
+# Step 3: API key for Sonnet (feature inventory step)
 export OPENROUTER_API_KEY="sk-or-..."
 ```
+
+pip warnings about numpy/beartype/huggingface-hub version conflicts are safe to ignore — the code works fine with the installed versions.
 
 ## Quick Test (Manual Catalog)
 
