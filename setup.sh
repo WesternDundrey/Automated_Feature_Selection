@@ -9,7 +9,6 @@ git clone https://github.com/WesternDundrey/Automated_Feature_Selection.git /wor
 cd /workspace/Automated_Feature_Selection
 
 pip install --no-deps sae-lens transformer-lens
-pip install -r pipeline/requirements.txt
 
 # Pre-download annotator model
 python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-4B-Base')" || true
