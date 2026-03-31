@@ -8,8 +8,6 @@ apt-get update -qq && apt-get install -y -qq curl git tmux > /dev/null 2>&1
 git clone https://github.com/WesternDundrey/Automated_Feature_Selection.git /workspace/Automated_Feature_Selection
 cd /workspace/Automated_Feature_Selection
 
-pip install --no-deps sae-lens transformer-lens
-
 # Pre-download annotator model
 python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-4B-Base')" || true
 
