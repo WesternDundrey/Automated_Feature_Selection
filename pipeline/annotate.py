@@ -499,9 +499,12 @@ def _annotate_local_vllm_pertoken(
     print(f"  Token IDs: '0'={tok_0_id}, '1'={tok_1_id}")
 
     # ── Build system prefix and suffix caches ──────────────────────────
+    # Both modes share the same cache structure:
+    #   pos_prefix = sys + text:" + tok_0...tok_k + '"\nToken: "X". '  (CACHED)
+    #   suffix = feature question only                                  (NOT cached)
+    # F-index suffix: "F3? " (~3 tok).  Full-desc suffix: "description? " (~8-10 tok)
     use_findex = cfg.use_findex_suffix
     if use_findex:
-        # F-index mode: feature defs in prefix, suffix is just "F{i}? " (~3 tok)
         feat_defs = "\n".join(
             f"F{i}: {f['description']}" for i, f in enumerate(features)
         )
@@ -515,7 +518,6 @@ def _annotate_local_vllm_pertoken(
             f'Token: "cat". F5? 0\n\n'
         )
     else:
-        # Full-description mode: suffix has full question (~15 tok)
         SYS_STR = (
             'Answer 0 (no) or 1 (yes).\n\n'
             'Text: "The cat sat on the mat ,"\nToken: ",". A comma? 1\n'
@@ -525,8 +527,6 @@ def _annotate_local_vllm_pertoken(
         )
 
     sys_ids = ann_tokenizer.encode(SYS_STR, add_special_tokens=False)
-    mode_str = f"F-index (~3 tok suffix)" if use_findex else f"full-desc (~15 tok suffix)"
-    print(f"  System prefix: {len(sys_ids)} tokens ({mode_str})")
 
     # Pre-tokenize each GPT-2 token string
     print("  Pre-tokenizing sequence tokens...")
@@ -539,8 +539,7 @@ def _annotate_local_vllm_pertoken(
             seq_tok_ids.append(ids)
         tok_ids_per_seq.append(seq_tok_ids)
 
-    # Pre-encode token name cache: tok_str -> IDs for '"\nToken: "X". '
-    print("  Pre-encoding suffixes...")
+    # Token name cache: cached across features at same position
     tok_name_cache = {}
     for seq_j in range(N):
         for tok_k in range(T):
@@ -551,47 +550,46 @@ def _annotate_local_vllm_pertoken(
                     ann_tokenizer.encode(s, add_special_tokens=False)
                 )
 
+    # Feature suffix: only non-cached part per prompt
     if use_findex:
-        # F-index suffix: "F{i}? " per feature (~3 tokens)
-        feat_suffix_cache = []
-        for fi in range(n_features):
-            s = f'F{fi}? '
-            feat_suffix_cache.append(tuple(
-                ann_tokenizer.encode(s, add_special_tokens=False)
-            ))
-        avg_sfx = sum(len(s) for s in feat_suffix_cache) / max(len(feat_suffix_cache), 1)
-        print(f"  {n_features} feature suffixes (avg {avg_sfx:.1f} tok, NOT cached)")
+        feat_suffix_list = [
+            tuple(ann_tokenizer.encode(f'F{fi}? ', add_special_tokens=False))
+            for fi in range(n_features)
+        ]
     else:
-        # Full-description suffix: (tok_str, fi) -> full question (~15 tokens)
-        feat_descs = [f["description"].rstrip(".").lower() for f in features]
-        suffix_cache = {}
-        for seq_j in range(N):
-            for tok_k in range(T):
-                tok_str = all_token_strs[seq_j][tok_k].strip()
-                for fi in range(n_features):
-                    key = (tok_str, fi)
-                    if key not in suffix_cache:
-                        s = f'"\nToken: "{tok_str}". {feat_descs[fi]}? '
-                        suffix_cache[key] = tuple(
-                            ann_tokenizer.encode(s, add_special_tokens=False)
-                        )
-        avg_sfx = sum(len(v) for v in suffix_cache.values()) / max(len(suffix_cache), 1)
-        print(f"  {len(suffix_cache)} unique suffixes (avg {avg_sfx:.1f} tok, NOT cached)")
+        feat_suffix_list = [
+            tuple(ann_tokenizer.encode(
+                f'{f["description"].rstrip(".").lower()}? ', add_special_tokens=False
+            ))
+            for f in features
+        ]
 
     text_open_ids = ann_tokenizer.encode('Text: "', add_special_tokens=False)
 
+    # Compute actual max prompt length → set max_model_len tightly
+    max_text_toks = max(
+        sum(len(tok_ids_per_seq[j][k]) for k in range(T))
+        for j in range(N)
+    )
+    max_name_toks = max(len(v) for v in tok_name_cache.values())
+    max_sfx_toks = max(len(s) for s in feat_suffix_list)
+    max_prompt = len(sys_ids) + len(text_open_ids) + max_text_toks + max_name_toks + max_sfx_toks
+    # Round up to next multiple of 64
+    computed_max_len = min(8192, ((max_prompt + 63) // 64) * 64)
+
+    avg_sfx = sum(len(s) for s in feat_suffix_list) / max(len(feat_suffix_list), 1)
+    mode_str = "F-index" if use_findex else "full-desc"
+    print(f"  System prefix: {len(sys_ids)} tokens ({mode_str})")
+    print(f"  Token names: {len(tok_name_cache)} unique (cached per-position)")
+    print(f"  Feature suffixes: avg {avg_sfx:.1f} tok (NOT cached)")
+    print(f"  Max prompt: {max_prompt} tok → max_model_len={computed_max_len}")
+
     # Debug: show sample prompt
     sample_tok = all_token_strs[0][0].strip()
-    if use_findex:
-        sample_prompt = (
-            sys_ids + text_open_ids + list(tok_ids_per_seq[0][0])
-            + list(tok_name_cache[sample_tok]) + list(feat_suffix_cache[0])
-        )
-    else:
-        sample_prompt = (
-            sys_ids + text_open_ids + list(tok_ids_per_seq[0][0])
-            + list(suffix_cache[(sample_tok, 0)])
-        )
+    sample_prompt = (
+        sys_ids + text_open_ids + list(tok_ids_per_seq[0][0])
+        + list(tok_name_cache[sample_tok]) + list(feat_suffix_list[0])
+    )
     print(f"\n  Sample prompt (seq=0, pos=0, feat=0):")
     print(f"  {ann_tokenizer.decode(sample_prompt)}")
     print()
@@ -616,8 +614,8 @@ def _annotate_local_vllm_pertoken(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
-        max_model_len=4096,  # needs headroom for large feature catalogs in prefix
-        gpu_memory_utilization=0.85,  # leave headroom for lingering PyTorch allocs from prior steps
+        max_model_len=computed_max_len,
+        gpu_memory_utilization=0.95,  # safe: activation extraction runs in subprocess
     )
     # Base model: no thinking, no chat template. Just completes text.
     # allowed_token_ids forces "0" or "1" — safe on base models.
@@ -662,24 +660,19 @@ def _annotate_local_vllm_pertoken(
             for tok_k in range(T):
                 prefix = prefix + tok_id_tuples[seq_j][tok_k]
                 tok_str = all_token_strs[seq_j][tok_k].strip()
-                if use_findex:
-                    pos_prefix = prefix + tok_name_cache[tok_str]
-                    for fi in range(n_features):
-                        prompts.append({
-                            "prompt_token_ids": list(pos_prefix + feat_suffix_cache[fi])
-                        })
-                        positions.append((seq_j, tok_k, fi))
-                else:
-                    for fi in range(n_features):
-                        suf = suffix_cache[(tok_str, fi)]
-                        prompts.append({
-                            "prompt_token_ids": list(prefix + suf)
-                        })
-                        positions.append((seq_j, tok_k, fi))
+                # Token name in prefix: cached across all features at this position
+                pos_prefix = prefix + tok_name_cache[tok_str]
+                for fi in range(n_features):
+                    prompts.append({
+                        "prompt_token_ids": list(pos_prefix + feat_suffix_list[fi])
+                    })
+                    positions.append((seq_j, tok_k, fi))
 
         outputs = llm.generate(prompts, params)
 
-        # Debug: print first 10 raw outputs from first chunk
+        batch_time = time.time()
+
+        # Debug + cache verification on first chunk
         if seq_start == 0:
             print("\n  First 10 raw outputs:")
             for di in range(min(10, len(outputs))):
@@ -687,6 +680,20 @@ def _annotate_local_vllm_pertoken(
                 raw = outputs[di].outputs[0].text
                 tok = all_token_strs[sj][tk].strip()
                 print(f"    [{di}] tok='{tok}' feat={fi_d} -> '{raw}'")
+
+            # Prefix cache check: re-run same batch, should be 2-10x faster
+            t_cold = batch_time - t_start
+            t0 = time.time()
+            llm.generate(prompts[:min(512, len(prompts))], params)
+            t_warm = time.time() - t0
+            speedup = t_cold / max(t_warm, 1e-6)
+            n_check = min(512, len(prompts))
+            print(f"\n  PREFIX CACHE CHECK ({n_check} prompts):")
+            print(f"    Cold: {t_cold:.2f}s  Warm: {t_warm:.2f}s  Speedup: {speedup:.1f}x")
+            if speedup < 1.5:
+                print("    WARNING: prefix caching may not be working!")
+            else:
+                print("    OK — caching is active.")
             print()
 
         for idx, output in enumerate(outputs):

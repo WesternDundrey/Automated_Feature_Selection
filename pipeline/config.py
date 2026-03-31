@@ -70,7 +70,7 @@ class Config:
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API
-    local_annotator_model: str = "Qwen/Qwen3-8B-Base"  # base model, no thinking, pure transformer
+    local_annotator_model: str = "Qwen/Qwen3-4B-Base"  # base model, no thinking, pure transformer
     local_annotation_batch_size: int = 64
     batch_positions: bool = False  # True = full-sequence JSON, False = per-token
     use_findex_suffix: bool = True  # True = "F3? " (~3 tok), False = full description (~15 tok)
