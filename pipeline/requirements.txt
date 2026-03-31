@@ -1,6 +1,11 @@
-numpy>=2
-transformer-lens
-sae-lens
+# DO NOT install torch, vllm, or numpy on Blackwell GPUs (5090, etc.)
+# The vast.ai image has custom CUDA 13.x builds that don't exist on PyPI.
+# Only install the packages below.
+
+transformer-lens --no-deps
+sae-lens --no-deps
+
+# transformer-lens + sae-lens dependencies (minus torch/numpy/vllm)
 datasets
 huggingface-hub
 openai
@@ -13,6 +18,7 @@ wandb
 safetensors
 accelerate
 beartype
+better-abc
 sentencepiece
 rich
 protobuf
@@ -23,4 +29,7 @@ simple-parsing
 tenacity
 plotly
 nltk
-vllm
+typing-extensions
+transformers
+transformers-stream-generator
+pandas
