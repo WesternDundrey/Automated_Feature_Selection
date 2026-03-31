@@ -498,23 +498,35 @@ def _annotate_local_vllm_pertoken(
     tok_1_id = ann_tokenizer.encode("1", add_special_tokens=False)[0]
     print(f"  Token IDs: '0'={tok_0_id}, '1'={tok_1_id}")
 
-    # ── System prefix with feature definitions (cached across ALL prompts) ──
-    # Feature defs in prefix → suffix is just "F{i}? " (~3 tokens, not ~15)
-    feat_defs = "\n".join(
-        f"F{i}: {f['description']}" for i, f in enumerate(features)
-    )
-    SYS_STR = (
-        f'Answer 0 (no) or 1 (yes).\n\n'
-        f'Features:\n{feat_defs}\n\n'
-        f'Text: "The cat sat on the mat ,"\n'
-        f'Token: ",". F0? 1\n'
-        f'Token: "mat". F0? 0\n'
-        f'Token: "The". F5? 1\n'
-        f'Token: "cat". F5? 0\n\n'
-    )
+    # ── Build system prefix and suffix caches ──────────────────────────
+    use_findex = cfg.use_findex_suffix
+    if use_findex:
+        # F-index mode: feature defs in prefix, suffix is just "F{i}? " (~3 tok)
+        feat_defs = "\n".join(
+            f"F{i}: {f['description']}" for i, f in enumerate(features)
+        )
+        SYS_STR = (
+            f'Answer 0 (no) or 1 (yes).\n\n'
+            f'Features:\n{feat_defs}\n\n'
+            f'Text: "The cat sat on the mat ,"\n'
+            f'Token: ",". F0? 1\n'
+            f'Token: "mat". F0? 0\n'
+            f'Token: "The". F5? 1\n'
+            f'Token: "cat". F5? 0\n\n'
+        )
+    else:
+        # Full-description mode: suffix has full question (~15 tok)
+        SYS_STR = (
+            'Answer 0 (no) or 1 (yes).\n\n'
+            'Text: "The cat sat on the mat ,"\nToken: ",". A comma? 1\n'
+            'Text: "The cat sat on the mat ,"\nToken: "mat". A comma? 0\n'
+            'Text: "The cat sat on the mat ,"\nToken: "The". Starts with uppercase? 1\n'
+            'Text: "The cat sat on the mat ,"\nToken: "cat". Starts with uppercase? 0\n\n'
+        )
 
     sys_ids = ann_tokenizer.encode(SYS_STR, add_special_tokens=False)
-    print(f"  System prefix: {len(sys_ids)} tokens (feat defs + few-shot, cached L0)")
+    mode_str = f"F-index (~3 tok suffix)" if use_findex else f"full-desc (~15 tok suffix)"
+    print(f"  System prefix: {len(sys_ids)} tokens ({mode_str})")
 
     # Pre-tokenize each GPT-2 token string
     print("  Pre-tokenizing sequence tokens...")
@@ -527,9 +539,8 @@ def _annotate_local_vllm_pertoken(
             seq_tok_ids.append(ids)
         tok_ids_per_seq.append(seq_tok_ids)
 
-    # Pre-encode token name suffixes: tok_str -> IDs for '"\nToken: "X". '
-    # This goes into the per-position prefix (cached across features at same position)
-    print("  Pre-encoding token names and feature suffixes...")
+    # Pre-encode token name cache: tok_str -> IDs for '"\nToken: "X". '
+    print("  Pre-encoding suffixes...")
     tok_name_cache = {}
     for seq_j in range(N):
         for tok_k in range(T):
@@ -540,28 +551,47 @@ def _annotate_local_vllm_pertoken(
                     ann_tokenizer.encode(s, add_special_tokens=False)
                 )
 
-    # Pre-encode feature question suffixes: fi -> IDs for 'F{i}? '
-    # This is the ONLY non-cached part per prompt (~3 tokens)
-    feat_suffix_cache = []
-    for fi in range(n_features):
-        s = f'F{fi}? '
-        feat_suffix_cache.append(tuple(
-            ann_tokenizer.encode(s, add_special_tokens=False)
-        ))
-
-    avg_feat_len = sum(len(s) for s in feat_suffix_cache) / max(len(feat_suffix_cache), 1)
-    avg_name_len = sum(len(v) for v in tok_name_cache.values()) / max(len(tok_name_cache), 1)
-    print(f"  {len(tok_name_cache)} unique token names (avg {avg_name_len:.1f} tok, cached per-position)")
-    print(f"  {n_features} feature suffixes (avg {avg_feat_len:.1f} tok, NOT cached)")
+    if use_findex:
+        # F-index suffix: "F{i}? " per feature (~3 tokens)
+        feat_suffix_cache = []
+        for fi in range(n_features):
+            s = f'F{fi}? '
+            feat_suffix_cache.append(tuple(
+                ann_tokenizer.encode(s, add_special_tokens=False)
+            ))
+        avg_sfx = sum(len(s) for s in feat_suffix_cache) / max(len(feat_suffix_cache), 1)
+        print(f"  {n_features} feature suffixes (avg {avg_sfx:.1f} tok, NOT cached)")
+    else:
+        # Full-description suffix: (tok_str, fi) -> full question (~15 tokens)
+        feat_descs = [f["description"].rstrip(".").lower() for f in features]
+        suffix_cache = {}
+        for seq_j in range(N):
+            for tok_k in range(T):
+                tok_str = all_token_strs[seq_j][tok_k].strip()
+                for fi in range(n_features):
+                    key = (tok_str, fi)
+                    if key not in suffix_cache:
+                        s = f'"\nToken: "{tok_str}". {feat_descs[fi]}? '
+                        suffix_cache[key] = tuple(
+                            ann_tokenizer.encode(s, add_special_tokens=False)
+                        )
+        avg_sfx = sum(len(v) for v in suffix_cache.values()) / max(len(suffix_cache), 1)
+        print(f"  {len(suffix_cache)} unique suffixes (avg {avg_sfx:.1f} tok, NOT cached)")
 
     text_open_ids = ann_tokenizer.encode('Text: "', add_special_tokens=False)
 
     # Debug: show sample prompt
     sample_tok = all_token_strs[0][0].strip()
-    sample_prompt = (
-        sys_ids + text_open_ids + list(tok_ids_per_seq[0][0])
-        + list(tok_name_cache[sample_tok]) + list(feat_suffix_cache[0])
-    )
+    if use_findex:
+        sample_prompt = (
+            sys_ids + text_open_ids + list(tok_ids_per_seq[0][0])
+            + list(tok_name_cache[sample_tok]) + list(feat_suffix_cache[0])
+        )
+    else:
+        sample_prompt = (
+            sys_ids + text_open_ids + list(tok_ids_per_seq[0][0])
+            + list(suffix_cache[(sample_tok, 0)])
+        )
     print(f"\n  Sample prompt (seq=0, pos=0, feat=0):")
     print(f"  {ann_tokenizer.decode(sample_prompt)}")
     print()
@@ -632,14 +662,20 @@ def _annotate_local_vllm_pertoken(
             for tok_k in range(T):
                 prefix = prefix + tok_id_tuples[seq_j][tok_k]
                 tok_str = all_token_strs[seq_j][tok_k].strip()
-                # Per-position prefix includes token name (cached across features)
-                pos_prefix = prefix + tok_name_cache[tok_str]
-                for fi in range(n_features):
-                    # Only ~3 non-cached tokens per prompt
-                    prompts.append({
-                        "prompt_token_ids": list(pos_prefix + feat_suffix_cache[fi])
-                    })
-                    positions.append((seq_j, tok_k, fi))
+                if use_findex:
+                    pos_prefix = prefix + tok_name_cache[tok_str]
+                    for fi in range(n_features):
+                        prompts.append({
+                            "prompt_token_ids": list(pos_prefix + feat_suffix_cache[fi])
+                        })
+                        positions.append((seq_j, tok_k, fi))
+                else:
+                    for fi in range(n_features):
+                        suf = suffix_cache[(tok_str, fi)]
+                        prompts.append({
+                            "prompt_token_ids": list(prefix + suf)
+                        })
+                        positions.append((seq_j, tok_k, fi))
 
         outputs = llm.generate(prompts, params)
 

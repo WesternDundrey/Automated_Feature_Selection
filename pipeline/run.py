@@ -45,6 +45,8 @@ def main():
                         help="Path to manual feature catalog JSON (skips inventory step)")
     parser.add_argument("--no-mse", action="store_true",
                         help="Use legacy BCE supervision instead of MSE")
+    parser.add_argument("--full-desc", action="store_true",
+                        help="Use full description in suffix instead of F-index (slower but more accurate)")
     parser.add_argument("--supervision", default=None,
                         choices=["hybrid", "mse", "bce"],
                         help="Supervision mode: hybrid (BCE+direction), mse, bce")
@@ -94,6 +96,8 @@ def main():
         overrides["supervision_mode"] = args.supervision
     if args.no_mse:
         overrides["supervision_mode"] = "bce"
+    if args.full_desc:
+        overrides["use_findex_suffix"] = False
 
     cfg = Config(**overrides)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
