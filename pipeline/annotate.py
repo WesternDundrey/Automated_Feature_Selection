@@ -615,7 +615,7 @@ def _annotate_local_vllm_pertoken(
         dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=computed_max_len,
-        gpu_memory_utilization=0.95,  # safe: activation extraction runs in subprocess
+        gpu_memory_utilization=0.90,
     )
     # Base model: no thinking, no chat template. Just completes text.
     # allowed_token_ids forces "0" or "1" — safe on base models.
