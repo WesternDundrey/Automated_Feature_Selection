@@ -7,7 +7,7 @@
 - **Model**: GPT-2 Small, layer 8 residual stream (d_model=768)
 - **Features**: 64 supervised latents (11 groups + 53 leaves) across 11 semantic categories
 - **Data**: 500 sequences x 128 tokens from OpenWebText (64K token-positions, 12,800 test)
-- **Annotator**: Qwen3-8B-Base via vLLM, per-token binary labels with token-ID prefix caching
+- **Annotator**: Qwen3-4B-Base via vLLM, per-token binary labels with token-ID prefix caching
 - **Feature catalog**: Sonnet-generated inventory with hierarchical grouping
 - **Training**: Hybrid BCE + direction loss, 64 supervised + 256 unsupervised latents
 - **Baselines**: Linear probe on raw activations (d_model=768), post-training linear readout from pretrained SAE (24,576 latents)
