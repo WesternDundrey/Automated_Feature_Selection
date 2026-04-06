@@ -4,6 +4,45 @@
 
 ---
 
+## [v5.0] — Phase 1 Validation (Causal + Calibrated Eval + Ablation)
+
+**Date:** 2026-04-06
+
+### Changes
+
+**1. Calibrated threshold evaluation (evaluate.py)**
+
+Previous evaluation tuned per-feature thresholds on the test set ("oracle") — this overfits. Now the 20% held-out data is split into 10% val + 10% test:
+- Thresholds are optimized per-feature on val via grid search over `np.linspace(min, max, 200)`
+- All reported metrics use these fixed thresholds on the held-out test set
+- Oracle thresholds (per-feature optimum on test) are kept but explicitly labeled "NOT honest eval"
+- Three F1 variants reported: t=0 (naive), calibrated (from val), oracle (from test)
+
+The train set (80%) is unchanged — no retraining required.
+
+**2. Per-feature causal necessity test (causal.py)**
+
+New Test 4: `test_feature_necessity()`. For each of the n_supervised features:
+1. Replace layer-8 residual with full SAE reconstruction → baseline logits
+2. Replace residual with SAE reconstruction minus feature k (zero one latent) → ablated logits
+3. Compute KL(baseline || ablated) at positions where feature k's annotation label = 1
+
+Metrics: `mean_kl` (causal importance), `pred_change_rate` (fraction of active positions where argmax prediction changes). This is the test that distinguishes a supervised SAE from a linear probe: the probe classifies but can't intervene; the SAE's decoder columns steer the model.
+
+**3. Ablation study fix (ablation.py)**
+
+Replaced deprecated `use_mse_supervision` flag with `supervision_mode` in ablation variants. Now correctly tests all three supervision modes: hybrid (BCE + direction), mse (Makelov-style), bce (legacy).
+
+### Mathematical detail
+
+**Threshold calibration:**
+For feature k, the calibrated threshold t_k^* = argmax_{t} F1(y_val_k, scores_val_k > t), searched over 200 linearly-spaced values in [min(scores_k), max(scores_k)]. This is applied as a fixed decision boundary on the test set: pred_k = (scores_test_k > t_k^*).
+
+**Causal necessity KL:**
+KL(p_base || p_ablated) = Σ_v p_base(v) · log(p_base(v) / p_ablated(v)), where p_base is the softmax output under full SAE reconstruction and p_ablated is the softmax under reconstruction with feature k zeroed. Computed only at positions where the annotation label for feature k is 1.
+
+---
+
 ## [v4.1] — Qwen3-8B Annotator + ChatML + Calibration Fix
 
 **Date:** 2026-03-21

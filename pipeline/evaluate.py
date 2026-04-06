@@ -113,11 +113,19 @@ def evaluate(cfg: Config = None):
         perm = torch.randperm(n_total)
 
     split_idx = int(cfg.train_fraction * n_total)
-    test_idx = perm[split_idx:]
+    remaining = n_total - split_idx
+    val_size = remaining // 2
+    val_split = split_idx + val_size
+
+    val_idx = perm[split_idx:val_split]
+    test_idx = perm[val_split:]
+
+    x_val = x_flat[val_idx]
+    y_val = y_flat[val_idx]
     x_test = x_flat[test_idx]
     y_test = y_flat[test_idx]
 
-    print(f"Evaluating on {x_test.shape[0]:,} test vectors")
+    print(f"Val: {x_val.shape[0]:,} vectors  |  Test: {x_test.shape[0]:,} vectors")
 
     # Forward pass in batches
     all_recon = []
@@ -138,6 +146,25 @@ def evaluate(cfg: Config = None):
     sup_pre = torch.cat(all_sup_pre)
     sup_acts = torch.cat(all_sup_acts)
     all_acts = torch.cat(all_all_acts)
+
+    # ── Val forward pass (threshold calibration) ─────────────────────────
+    val_sup_pre_list = []
+    with torch.no_grad():
+        for i in range(0, x_val.shape[0], cfg.batch_size):
+            x_b = x_val[i : i + cfg.batch_size].to(cfg.device)
+            _, vsp, _, _ = sae(x_b)
+            val_sup_pre_list.append(vsp.cpu())
+    val_sup_pre = torch.cat(val_sup_pre_list)
+
+    val_gt = y_val.numpy().astype(bool)
+    val_scores = val_sup_pre.numpy()
+    calibrated_thresholds = np.zeros(n_features)
+    for k in range(n_features):
+        n_pos = int(val_gt[:, k].sum())
+        if n_pos == 0:
+            continue
+        _, _, _, best_t = optimal_threshold_f1(val_gt[:, k], val_scores[:, k])
+        calibrated_thresholds[k] = best_t
 
     # ── 1. Reconstruction ────────────────────────────────────────────────
     mse = F.mse_loss(recon, x_test).item()
@@ -198,8 +225,30 @@ def evaluate(cfg: Config = None):
     print(f"\n  Mean F1 (features with positives):    {mean_f1:.3f}")
     print(f"  Mean AUROC (features with positives): {mean_auroc:.3f}")
 
-    # ── 2b. Optimal-threshold F1 (calibration-independent) ──────────
-    print(f"\n  OPTIMAL-THRESHOLD F1 (best per-feature threshold):")
+    # ── 2a. Calibrated-threshold F1 (tuned on val, applied to test) ──
+    print(f"\n  CALIBRATED F1 (thresholds from val set, evaluated on test):")
+    print(f"  {'Feature':<36} {'calF1':>6} {'calP':>6} {'calR':>6} {'thresh':>8}")
+    print("  " + "-" * 65)
+
+    cal_f1_scores = []
+    for k, feat in enumerate(features):
+        n_pos = int(gt[:, k].sum())
+        if n_pos == 0:
+            continue
+        cal_pred = scores[:, k] > calibrated_thresholds[k]
+        cal_p, cal_r, cal_f1 = precision_recall_f1(gt[:, k], cal_pred)
+        cal_f1_scores.append(cal_f1)
+        tag = " [G]" if feat["type"] == "group" else ""
+        print(f"  {feat['id']:<36} {cal_f1:>6.3f} {cal_p:>6.3f} {cal_r:>6.3f} "
+              f"{calibrated_thresholds[k]:>8.3f}{tag}")
+        feature_results[k]["cal_f1"] = round(cal_f1, 4)
+        feature_results[k]["cal_threshold"] = round(float(calibrated_thresholds[k]), 4)
+
+    cal_mean_f1 = float(np.mean(cal_f1_scores)) if cal_f1_scores else 0.0
+    print(f"\n  Mean calibrated F1: {cal_mean_f1:.3f}  (vs t=0: {mean_f1:.3f})")
+
+    # ── 2b. Oracle-threshold F1 (per-feature optimum on test — reference only)
+    print(f"\n  ORACLE F1 (per-feature optimum on test set — NOT honest eval):")
     print(f"  {'Feature':<36} {'optF1':>6} {'optP':>6} {'optR':>6} {'thresh':>8}")
     print("  " + "-" * 65)
 
@@ -216,7 +265,7 @@ def evaluate(cfg: Config = None):
         feature_results[k]["opt_threshold"] = round(opt_t, 4)
 
     opt_mean_f1 = float(np.mean(opt_f1_scores)) if opt_f1_scores else 0.0
-    print(f"\n  Mean optimal F1: {opt_mean_f1:.3f}  (vs threshold=0: {mean_f1:.3f})")
+    print(f"\n  Mean oracle F1: {opt_mean_f1:.3f}  (calibrated: {cal_mean_f1:.3f}, t=0: {mean_f1:.3f})")
 
     # ── 3. Sparsity ─────────────────────────────────────────────────────
     l0_supervised = (sup_acts > 0).float().sum(dim=-1).mean().item()
@@ -528,7 +577,10 @@ def evaluate(cfg: Config = None):
         "sparsity": {"l0_supervised": l0_supervised, "l0_total": l0_total},
         "features": feature_results,
         "mean_f1": mean_f1,
+        "cal_mean_f1": cal_mean_f1,
+        "opt_mean_f1": opt_mean_f1,
         "mean_auroc": mean_auroc,
+        "n_val_vectors": int(x_val.shape[0]),
         "mse_supervision_metrics": {
             "mean_cosine_to_target": mean_cosine,
             "mean_fve": mean_fve,

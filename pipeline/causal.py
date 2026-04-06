@@ -400,6 +400,146 @@ def test_interpretability(sae, pairs, features, cfg):
     return {}
 
 
+# ── Test 4: Per-Feature Necessity ────────────────────────────────────────
+
+def test_feature_necessity(model, sae, cfg):
+    """Per-feature ablation: zero out each supervised latent, measure downstream effect.
+
+    For each supervised feature k:
+      1. Replace residual stream with full SAE reconstruction → baseline logits
+      2. Replace residual with SAE reconstruction minus feature k → ablated logits
+      3. Compute KL(baseline || ablated) at positions where feature k is active
+
+    High KL = the model relies on this feature's decoder direction.
+    This is what separates a supervised SAE from a linear probe — the probe
+    can classify but can't intervene.
+
+    Uses stored tokens + annotations from the pipeline (not IOI prompts).
+    """
+    from pathlib import Path
+
+    print("\n" + "=" * 70)
+    print("TEST 4: PER-FEATURE CAUSAL NECESSITY")
+    print("=" * 70)
+
+    for path, name in [
+        (cfg.tokens_path, "tokens"),
+        (cfg.annotations_path, "annotations"),
+    ]:
+        if not path.exists():
+            print(f"  Skipping: {name} not found at {path}")
+            return {}
+
+    tokens = torch.load(cfg.tokens_path, weights_only=True)
+    annotations = torch.load(cfg.annotations_path, weights_only=True)
+    catalog = json.loads(cfg.catalog_path.read_text())
+    features = catalog["features"]
+    n_sup = sae.n_supervised
+
+    n_seqs = min(cfg.causal_n_sequences, tokens.shape[0])
+    tokens_sub = tokens[:n_seqs]
+    annot_sub = annotations[:n_seqs]
+
+    sae = sae.to(cfg.device).eval()
+
+    print(f"  Sequences: {n_seqs}  |  Features: {n_sup}")
+    print(f"  Hook point: {cfg.hook_point}")
+
+    # Full-reconstruction baseline logits (one pass per sequence)
+    def full_recon_hook(resid, hook):
+        flat = resid.reshape(-1, resid.shape[-1])
+        recon, _, _, _ = sae(flat)
+        return recon.reshape(resid.shape)
+
+    recon_logprobs = []
+    with torch.no_grad():
+        for i in tqdm(range(n_seqs), desc="  Full recon baseline"):
+            toks = tokens_sub[i : i + 1].to(cfg.device)
+            logits = model.run_with_hooks(
+                toks, fwd_hooks=[(cfg.hook_point, full_recon_hook)]
+            )
+            recon_logprobs.append(F.log_softmax(logits[0].cpu(), dim=-1))
+
+    # Per-feature ablation
+    results = []
+
+    for k in tqdm(range(n_sup), desc="  Feature ablation"):
+        feat = features[k]
+        active_mask = annot_sub[:, :, k].bool()
+        n_active = int(active_mask.sum())
+
+        if n_active < 5:
+            results.append({
+                "id": feat["id"], "type": feat["type"],
+                "n_active": n_active,
+                "mean_kl": None, "pred_change_rate": None,
+            })
+            continue
+
+        feat_k = k  # capture for closure
+
+        def ablate_hook(resid, hook):
+            flat = resid.reshape(-1, resid.shape[-1])
+            _, _, _, acts = sae(flat)
+            acts[:, feat_k] = 0.0
+            recon = sae.decoder(acts)
+            return recon.reshape(resid.shape)
+
+        kl_sum = 0.0
+        pred_changes = 0
+        total = 0
+
+        with torch.no_grad():
+            for i in range(n_seqs):
+                if not active_mask[i].any():
+                    continue
+                toks = tokens_sub[i : i + 1].to(cfg.device)
+                abl_logits = model.run_with_hooks(
+                    toks, fwd_hooks=[(cfg.hook_point, ablate_hook)]
+                )
+
+                active_pos = active_mask[i].nonzero(as_tuple=True)[0]
+                base_lp = recon_logprobs[i][active_pos]
+                abl_lp = F.log_softmax(abl_logits[0, active_pos].cpu(), dim=-1)
+
+                kl = (base_lp.exp() * (base_lp - abl_lp)).sum(dim=-1)
+                kl_sum += kl.sum().item()
+
+                pred_changes += (base_lp.argmax(-1) != abl_lp.argmax(-1)).sum().item()
+                total += len(active_pos)
+
+        mean_kl = kl_sum / total if total > 0 else 0
+        change_rate = pred_changes / total if total > 0 else 0
+
+        results.append({
+            "id": feat["id"], "type": feat["type"],
+            "n_active": n_active,
+            "mean_kl": round(mean_kl, 6),
+            "pred_change_rate": round(change_rate, 4),
+        })
+
+    # Print sorted by causal impact
+    print(f"\n  {'Feature':<30} {'KL':>8} {'dPred':>7} {'Active':>7}")
+    print("  " + "-" * 55)
+    for r in sorted(results, key=lambda x: -(x["mean_kl"] or 0)):
+        if r["mean_kl"] is None:
+            print(f"  {r['id']:<30} {'--':>8} {'--':>7} {r['n_active']:>7}")
+            continue
+        tag = " [G]" if r["type"] == "group" else ""
+        print(f"  {r['id']:<30} {r['mean_kl']:>8.4f} {r['pred_change_rate']:>7.3f} "
+              f"{r['n_active']:>7}{tag}")
+
+    valid = [r for r in results if r["mean_kl"] is not None]
+    if valid:
+        mean_kl = sum(r["mean_kl"] for r in valid) / len(valid)
+        mean_change = sum(r["pred_change_rate"] for r in valid) / len(valid)
+        n_causal = sum(1 for r in valid if r["mean_kl"] > 0.01)
+        print(f"\n  Mean KL: {mean_kl:.4f}  |  Mean pred change: {mean_change:.3f}")
+        print(f"  Features with KL > 0.01 (causally active): {n_causal}/{len(valid)}")
+
+    return {"features": results}
+
+
 # ── Main entry point ───────────────────────────────────────────────────────
 
 def run(cfg: Config = None):
@@ -439,13 +579,14 @@ def run(cfg: Config = None):
     pairs = generate_ioi_pairs(n_pairs, tokenizer, seed=cfg.seed)
     print(f"  Generated {len(pairs)} valid pairs")
 
-    # Run three tests
+    # Run tests
     results = {}
     results["approximation"] = test_approximation(model, sae, pairs, cfg)
     results["controllability"] = test_controllability(
         model, sae, pairs, cfg, k_values=(1, 2, 4),
     )
     results["interpretability"] = test_interpretability(sae, pairs, features, cfg)
+    results["feature_necessity"] = test_feature_necessity(model, sae, cfg)
 
     # Save
     results_path = cfg.causal_path

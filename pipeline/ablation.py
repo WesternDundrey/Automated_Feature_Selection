@@ -162,11 +162,16 @@ def run(cfg: Config = None):
     if cfg.n_lista_steps > 0:
         ablations["no_lista"] = {"n_lista_steps": 0}
 
-    # v2: MSE vs BCE supervision ablation
-    if cfg.use_mse_supervision:
-        ablations["bce_supervision"] = {"use_mse_supervision": False}
+    # v2: supervision mode ablation
+    if cfg.supervision_mode == "hybrid":
+        ablations["bce_only"] = {"supervision_mode": "bce"}
+        ablations["mse_mode"] = {"supervision_mode": "mse"}
+    elif cfg.supervision_mode == "mse":
+        ablations["bce_only"] = {"supervision_mode": "bce"}
+        ablations["hybrid_mode"] = {"supervision_mode": "hybrid"}
     else:
-        ablations["mse_supervision"] = {"use_mse_supervision": True}
+        ablations["mse_mode"] = {"supervision_mode": "mse"}
+        ablations["hybrid_mode"] = {"supervision_mode": "hybrid"}
 
     print("=" * 70)
     print("ABLATION STUDY")
