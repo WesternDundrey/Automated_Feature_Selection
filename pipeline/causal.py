@@ -147,7 +147,7 @@ def test_approximation(model, sae, pairs, cfg):
         with torch.no_grad():
             _, cache = model.run_with_cache(tokens, names_filter=cfg.hook_point, return_type=None)
             all_acts.append(cache[cfg.hook_point].cpu())
-    mean_act = torch.cat(all_acts, dim=0).mean(dim=(0, 1))  # (d_model,)
+    mean_act = torch.cat([a.reshape(-1, a.shape[-1]) for a in all_acts], dim=0).mean(dim=0)  # (d_model,)
 
     sae = sae.to(cfg.device).eval()
 
