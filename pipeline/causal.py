@@ -404,13 +404,13 @@ def test_interpretability(sae, pairs, features, cfg):
 
 def _make_ablate_hook(sae, feature_idx):
     """Factory: create a hook that reconstructs with one feature zeroed out."""
-    def hook(resid, hook_info):
+    def _hook(resid, hook=None):
         flat = resid.reshape(-1, resid.shape[-1])
         _, _, _, acts = sae(flat)
         acts[:, feature_idx] = 0.0
         recon = sae.decoder(acts)
         return recon.reshape(resid.shape)
-    return hook
+    return _hook
 
 
 def test_feature_necessity(model, sae, cfg):
@@ -456,7 +456,7 @@ def test_feature_necessity(model, sae, cfg):
     print(f"  Hook point: {cfg.hook_point}")
 
     # Full-reconstruction baseline logits (one pass per sequence)
-    def full_recon_hook(resid, hook_info):
+    def full_recon_hook(resid, hook=None):
         flat = resid.reshape(-1, resid.shape[-1])
         recon, _, _, _ = sae(flat)
         return recon.reshape(resid.shape)
