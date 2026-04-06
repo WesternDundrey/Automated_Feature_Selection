@@ -4,6 +4,29 @@
 
 ---
 
+## [v5.1] — Ablation Learnings + Gemma-2-2B Support
+
+**Date:** 2026-04-06
+
+### Changes
+
+**1. lambda_sparse: 0.001 → 0.01 (config.py)**
+Ablation showed L0=254/256 unsupervised latents firing — the sparsity penalty was too weak to do anything. 10x increase should yield meaningful sparsity (~60-80% active).
+
+**2. hook_point derivation from sae_id (config.py)**
+Previously always derived `hook_resid_post`. Now inspects `sae_id`: if it contains `hook_resid_pre` (e.g., GPT-2 JB release `blocks.8.hook_resid_pre`), uses that. Otherwise defaults to `hook_resid_post` (correct for GemmaScope). Fixes the pre-existing mismatch where GPT-2 pretrained SAE baseline was evaluated on wrong activations.
+
+**3. --model-dtype CLI flag (run.py)**
+Gemma-2-2B runs in bfloat16. Added `--model-dtype` argument to override `model_dtype` from CLI.
+
+**4. Subprocess hook_point passthrough (annotate.py)**
+The subprocess that extracts activations now receives `hook_point` explicitly instead of relying on `__post_init__` derivation (which lacked the `sae_id` needed for the new derivation logic).
+
+**5. Gemma-2-2B documentation (RUNNING.md)**
+Added section with exact commands, architecture comparison table, and Phase 1 validation steps for Gemma.
+
+---
+
 ## [v5.0] — Phase 1 Validation (Causal + Calibrated Eval + Ablation)
 
 **Date:** 2026-04-06

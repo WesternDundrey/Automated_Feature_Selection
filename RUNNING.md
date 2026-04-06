@@ -94,6 +94,43 @@ Both modes cache the system prefix + text tokens + token name. Only the feature 
 | MSE | `--supervision mse` | MSE magnitude + direction (with negative supervision) |
 | BCE | `--supervision bce` | Legacy BCE only (no decoder alignment) |
 
+## Gemma-2-2B
+
+Same pipeline, different flags. Requires RTX 5090 (32GB) or equivalent.
+
+```bash
+python -m pipeline.run \
+    --model google/gemma-2-2b --layer 20 \
+    --sae_release gemma-scope-2b-pt-res \
+    --sae_id "layer_20/width_16k/average_l0_71" \
+    --model-dtype bfloat16 \
+    --local-annotator --full-desc --flat \
+    --n_sequences 1000 --epochs 15
+```
+
+Then Phase 1 validation:
+```bash
+python -m pipeline.run --step causal \
+    --model google/gemma-2-2b --layer 20 \
+    --sae_release gemma-scope-2b-pt-res \
+    --sae_id "layer_20/width_16k/average_l0_71" \
+    --model-dtype bfloat16
+python -m pipeline.run --step ablation \
+    --model google/gemma-2-2b --layer 20 \
+    --model-dtype bfloat16
+```
+
+| Aspect | GPT-2 Small | Gemma-2-2B |
+|--------|-------------|------------|
+| d_model | 768 | 2304 |
+| Layers | 12 | 26 |
+| Target layer | 8 | 20 |
+| SAE activation | ReLU | JumpReLU |
+| dtype | float32 | bfloat16 |
+| VRAM (model) | ~0.5GB | ~5GB |
+
+The pipeline auto-adapts: `SupervisedSAE(d_model=2304)` from activation shape, GemmaScope npz loading already in `inventory.py`.
+
 ## Causal Validation (Makelov Framework)
 
 ```bash

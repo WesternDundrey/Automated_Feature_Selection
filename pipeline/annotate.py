@@ -1007,6 +1007,7 @@ cfg = Config(
     model_dtype="{cfg.model_dtype}", n_sequences={cfg.n_sequences},
     seq_len={cfg.seq_len}, corpus_batch_size={cfg.corpus_batch_size},
     target_layer={cfg.target_layer}, output_dir="{cfg.output_dir}",
+    hook_point="{cfg.hook_point}",
 )
 cfg.output_dir.mkdir(parents=True, exist_ok=True)
 

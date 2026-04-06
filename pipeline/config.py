@@ -52,7 +52,7 @@ class Config:
     batch_size: int = 512
     lr: float = 3e-4
     lambda_sup: float = 2.0
-    lambda_sparse: float = 1e-3
+    lambda_sparse: float = 1e-2
     lambda_hier: float = 0.5
     warmup_steps: int = 500
     train_fraction: float = 0.8
@@ -103,7 +103,11 @@ class Config:
 
     def __post_init__(self):
         if not self.hook_point:
-            self.hook_point = f"blocks.{self.target_layer}.hook_resid_post"
+            # Derive from sae_id if it contains a hook point hint
+            if "hook_resid_pre" in self.sae_id:
+                self.hook_point = f"blocks.{self.target_layer}.hook_resid_pre"
+            else:
+                self.hook_point = f"blocks.{self.target_layer}.hook_resid_post"
         self.output_dir = Path(self.output_dir)
         # Fallback to CPU if CUDA not available.
         # Use environment check to avoid initializing CUDA (which breaks vLLM fork).

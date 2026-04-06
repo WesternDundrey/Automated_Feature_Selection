@@ -34,6 +34,8 @@ def main():
     parser.add_argument("--output_dir", default=None, help="Output directory")
     parser.add_argument("--device", default=None, help="Device (cuda/cpu)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--model-dtype", default=None,
+                        help="Model dtype (float32/bfloat16)")
     parser.add_argument("--lista", type=int, default=None, help="LISTA refinement steps")
     parser.add_argument("--local-annotator", action="store_true",
                         help="Use local model for annotation (vLLM)")
@@ -84,6 +86,8 @@ def main():
         overrides["device"] = args.device
     if args.seed is not None:
         overrides["seed"] = args.seed
+    if args.model_dtype:
+        overrides["model_dtype"] = args.model_dtype
     if args.lista is not None:
         overrides["n_lista_steps"] = args.lista
     if args.local_annotator:
