@@ -47,6 +47,8 @@ def main():
                         help="Use legacy BCE supervision instead of MSE")
     parser.add_argument("--full-desc", action="store_true",
                         help="Use full description in suffix instead of F-index (slower but more accurate)")
+    parser.add_argument("--flat", action="store_true",
+                        help="Strip group features from catalog, keep only leaves (no hierarchy loss)")
     parser.add_argument("--supervision", default=None,
                         choices=["hybrid", "mse", "bce"],
                         help="Supervision mode: hybrid (BCE+direction), mse, bce")
@@ -137,6 +139,21 @@ def main():
         from .inventory import run as run_inventory
         run_inventory(cfg)
         print(f"Step 1 completed in {time.time() - t0:.1f}s")
+
+    # Flatten catalog if requested (strip groups, keep only leaves)
+    if args.flat and cfg.catalog_path.exists():
+        import json as _json
+        _cat = _json.loads(cfg.catalog_path.read_text())
+        _before = len(_cat["features"])
+        _cat["features"] = [f for f in _cat["features"] if f["type"] == "leaf"]
+        # Clear parent references (no hierarchy)
+        for f in _cat["features"]:
+            f.pop("parent", None)
+        _after = len(_cat["features"])
+        if _after < _before:
+            cfg.catalog_path.write_text(_json.dumps(_cat, indent=2))
+            print(f"\n  --flat: stripped {_before - _after} group features, "
+                  f"{_after} leaves remain")
 
     # Step 2: Annotation
     if args.step is None or args.step == "annotate":

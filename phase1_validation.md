@@ -188,12 +188,14 @@ uv pip install --system --no-deps sae-lens transformer-lens
 uv pip install --system -r pipeline/requirements.txt
 export OPENROUTER_API_KEY="sk-or-..."
 
-# Full pipeline (inventory → annotate → train → evaluate) + Phase 1 validation
-python -m pipeline.run --local-annotator --full-desc \
+# Full pipeline (flat catalog) + Phase 1 validation
+python -m pipeline.run --local-annotator --full-desc --flat \
     --n_latents 100 --n_sequences 500 --epochs 15 \
   && python -m pipeline.run --step causal \
   && python -m pipeline.run --step ablation \
   2>&1 | tee run.log
 ```
+
+`--flat` strips group features after Sonnet generates the catalog, keeping only leaves. No hierarchy loss, no wasted decoder columns on diffuse group directions. Annotation already only processes leaves, so this costs nothing.
 
 Estimated time: ~3-4 hours total (annotation dominates). Results in `pipeline_data/`.
