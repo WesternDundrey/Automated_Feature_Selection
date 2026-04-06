@@ -168,3 +168,32 @@ Steps 1 and 2 use the existing trained SAE. Step 3 retrains from scratch for eac
 2. **pipeline/causal.py** — Added `test_feature_necessity()`: per-feature decoder ablation measuring KL divergence and prediction change rate. Wired into `run()` as Test 4.
 
 3. **pipeline/ablation.py** — Fixed deprecated `use_mse_supervision` flag to use `supervision_mode`. Now tests all three modes (hybrid/mse/bce).
+
+---
+
+## Known Issue: hook_point mismatch
+
+The pretrained SAE baseline uses `sae_id="blocks.8.hook_resid_pre"` but the supervised SAE is trained on `hook_point="blocks.8.hook_resid_post"`. These are different activation spaces (pre vs post layer 8). The pretrained SAE's R2 and post-training F1 are evaluated on activations it wasn't trained on — making the "beats post-training" comparison unfair in our favor. To fix: either switch hook_point to `resid_pre` (requires retrain) or find a pretrained SAE for `resid_post`.
+
+---
+
+## All-In-One (vast.ai)
+
+Everything in a single tmux command. Assumes setup.sh already ran (repo cloned, Qwen downloaded).
+
+```bash
+tmux new -s run
+cd /workspace/Automated_Feature_Selection && git pull
+uv pip install --system --no-deps sae-lens transformer-lens
+uv pip install --system -r pipeline/requirements.txt
+export OPENROUTER_API_KEY="sk-or-..."
+
+# Full pipeline (inventory → annotate → train → evaluate) + Phase 1 validation
+python -m pipeline.run --local-annotator --full-desc \
+    --n_latents 100 --n_sequences 500 --epochs 15 \
+  && python -m pipeline.run --step causal \
+  && python -m pipeline.run --step ablation \
+  2>&1 | tee run.log
+```
+
+Estimated time: ~3-4 hours total (annotation dominates). Results in `pipeline_data/`.

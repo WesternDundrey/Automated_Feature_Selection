@@ -402,22 +402,31 @@ def test_interpretability(sae, pairs, features, cfg):
 
 # ── Test 4: Per-Feature Necessity ────────────────────────────────────────
 
+def _make_ablate_hook(sae, feature_idx):
+    """Factory: create a hook that reconstructs with one feature zeroed out."""
+    def hook(resid, hook_info):
+        flat = resid.reshape(-1, resid.shape[-1])
+        _, _, _, acts = sae(flat)
+        acts[:, feature_idx] = 0.0
+        recon = sae.decoder(acts)
+        return recon.reshape(resid.shape)
+    return hook
+
+
 def test_feature_necessity(model, sae, cfg):
     """Per-feature ablation: zero out each supervised latent, measure downstream effect.
 
     For each supervised feature k:
-      1. Replace residual stream with full SAE reconstruction → baseline logits
-      2. Replace residual with SAE reconstruction minus feature k → ablated logits
+      1. Replace residual stream with full SAE reconstruction -> baseline logits
+      2. Replace residual with SAE reconstruction minus feature k -> ablated logits
       3. Compute KL(baseline || ablated) at positions where feature k is active
 
     High KL = the model relies on this feature's decoder direction.
-    This is what separates a supervised SAE from a linear probe — the probe
+    This is what separates a supervised SAE from a linear probe -- the probe
     can classify but can't intervene.
 
     Uses stored tokens + annotations from the pipeline (not IOI prompts).
     """
-    from pathlib import Path
-
     print("\n" + "=" * 70)
     print("TEST 4: PER-FEATURE CAUSAL NECESSITY")
     print("=" * 70)
@@ -425,6 +434,7 @@ def test_feature_necessity(model, sae, cfg):
     for path, name in [
         (cfg.tokens_path, "tokens"),
         (cfg.annotations_path, "annotations"),
+        (cfg.catalog_path, "catalog"),
     ]:
         if not path.exists():
             print(f"  Skipping: {name} not found at {path}")
@@ -434,7 +444,7 @@ def test_feature_necessity(model, sae, cfg):
     annotations = torch.load(cfg.annotations_path, weights_only=True)
     catalog = json.loads(cfg.catalog_path.read_text())
     features = catalog["features"]
-    n_sup = sae.n_supervised
+    n_sup = min(sae.n_supervised, len(features), annotations.shape[-1])
 
     n_seqs = min(cfg.causal_n_sequences, tokens.shape[0])
     tokens_sub = tokens[:n_seqs]
@@ -446,7 +456,7 @@ def test_feature_necessity(model, sae, cfg):
     print(f"  Hook point: {cfg.hook_point}")
 
     # Full-reconstruction baseline logits (one pass per sequence)
-    def full_recon_hook(resid, hook):
+    def full_recon_hook(resid, hook_info):
         flat = resid.reshape(-1, resid.shape[-1])
         recon, _, _, _ = sae(flat)
         return recon.reshape(resid.shape)
@@ -476,14 +486,7 @@ def test_feature_necessity(model, sae, cfg):
             })
             continue
 
-        feat_k = k  # capture for closure
-
-        def ablate_hook(resid, hook):
-            flat = resid.reshape(-1, resid.shape[-1])
-            _, _, _, acts = sae(flat)
-            acts[:, feat_k] = 0.0
-            recon = sae.decoder(acts)
-            return recon.reshape(resid.shape)
+        ablate_hook = _make_ablate_hook(sae, k)
 
         kl_sum = 0.0
         pred_changes = 0
@@ -503,7 +506,7 @@ def test_feature_necessity(model, sae, cfg):
                 abl_lp = F.log_softmax(abl_logits[0, active_pos].cpu(), dim=-1)
 
                 kl = (base_lp.exp() * (base_lp - abl_lp)).sum(dim=-1)
-                kl_sum += kl.sum().item()
+                kl_sum += kl.clamp(min=0).sum().item()
 
                 pred_changes += (base_lp.argmax(-1) != abl_lp.argmax(-1)).sum().item()
                 total += len(active_pos)
