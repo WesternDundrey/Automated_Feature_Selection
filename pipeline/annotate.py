@@ -625,17 +625,28 @@ def _annotate_local_vllm_pertoken(
         allowed_token_ids=[tok_0_id, tok_1_id],
     )
 
-    annotations = torch.zeros(N, T, n_features)
     total_decisions = n_features * N * T
-    completed = 0
     t_start = time.time()
 
-    # Aggressive chunk size — vLLM handles internal batching and scheduling.
-    # Bigger chunks = fewer generate() calls = less Python overhead.
-    # KV cache is 98K tokens, each prefix ~110 tokens avg.
-    # 20 sequences × 128 positions = 2560 prefixes × 110 = 282K — may evict.
-    # 10 sequences = 1280 prefixes × 110 = 141K — tight but OK.
-    seq_chunk = min(10, N)
+    seq_chunk = min(5, N)
+
+    # Resume from partial checkpoint (crash recovery)
+    partial_path = cfg.output_dir / "annotations_local_partial.pt"
+    progress_path = cfg.output_dir / "annotations_local_progress.txt"
+    resume_from = 0
+
+    if partial_path.exists() and progress_path.exists():
+        annotations = torch.load(partial_path, weights_only=True)
+        if annotations.shape == (N, T, n_features):
+            resume_from = int(progress_path.read_text().strip())
+            print(f"Resuming local annotation from sequence {resume_from}/{N}")
+        else:
+            print("Partial annotations shape mismatch, starting fresh")
+            annotations = torch.zeros(N, T, n_features)
+    else:
+        annotations = torch.zeros(N, T, n_features)
+
+    completed = resume_from * T * n_features
 
     print(f"\nAnnotating: {n_features} features x {N} sequences x {T} tokens "
           f"= {total_decisions:,} decisions "
@@ -649,7 +660,7 @@ def _annotate_local_vllm_pertoken(
         for j in range(N)
     ]
 
-    for seq_start in range(0, N, seq_chunk):
+    for seq_start in range(resume_from, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
 
         prompts = []
@@ -707,6 +718,16 @@ def _annotate_local_vllm_pertoken(
         eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
         print(f"  {completed:,}/{total_decisions:,} decisions  "
               f"rate={rate:.0f}/s  ETA {eta_sec/3600:.1f}h")
+
+        # Save checkpoint after each chunk (crash recovery)
+        torch.save(annotations, partial_path)
+        progress_path.write_text(str(seq_end))
+
+    # Clean up partial checkpoints on success
+    if partial_path.exists():
+        partial_path.unlink()
+    if progress_path.exists():
+        progress_path.unlink()
 
     del llm
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
