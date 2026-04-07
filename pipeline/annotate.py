@@ -615,7 +615,7 @@ def _annotate_local_vllm_pertoken(
         dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=computed_max_len,
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=0.80,
     )
     # Base model: no thinking, no chat template. Just completes text.
     # allowed_token_ids forces "0" or "1" — safe on base models.
@@ -628,7 +628,7 @@ def _annotate_local_vllm_pertoken(
     total_decisions = n_features * N * T
     t_start = time.time()
 
-    seq_chunk = min(5, N)
+    seq_chunk = min(2, N)
 
     # Resume from partial checkpoint (crash recovery)
     partial_path = cfg.output_dir / "annotations_local_partial.pt"
