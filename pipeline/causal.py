@@ -572,6 +572,11 @@ def run(cfg: Config = None):
     )
     sae.load_state_dict(torch.load(cfg.checkpoint_path, weights_only=True))
 
+    # Match model dtype (SAE trained in fp32, but Gemma runs in bf16)
+    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+    if cfg.model_dtype in dtype_map:
+        sae = sae.to(dtype_map[cfg.model_dtype])
+
     # Load features
     catalog = json.loads(cfg.catalog_path.read_text())
     features = catalog["features"]
