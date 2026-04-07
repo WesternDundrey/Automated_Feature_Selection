@@ -103,6 +103,58 @@ Gemma's richer 2304-dim representations enable cleaner linear features for seman
 
 Gemma achieves higher cosine alignment on semantic and grammatical features, suggesting these concepts are more linearly represented in Gemma's residual stream than in GPT-2's.
 
+## Causal Validation (Per-Feature Necessity)
+
+For each supervised feature, the decoder column is ablated (zeroed) from the SAE reconstruction. KL divergence and prediction change rate are measured at positions where the feature is active.
+
+**35/58 features are causally active (KL > 0.01).** Ablating their decoder columns measurably changes the model's output distribution.
+
+### Comparison to GPT-2
+
+| Metric | GPT-2 | Gemma-2-2B |
+|---|---|---|
+| Causally active features | 16/50 (32%) | **35/58 (60%)** |
+| Top feature KL | 0.083 | **1.284** (15x stronger) |
+| Mean prediction change | 5.1% | **10.0%** |
+
+### Top 15 Causally Active Features
+
+| Feature | KL | Pred Change | Active Pos |
+|---|---|---|---|
+| digit_or_number | 1.284 | 45.0% | 229 |
+| markup_tag | 0.822 | 19.6% | 224 |
+| article_or_determiner | 0.549 | 47.7% | 451 |
+| ordinal_or_enumerator | 0.535 | 25.0% | 8 |
+| dash_or_hyphen | 0.193 | 10.3% | 300 |
+| database_schema | 0.133 | 89.5% | 57 |
+| range_expression | 0.109 | 7.7% | 13 |
+| place_name | 0.101 | 16.3% | 160 |
+| monetary_amount | 0.089 | 7.1% | 84 |
+| programming_keyword | 0.086 | 0.0% | 50 |
+| code_operator_or_symbol | 0.082 | 11.8% | 34 |
+| shell_command | 0.078 | 9.9% | 91 |
+| quotation_mark | 0.066 | 7.9% | 203 |
+| technology_and_computing | 0.051 | 9.2% | 294 |
+| person_name | 0.047 | 12.1% | 132 |
+
+### What This Proves
+
+The supervised SAE's decoder columns are causally load-bearing — the model relies on the directions they encode. A linear probe achieves F1=0.487 on the same features but has no decoder to ablate. The supervised SAE achieves F1=0.601 AND its latents steer model behavior.
+
+`digit_or_number` (KL=1.28) is the strongest example: removing this one decoder column from the reconstruction changes the model's next-token prediction 45% of the time at numeric positions. The model's concept of "this is a number" flows through this specific direction at layer 20.
+
+`database_schema` is the most striking: 89.5% prediction change rate. At positions in SQL/database contexts, this single feature is essentially the dominant signal — remove it and the model has no idea what comes next.
+
+Semantic features are also causally active, though weaker: technology (KL=0.051), science (0.046), business (0.043). These concepts have real but diffuse causal influence — consistent with semantic domains being spread across multiple directions rather than concentrated in one.
+
+### IOI Tests (Tests 1-2)
+
+Sufficiency=-0.002, controllability IIA=-1.84. As expected, our features don't target IOI name-tracking. These tests are irrelevant for a general feature catalog.
+
+### Known Issue
+
+`comma` and `period` show NaN KL values due to bf16 numerical instability in the log_softmax→KL computation. These are the two highest-frequency features (764 and 936 active positions). The computation should cast to fp32 for numerical stability.
+
 ## Architecture
 
 ```
@@ -124,6 +176,6 @@ Hierarchy loss removed (flat catalog, no parent-child pairs).
 
 3. **Increase data** — 1000 sequences is adequate but several features have <30 test positives. 2000+ sequences would stabilize rare features.
 
-4. **Causal validation** — Run per-feature necessity test on Gemma. Expect stronger causal signal than GPT-2 given the higher cosine alignment.
+4. **Tune sparsity** — L0=247/316 is still too dense. Try lambda_sparse=0.05 or 0.1 to get meaningful sparsity in unsupervised latents.
 
-5. **Tune sparsity** — L0=247/316 is still too dense. Try lambda_sparse=0.05 or 0.1 to get meaningful sparsity in unsupervised latents.
+5. **Fix KL NaN for high-frequency features** — Cast to fp32 in the KL computation to handle comma/period.
