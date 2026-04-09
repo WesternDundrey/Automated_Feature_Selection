@@ -481,6 +481,24 @@ def evaluate(cfg: Config = None):
         wrapped_sae = wrapped_sae.to(cfg.device)
         d_sae = wrapped_sae.d_sae
 
+        # Sanity check: compute R² on a small batch up front so we fail fast
+        # if the pretrained SAE is mis-loaded (e.g., sae_lens weight-convention
+        # mismatch that produced R²=-6.85 in summary4).
+        with torch.no_grad():
+            _probe = x_test[: min(256, x_test.shape[0])].to(cfg.device)
+            _probe_recon = wrapped_sae.decode(wrapped_sae.encode(_probe))
+            _probe_mse = F.mse_loss(_probe_recon, _probe).item()
+            _probe_base = F.mse_loss(
+                _probe.mean(0, keepdim=True).expand_as(_probe), _probe,
+            ).item()
+            _probe_r2 = 1.0 - _probe_mse / max(_probe_base, 1e-9)
+            print(f"  [sanity] 256-vec R²={_probe_r2:+.4f}  "
+                  f"(MSE={_probe_mse:.3f} vs baseline {_probe_base:.3f})")
+            if _probe_r2 < 0.5:
+                print("  [sanity] WARNING: pretrained SAE reconstruction is "
+                      "broken. Downstream baseline will be unreliable.")
+            del _probe, _probe_recon
+
         # ── 6. Reconstruction comparison ──────────────────────────────
         pre_recon_list = []
         with torch.no_grad():

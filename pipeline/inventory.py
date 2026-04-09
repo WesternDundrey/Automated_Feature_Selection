@@ -104,14 +104,33 @@ class PretrainedSAE:
 def load_sae(cfg: Config) -> tuple[PretrainedSAE, torch.Tensor | None]:
     """Load a pretrained SAE.
 
-    Tries sae_lens first (community standard), falls back to direct GemmaScope
-    npz loading (matches agentic-delphi/delphi/sparse_coders/custom/gemmascope.py).
+    For GemmaScope releases we prefer direct npz loading (matches the reference
+    implementation in agentic-delphi/delphi/sparse_coders/custom/gemmascope.py).
+    sae_lens is known to apply extra preprocessing to GemmaScope weights (e.g.,
+    folding in normalization factors or adjusting for apply_b_dec_to_input),
+    which breaks reconstruction when we use our bare PretrainedSAE wrapper.
+    The npz path bypasses sae_lens entirely and loads the exact weights that
+    the original JumpReluSae expects.
+
+    Non-GemmaScope releases (e.g., `gpt2-small-res-jb`) still go through
+    sae_lens because we don't have a direct npz loader for them.
     """
+    release = cfg.sae_release or ""
+    is_gemmascope = "gemma-scope" in release or "gemmascope" in release
+
+    if is_gemmascope:
+        try:
+            return _load_sae_gemmascope_npz(cfg)
+        except Exception as e:
+            print(f"Direct npz loading failed ({e}); falling back to sae_lens")
+
     try:
         return _load_sae_sae_lens(cfg)
     except ImportError:
-        print("sae_lens not installed, trying direct GemmaScope npz loading...")
-        return _load_sae_gemmascope_npz(cfg)
+        if not is_gemmascope:
+            print("sae_lens not installed, trying direct GemmaScope npz loading...")
+            return _load_sae_gemmascope_npz(cfg)
+        raise
 
 
 def _load_sae_sae_lens(cfg: Config) -> tuple[PretrainedSAE, torch.Tensor | None]:
