@@ -58,7 +58,8 @@ def main():
         "--step", default=None,
         choices=["inventory", "annotate", "train", "evaluate",
                  "agreement", "ablation", "residual", "causal", "ioi",
-                 "validate-annotator"],
+                 "validate-annotator",
+                 "splitting", "circuit", "intervention"],
         help="Run only this step",
     )
     args = parser.parse_args()
@@ -239,6 +240,36 @@ def main():
         skip_ann = not cfg.use_local_annotator
         run_ioi(cfg, skip_annotator=skip_ann)
         print(f"IOI validation completed in {time.time() - t0:.1f}s")
+
+    # Phase 3 — Experiment A: Feature splitting quantification
+    if args.step == "splitting":
+        print("\n" + "=" * 70)
+        print("PHASE 3 — EXPERIMENT A: FEATURE SPLITTING")
+        print("=" * 70)
+        t0 = time.time()
+        from .feature_splitting import run as run_splitting
+        run_splitting(cfg)
+        print(f"Experiment A completed in {time.time() - t0:.1f}s")
+
+    # Phase 3 — Experiment B: Downstream circuit analysis
+    if args.step == "circuit":
+        print("\n" + "=" * 70)
+        print("PHASE 3 — EXPERIMENT B: CIRCUIT ANALYSIS")
+        print("=" * 70)
+        t0 = time.time()
+        from .circuit import run as run_circuit
+        run_circuit(cfg)
+        print(f"Experiment B completed in {time.time() - t0:.1f}s")
+
+    # Phase 3 — Experiment C: Intervention precision
+    if args.step == "intervention":
+        print("\n" + "=" * 70)
+        print("PHASE 3 — EXPERIMENT C: INTERVENTION PRECISION")
+        print("=" * 70)
+        t0 = time.time()
+        from .intervention import run as run_intervention
+        run_intervention(cfg)
+        print(f"Experiment C completed in {time.time() - t0:.1f}s")
 
     # Annotator validation on trivial features
     if args.step == "validate-annotator":

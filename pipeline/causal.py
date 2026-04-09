@@ -468,7 +468,10 @@ def test_feature_necessity(model, sae, cfg):
             logits = model.run_with_hooks(
                 toks, fwd_hooks=[(cfg.hook_point, full_recon_hook)]
             )
-            recon_logprobs.append(F.log_softmax(logits[0].cpu(), dim=-1))
+            # Cast to fp32 before log_softmax to avoid bf16 underflow on
+            # high-frequency features (comma, period) — without this, the
+            # log_softmax→KL computation produces NaN for Gemma (bf16 model).
+            recon_logprobs.append(F.log_softmax(logits[0].float().cpu(), dim=-1))
 
     # Per-feature ablation
     results = []
@@ -503,7 +506,7 @@ def test_feature_necessity(model, sae, cfg):
 
                 active_pos = active_mask[i].nonzero(as_tuple=True)[0]
                 base_lp = recon_logprobs[i][active_pos]
-                abl_lp = F.log_softmax(abl_logits[0, active_pos].cpu(), dim=-1)
+                abl_lp = F.log_softmax(abl_logits[0, active_pos].float().cpu(), dim=-1)
 
                 kl = (base_lp.exp() * (base_lp - abl_lp)).sum(dim=-1)
                 kl_sum += kl.clamp(min=0).sum().item()

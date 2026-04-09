@@ -4,6 +4,103 @@
 
 ---
 
+## [v6.0] — Phase 3: Supervised vs Pretrained SAE Comparison
+
+**Date:** 2026-04-09
+
+### Motivation
+
+Phase 2 showed our supervised SAE achieves calibrated F1 0.601 on Gemma-2-2B with 35/58 features causally active. But the head-to-head comparison against pretrained (GemmaScope) SAE was undermined by a broken baseline (R²=-6.85) and NaN KL on the two highest-frequency features. Phase 3 fixes these and quantifies the three classic pretrained-SAE problems — feature splitting, entangled circuits, and noisy interventions — via direct 3-way comparisons against our supervised latents AND our own unsupervised latents (as an architecture control).
+
+### Fixes
+
+**1. GemmaScope pretrained SAE loader (evaluate.py:465-570)**
+Previously used `sae_lens.SAE.from_pretrained().__call__` directly, which applied `apply_b_dec_to_input` and/or activation normalization inconsistent with the GemmaScope JumpReLU convention documented in `agentic-delphi/delphi/sparse_coders/custom/gemmascope.py` and in MEMORY.md:
+```
+encode: z = JumpReLU_theta(x @ W_enc + b_enc)    (NO b_dec subtraction)
+decode: x_hat = z @ W_dec + b_dec
+```
+This produced R²=-6.85 on Gemma-2-2B residual-stream activations — i.e., the baseline was worse than predicting the mean. Fix: route through `inventory.load_sae(cfg)`, which returns a `PretrainedSAE` wrapper that follows the documented convention and is already used successfully by the inventory step. Expected R² post-fix: > 0.9.
+
+**2. fp32 cast for KL computation (causal.py:471, 506)**
+bfloat16 `log_softmax` underflows on large-magnitude logits, producing NaN KL for the two highest-frequency features in summary4 (`comma`: 764 active positions, `period`: 936 active positions). Added `.float()` cast before `log_softmax`. No numerical difference on fp32 runs; fixes Gemma (bf16).
+
+### New experiments
+
+Phase 3 adds three new `--step` commands to `pipeline.run`, all of which reuse the existing Gemma-2-2B artifacts (no retraining). Every experiment is a **3-way comparison**:
+- **(S)** supervised latents in our SAE (n=60)
+- **(U)** unsupervised latents in our SAE (n=256) — *same architecture, same training data, no supervision signal*
+- **(P)** pretrained GemmaScope SAE latents (n=16384)
+
+The (S) vs (U) comparison is the architecture control: if supervision is the causal factor for cleaner representations, (S) should dominate (U) even though they share everything except the supervision term in the loss.
+
+**Experiment A — Feature splitting quantification** (`pipeline/feature_splitting.py`, `--step splitting`)
+
+For each of 10 target features, compute per-pool:
+- `top1_coverage`: fraction of positive positions covered by the best single latent
+- `top1_specificity`: fraction of that latent's fires landing on positive positions
+- `n_at_80`: greedy set-cover — minimum number of latents to cover 80% of positives
+
+Output: `pipeline_data/feature_splitting.json`.
+
+**Experiment B — Downstream circuit analysis** (`pipeline/circuit.py`, `--step circuit`)
+
+Target behavior: closing-bracket prediction. Collects positions where the next token is `)` and the context has an open paren. Uses **attribution patching** (first-order direct effect via decoder columns and layer-20 residual gradient) to compute per-latent contribution to `logit_diff = logit(')') - mean(logit(non-bracket))`. Then counts how many latents per pool are needed to cover 80% of cumulative `|attribution|`.
+
+Attribution patching is necessary because 16384 individual ablations on the pretrained SAE would take hours. The first-order approximation preserves the ranking — good enough to count circuit complexity per pool.
+
+Output: `pipeline_data/circuit_comparison.json`.
+
+**Experiment C — Intervention precision** (`pipeline/intervention.py`, `--step intervention`)
+
+For each of 5 high-causal-KL features from summary4, compute single-latent ablation KL at two position sets:
+- `P_pos`: positions where the feature is labeled active
+- `P_neg`: equal-size random sample of non-active positions
+
+The targeting ratio `KL(P_pos) / KL(P_neg)` measures how concept-specific the ablation is — high ratio = clean intervention, low ratio = diffuse (polysemantic) intervention.
+
+(S) ablates the supervised latent for the feature directly. (U) and (P) ablate the single unsupervised/pretrained latent with highest coverage (best-match) computed via the same method as Experiment A. Baselines: full supervised SAE reconstruction for (S)/(U), full pretrained SAE reconstruction for (P).
+
+Output: `pipeline_data/intervention_precision.json`.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/evaluate.py` | Fix 1 — replace sae_lens native forward with `inventory.load_sae()` wrapper |
+| `pipeline/causal.py` | Fix 2 — `.float()` cast before log_softmax on lines 471, 506 |
+| `pipeline/feature_splitting.py` | **NEW** — Experiment A |
+| `pipeline/circuit.py` | **NEW** — Experiment B |
+| `pipeline/intervention.py` | **NEW** — Experiment C |
+| `pipeline/run.py` | Added `--step splitting`, `--step circuit`, `--step intervention` |
+
+### What did NOT change
+
+- `pipeline/test_catalog.json`, `pipeline/gpt2_catalog.json` — frozen
+- `summary.md` through `summary4.md` — frozen
+- All config defaults — backwards compatible
+- The trained Gemma-2-2B `supervised_sae.pt` is reused by all three experiments (no retraining)
+
+### Mathematical detail
+
+**Feature splitting coverage (Experiment A):**
+For latent i in pool L, on positive set P_f:
+  `coverage(i, f) = |{p ∈ P_f : acts_L[p, i] > 0}| / |P_f|`
+  `specificity(i, f) = |{p ∈ P_f : acts_L[p, i] > 0}| / |{∀p : acts_L[p, i] > 0}|`
+
+`n_at_80` via greedy set cover on the boolean fire matrix at positive positions.
+
+**Attribution patching (Experiment B):**
+For a fixed set of target positions P and target logit direction d = (e_{`)`} - mean_{v∉brackets} e_v), the first-order contribution of latent i to `logit_diff` at position p is:
+  `contribution(i, p) = acts_L[p, i] · (∇_{resid[p]} logit_diff · W_dec_L[:, i])`
+
+Aggregated across positions: `total(i) = Σ_{p ∈ P} |contribution(i, p)|`. `n_at_80` = smallest k such that the top-k latents account for ≥80% of the total `Σ_i total(i)`.
+
+**Intervention precision (Experiment C):**
+`targeting_ratio = mean_{p ∈ P_pos}(KL(p_base || p_abl)) / mean_{p ∈ P_neg}(KL(p_base || p_abl))`, where p_base is the softmax output under the full SAE reconstruction at layer 20, and p_abl is the softmax under the same reconstruction minus one latent's contribution (zeroed activation → decoder column contribution dropped).
+
+---
+
 ## [v5.1] — Ablation Learnings + Gemma-2-2B Support
 
 **Date:** 2026-04-06
