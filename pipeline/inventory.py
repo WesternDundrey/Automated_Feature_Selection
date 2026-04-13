@@ -181,8 +181,11 @@ def _load_sae_gemmascope_npz(cfg: Config) -> tuple[PretrainedSAE, None]:
     # sae_id like "layer_20/width_16k/canonical" -> need to find actual file
     # For GemmaScope repos, the path structure is:
     #   layer_N/width_Wk/average_l0_L/params.npz
-    # The sae_release doubles as the HF repo ID for npz loading.
+    # sae_release is the sae_lens name (e.g., "gemma-scope-2b-pt-res"),
+    # but the HF repo needs the "google/" prefix.
     repo_id = cfg.sae_release.replace("-canonical", "")
+    if "/" not in repo_id:
+        repo_id = f"google/{repo_id}"
     filename = f"{cfg.sae_id}/params.npz"
     # If sae_id ends with /canonical, strip it and try to find a real L0 variant
     if filename.endswith("/canonical/params.npz"):
