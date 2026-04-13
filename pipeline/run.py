@@ -54,8 +54,8 @@ def main():
     parser.add_argument("--supervision", default=None,
                         choices=["hybrid", "mse", "bce"],
                         help="Supervision mode: hybrid (BCE+direction), mse, bce")
-    parser.add_argument("--freeze-decoder", action="store_true",
-                        help="Fix supervised decoder columns to target_dirs; train only encoder")
+    parser.add_argument("--no-freeze-decoder", action="store_true",
+                        help="Train decoder columns (legacy). Default: frozen to target_dirs")
     parser.add_argument("--selectivity", default=None,
                         choices=["bce", "hinge", "none"],
                         help="Selectivity loss type (default: bce)")
@@ -110,8 +110,8 @@ def main():
         overrides["supervision_mode"] = "bce"
     if args.full_desc:
         overrides["use_findex_suffix"] = False
-    if args.freeze_decoder:
-        overrides["freeze_supervised_decoder"] = True
+    if args.no_freeze_decoder:
+        overrides["freeze_supervised_decoder"] = False
     if args.selectivity:
         overrides["selectivity_loss"] = args.selectivity
 

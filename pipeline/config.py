@@ -74,7 +74,9 @@ class Config:
     # Fix supervised decoder columns to target_dirs before training.
     # Only encoder + unsupervised decoder train. Direction loss is
     # skipped (decoder is already aligned by construction).
-    freeze_supervised_decoder: bool = False
+    # Ablation proved frozen = learned on F1/R², but frozen gives
+    # cosine=1.0 and 5.7× FVE — strictly better for interventions.
+    freeze_supervised_decoder: bool = True
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API
