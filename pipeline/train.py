@@ -190,8 +190,18 @@ class SupervisedSAE(nn.Module):
         return recon, sup_pre, sup_acts, acts
 
     @torch.no_grad()
-    def normalize_decoder(self):
-        self.decoder.weight.data = F.normalize(self.decoder.weight.data, dim=0)
+    def normalize_decoder(self, skip_first_n: int = 0):
+        """Normalize decoder columns to unit norm.
+
+        If skip_first_n > 0, leaves the first `skip_first_n` columns
+        untouched (e.g., when supervised decoder columns are frozen to
+        target_dirs and should not be modified).
+        """
+        if skip_first_n > 0:
+            unsup_cols = self.decoder.weight.data[:, skip_first_n:]
+            self.decoder.weight.data[:, skip_first_n:] = F.normalize(unsup_cols, dim=0)
+        else:
+            self.decoder.weight.data = F.normalize(self.decoder.weight.data, dim=0)
 
 
 # ── Hierarchy loss ──────────────────────────────────────────────────────────
@@ -275,8 +285,9 @@ def train_supervised_sae(
     ).item()
 
     # Compute target directions for direction alignment (hybrid and mse modes)
+    # Also needed when freeze_supervised_decoder=True (to set the columns).
     target_dirs = None
-    need_dirs = cfg.supervision_mode in ("hybrid", "mse")
+    need_dirs = cfg.supervision_mode in ("hybrid", "mse") or cfg.freeze_supervised_decoder
     if need_dirs:
         target_dirs, raw_norms, dir_counts = compute_target_directions(
             x_train, y_train, n_supervised,
@@ -315,6 +326,18 @@ def train_supervised_sae(
         d_model, n_supervised, cfg.n_unsupervised,
         n_lista_steps=cfg.n_lista_steps,
     ).to(cfg.device)
+
+    # Frozen decoder: set supervised columns to target_dirs, zero their gradients
+    if cfg.freeze_supervised_decoder and target_dirs is not None:
+        with torch.no_grad():
+            sae.decoder.weight.data[:, :n_supervised] = target_dirs.T
+        def _zero_sup_grad(grad):
+            g = grad.clone()
+            g[:, :n_supervised] = 0
+            return g
+        sae.decoder.weight.register_hook(_zero_sup_grad)
+        print(f"  Decoder: supervised columns FROZEN to target_dirs")
+
     optimizer = torch.optim.AdamW(sae.parameters(), lr=cfg.lr, weight_decay=0.0)
 
     loader = DataLoader(
@@ -356,23 +379,33 @@ def train_supervised_sae(
             recon, sup_pre, sup_acts, all_acts = sae(x_b)
 
             loss_recon = F.mse_loss(recon, x_b)
-            if cfg.supervision_mode == "hybrid":
-                # BCE for selectivity (encoder) + direction for alignment (decoder)
-                loss_bce = F.binary_cross_entropy_with_logits(
+
+            # ── Selectivity loss (encoder: which positions fire?) ─────
+            if cfg.selectivity_loss == "hinge":
+                targets_hinge = 2 * y_b - 1  # {0,1} → {-1,+1}
+                loss_select = F.relu(cfg.hinge_margin - sup_pre * targets_hinge).mean()
+            elif cfg.selectivity_loss == "none":
+                loss_select = sup_pre.new_zeros(())
+            else:  # "bce" (default)
+                loss_select = F.binary_cross_entropy_with_logits(
                     sup_pre, y_b, pos_weight=pos_weight
                 )
+
+            # ── Direction / magnitude loss (decoder: where does it point?) ──
+            if cfg.freeze_supervised_decoder:
+                # Decoder is frozen to target_dirs — no direction loss needed
+                loss_sup = loss_select
+            elif cfg.supervision_mode == "hybrid":
                 dec_cols = sae.decoder.weight[:, :n_supervised]
                 cosines = (dec_cols * target_dirs.T).sum(dim=0)
                 loss_dir = (1 - cosines).mean()
-                loss_sup = loss_bce + cfg.direction_loss_weight * loss_dir
+                loss_sup = loss_select + cfg.direction_loss_weight * loss_dir
             elif cfg.supervision_mode == "mse":
                 loss_sup, loss_dir, loss_mag = mse_supervision_loss(
                     sae.decoder.weight, sup_acts, target_dirs, x_b, y_b, cfg,
                 )
             else:  # "bce"
-                loss_sup = F.binary_cross_entropy_with_logits(
-                    sup_pre, y_b, pos_weight=pos_weight
-                )
+                loss_sup = loss_select
             loss_sparse = all_acts.abs().mean()
             loss_hier = hierarchy_loss(sup_acts, hier_map)
 
@@ -389,7 +422,9 @@ def train_supervised_sae(
             torch.nn.utils.clip_grad_norm_(sae.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
-            sae.normalize_decoder()
+            sae.normalize_decoder(
+                skip_first_n=n_supervised if cfg.freeze_supervised_decoder else 0,
+            )
 
             epoch_recon += loss_recon.item()
             epoch_sup += loss_sup.item()

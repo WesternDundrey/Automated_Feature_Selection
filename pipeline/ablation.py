@@ -173,6 +173,22 @@ def run(cfg: Config = None):
         ablations["mse_mode"] = {"supervision_mode": "mse"}
         ablations["hybrid_mode"] = {"supervision_mode": "hybrid"}
 
+    # v3: frozen decoder + selectivity loss variants
+    ablations["frozen_bce"] = {
+        "freeze_supervised_decoder": True, "selectivity_loss": "bce",
+    }
+    ablations["frozen_hinge"] = {
+        "freeze_supervised_decoder": True, "selectivity_loss": "hinge",
+    }
+    ablations["frozen_recon_only"] = {
+        "freeze_supervised_decoder": True, "selectivity_loss": "none",
+        "lambda_sup": 0.0,  # no supervision loss at all — just recon + L1
+    }
+    ablations["frozen_mse"] = {
+        "freeze_supervised_decoder": True, "supervision_mode": "mse",
+        "selectivity_loss": "none",
+    }
+
     print("=" * 70)
     print("ABLATION STUDY")
     print("=" * 70)

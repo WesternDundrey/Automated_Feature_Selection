@@ -67,6 +67,14 @@ class Config:
     use_mse_supervision: bool = True    # DEPRECATED: use supervision_mode instead
     direction_loss_weight: float = 1.0  # α: decoder direction alignment (hybrid/mse)
     magnitude_loss_weight: float = 0.5  # β: activation magnitude alignment (mse only)
+    selectivity_loss: str = "bce"       # "bce", "hinge", or "none"
+    hinge_margin: float = 1.0           # margin for hinge selectivity loss
+
+    # ── v3: Frozen decoder ──────────────────────────────────────────
+    # Fix supervised decoder columns to target_dirs before training.
+    # Only encoder + unsupervised decoder train. Direction loss is
+    # skipped (decoder is already aligned by construction).
+    freeze_supervised_decoder: bool = False
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API

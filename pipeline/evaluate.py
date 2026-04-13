@@ -179,6 +179,61 @@ def evaluate(cfg: Config = None):
     print(f"  Baseline (mean) MSE:  {baseline_mse:.6f}")
     print(f"  R^2:                  {r2:.4f}")
 
+    # ── 1b. Supervised vs unsupervised R² decomposition ──────────────────
+    # Ablation-based: zero one slice, measure how much R² drops.
+    with torch.no_grad():
+        # Zero supervised → measure unsupervised-only reconstruction
+        acts_no_sup = all_acts.clone()
+        acts_no_sup[:, :n_features] = 0
+        recon_no_sup = sae.decoder(acts_no_sup)
+        mse_no_sup = F.mse_loss(recon_no_sup, x_test).item()
+        r2_no_sup = 1.0 - mse_no_sup / baseline_mse
+
+        # Zero unsupervised → measure supervised-only reconstruction
+        acts_no_unsup = all_acts.clone()
+        acts_no_unsup[:, n_features:] = 0
+        recon_no_unsup = sae.decoder(acts_no_unsup)
+        mse_no_unsup = F.mse_loss(recon_no_unsup, x_test).item()
+        r2_no_unsup = 1.0 - mse_no_unsup / baseline_mse
+
+    delta_r2_sup = r2 - r2_no_sup      # removing sup hurts by this much
+    delta_r2_unsup = r2 - r2_no_unsup  # removing unsup hurts by this much
+
+    print(f"\n  SUPERVISED vs UNSUPERVISED R² DECOMPOSITION (ablation-based)")
+    print(f"  Full R²:                {r2:.4f}")
+    print(f"  R² without supervised:  {r2_no_sup:.4f}  (delta = {delta_r2_sup:+.4f})")
+    print(f"  R² without unsupervised:{r2_no_unsup:.4f}  (delta = {delta_r2_unsup:+.4f})")
+    print(f"  Supervised-only R²:     {r2_no_unsup:.4f}")
+    print(f"  Unsupervised-only R²:   {r2_no_sup:.4f}")
+
+    # Magnitude correlation: at positive positions, does sup_acts[k] correlate
+    # with x @ target_dir[k]? High correlation = reconstruction already
+    # supervises activation magnitude without an explicit loss term.
+    use_mse = model_cfg.get("use_mse_supervision", False)
+    mag_corr = None
+    if use_mse and cfg.target_dirs_path.exists():
+        target_dirs_q4 = torch.load(cfg.target_dirs_path, weights_only=True)
+        projections = x_test @ target_dirs_q4.T  # (n_test, n_features)
+        gt_bool = y_test.bool()
+        corrs = []
+        for k in range(n_features):
+            mask = gt_bool[:, k]
+            n_pos = int(mask.sum().item())
+            if n_pos < 10:
+                continue
+            proj_k = projections[mask, k].numpy()
+            act_k = sup_acts[mask, k].numpy()
+            if proj_k.std() < 1e-8 or act_k.std() < 1e-8:
+                continue
+            corr = float(np.corrcoef(proj_k, act_k)[0, 1])
+            if not np.isnan(corr):
+                corrs.append(corr)
+        if corrs:
+            mag_corr = float(np.mean(corrs))
+            print(f"\n  MAGNITUDE CORRELATION (sup_acts vs x @ target_dir, at positive positions)")
+            print(f"  Mean Pearson r:  {mag_corr:.4f}  (over {len(corrs)} features)")
+            print(f"  Interpretation:  {'reconstruction supervises magnitude well' if mag_corr > 0.7 else 'magnitude is weakly supervised by reconstruction' if mag_corr > 0.4 else 'magnitude is NOT supervised by reconstruction'}")
+
     # ── 2. Per-feature classification ────────────────────────────────────
     gt = y_test.numpy().astype(bool)
     preds = sup_pre.numpy() > 0  # threshold at sigmoid=0.5
@@ -596,7 +651,14 @@ def evaluate(cfg: Config = None):
 
     # ── Save results ────────────────────────────────────────────────────
     results = {
-        "reconstruction": {"mse": mse, "baseline_mse": baseline_mse, "r2": r2},
+        "reconstruction": {
+            "mse": mse, "baseline_mse": baseline_mse, "r2": r2,
+            "r2_without_supervised": round(r2_no_sup, 4),
+            "r2_without_unsupervised": round(r2_no_unsup, 4),
+            "delta_r2_supervised": round(delta_r2_sup, 4),
+            "delta_r2_unsupervised": round(delta_r2_unsup, 4),
+            "magnitude_correlation": round(mag_corr, 4) if mag_corr is not None else None,
+        },
         "sparsity": {"l0_supervised": l0_supervised, "l0_total": l0_total},
         "features": feature_results,
         "mean_f1": mean_f1,

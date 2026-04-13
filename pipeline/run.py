@@ -54,12 +54,17 @@ def main():
     parser.add_argument("--supervision", default=None,
                         choices=["hybrid", "mse", "bce"],
                         help="Supervision mode: hybrid (BCE+direction), mse, bce")
+    parser.add_argument("--freeze-decoder", action="store_true",
+                        help="Fix supervised decoder columns to target_dirs; train only encoder")
+    parser.add_argument("--selectivity", default=None,
+                        choices=["bce", "hinge", "none"],
+                        help="Selectivity loss type (default: bce)")
     parser.add_argument(
         "--step", default=None,
         choices=["inventory", "annotate", "train", "evaluate",
                  "agreement", "ablation", "residual", "causal", "ioi",
                  "validate-annotator",
-                 "splitting", "circuit", "intervention"],
+                 "splitting", "circuit", "intervention", "amplify"],
         help="Run only this step",
     )
     args = parser.parse_args()
@@ -105,6 +110,10 @@ def main():
         overrides["supervision_mode"] = "bce"
     if args.full_desc:
         overrides["use_findex_suffix"] = False
+    if args.freeze_decoder:
+        overrides["freeze_supervised_decoder"] = True
+    if args.selectivity:
+        overrides["selectivity_loss"] = args.selectivity
 
     cfg = Config(**overrides)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -270,6 +279,16 @@ def main():
         from .intervention import run as run_intervention
         run_intervention(cfg)
         print(f"Experiment C completed in {time.time() - t0:.1f}s")
+
+    # Experiment D: Activation amplification sweep
+    if args.step == "amplify":
+        print("\n" + "=" * 70)
+        print("EXPERIMENT D: ACTIVATION AMPLIFICATION SWEEP")
+        print("=" * 70)
+        t0 = time.time()
+        from .amplify import run as run_amplify
+        run_amplify(cfg)
+        print(f"Experiment D completed in {time.time() - t0:.1f}s")
 
     # Annotator validation on trivial features
     if args.step == "validate-annotator":
