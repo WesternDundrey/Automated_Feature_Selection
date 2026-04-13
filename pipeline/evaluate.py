@@ -184,14 +184,14 @@ def evaluate(cfg: Config = None):
     with torch.no_grad():
         # Zero supervised → measure unsupervised-only reconstruction
         acts_no_sup = all_acts.clone()
-        acts_no_sup[:, :n_features] = 0
+        acts_no_sup[:, :sae.n_supervised] = 0
         recon_no_sup = sae.decoder(acts_no_sup)
         mse_no_sup = F.mse_loss(recon_no_sup, x_test).item()
         r2_no_sup = 1.0 - mse_no_sup / baseline_mse
 
         # Zero unsupervised → measure supervised-only reconstruction
         acts_no_unsup = all_acts.clone()
-        acts_no_unsup[:, n_features:] = 0
+        acts_no_unsup[:, sae.n_supervised:] = 0
         recon_no_unsup = sae.decoder(acts_no_unsup)
         mse_no_unsup = F.mse_loss(recon_no_unsup, x_test).item()
         r2_no_unsup = 1.0 - mse_no_unsup / baseline_mse

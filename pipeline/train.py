@@ -383,7 +383,13 @@ def train_supervised_sae(
             # ── Selectivity loss (encoder: which positions fire?) ─────
             if cfg.selectivity_loss == "hinge":
                 targets_hinge = 2 * y_b - 1  # {0,1} → {-1,+1}
-                loss_select = F.relu(cfg.hinge_margin - sup_pre * targets_hinge).mean()
+                raw_hinge = F.relu(cfg.hinge_margin - sup_pre * targets_hinge)
+                # Class-balanced: weight positive positions by pos_weight so rare
+                # features aren't drowned by the 99.9% negative class
+                weights = torch.where(
+                    y_b > 0.5, pos_weight.unsqueeze(0), y_b.new_ones(())
+                )
+                loss_select = (raw_hinge * weights).mean()
             elif cfg.selectivity_loss == "none":
                 loss_select = sup_pre.new_zeros(())
             else:  # "bce" (default)
@@ -392,8 +398,14 @@ def train_supervised_sae(
                 )
 
             # ── Direction / magnitude loss (decoder: where does it point?) ──
-            if cfg.freeze_supervised_decoder:
-                # Decoder is frozen to target_dirs — no direction loss needed
+            if cfg.freeze_supervised_decoder and cfg.supervision_mode == "mse":
+                # Frozen decoder + MSE mode: use magnitude loss only, skip direction
+                _, _, loss_mag = mse_supervision_loss(
+                    sae.decoder.weight, sup_acts, target_dirs, x_b, y_b, cfg,
+                )
+                loss_sup = loss_select + cfg.magnitude_loss_weight * loss_mag
+            elif cfg.freeze_supervised_decoder:
+                # Frozen decoder, non-MSE: no direction loss needed
                 loss_sup = loss_select
             elif cfg.supervision_mode == "hybrid":
                 dec_cols = sae.decoder.weight[:, :n_supervised]

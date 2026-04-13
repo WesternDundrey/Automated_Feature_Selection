@@ -32,7 +32,9 @@ from .config import Config
 from .train import SupervisedSAE
 
 
-MULTIPLIERS = [1.0, 2.0, 5.0, 10.0]
+# 0 = ablation (Experiment C baseline), then increasing amplification.
+# 1x is omitted because KL(full_recon || full_recon) = 0 (trivial).
+MULTIPLIERS = [0.0, 2.0, 5.0, 10.0]
 
 TARGET_FEATURE_HINTS = [
     "digit_or_number",
@@ -173,10 +175,11 @@ def run(cfg: Config = None):
     results_per_feature = []
 
     print(f"\nMultipliers: {MULTIPLIERS}")
+    print(f"  0x = ablation (Experiment C baseline), 2x+ = amplification")
     print(f"Sequences: {n_causal}")
     print("\n" + "=" * 90)
     print(f"{'Feature':<34} {'mult':>5} {'KL_pos':>8} {'KL_neg':>8} "
-          f"{'ratio':>8} {'ratio/1x':>8}")
+          f"{'ratio':>8} {'ratio/0x':>8}")
     print("-" * 90)
 
     for feat_idx, feat_id in targets:
@@ -208,7 +211,7 @@ def run(cfg: Config = None):
         neg_by_seq = group(neg_coords)
 
         sweep = []
-        base_ratio = None
+        ablation_ratio = None  # targeting ratio at 0x (ablation) — the baseline
 
         for mult in MULTIPLIERS:
             amp_hook = _make_amplify_hook(sae, feat_idx, mult)
@@ -227,13 +230,14 @@ def run(cfg: Config = None):
             else:
                 ratio = kl_pos / kl_neg
 
-            if mult == 1.0 and ratio is not None and ratio != float("inf"):
-                base_ratio = ratio
+            # Use the 0x (ablation) ratio as reference for drift measurement
+            if mult == 0.0 and ratio is not None and not np.isinf(ratio):
+                ablation_ratio = ratio
 
-            ratio_vs_1x = None
-            if ratio is not None and base_ratio is not None and base_ratio > 0:
+            ratio_vs_0x = None
+            if ratio is not None and ablation_ratio is not None and ablation_ratio > 0:
                 if not np.isinf(ratio):
-                    ratio_vs_1x = ratio / base_ratio
+                    ratio_vs_0x = ratio / ablation_ratio
 
             def fmt(r):
                 if r is None:
@@ -243,14 +247,14 @@ def run(cfg: Config = None):
                 return f"{r:8.2f}"
 
             print(f"  {feat_id:<32} {mult:>5.1f} {kl_pos:>8.4f} {kl_neg:>8.4f} "
-                  f"{fmt(ratio)} {fmt(ratio_vs_1x)}")
+                  f"{fmt(ratio)} {fmt(ratio_vs_0x)}")
 
             sweep.append({
                 "multiplier": mult,
                 "kl_pos": round(kl_pos, 6),
                 "kl_neg": round(kl_neg, 6),
                 "targeting_ratio": round(ratio, 4) if ratio is not None and not np.isinf(ratio) else None,
-                "ratio_vs_1x": round(ratio_vs_1x, 4) if ratio_vs_1x is not None else None,
+                "ratio_vs_0x": round(ratio_vs_0x, 4) if ratio_vs_0x is not None else None,
             })
 
         results_per_feature.append({
