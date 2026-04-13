@@ -181,18 +181,24 @@ def evaluate(cfg: Config = None):
 
     # ── 1b. Supervised vs unsupervised R² decomposition ──────────────────
     # Ablation-based: zero one slice, measure how much R² drops.
+    # all_acts is on CPU (collected with .cpu()); decode in batches on GPU.
     with torch.no_grad():
-        # Zero supervised → measure unsupervised-only reconstruction
-        acts_no_sup = all_acts.clone()
-        acts_no_sup[:, :sae.n_supervised] = 0
-        recon_no_sup = sae.decoder(acts_no_sup)
+        def _decode_ablated(acts_tensor, zero_start, zero_end):
+            """Decode acts with a zeroed slice, batched on GPU."""
+            recon_parts = []
+            for i in range(0, acts_tensor.shape[0], cfg.batch_size):
+                a = acts_tensor[i : i + cfg.batch_size].clone().to(cfg.device)
+                a[:, zero_start:zero_end] = 0
+                recon_parts.append(sae.decoder(a).cpu())
+            return torch.cat(recon_parts)
+
+        # Zero supervised → unsupervised-only reconstruction
+        recon_no_sup = _decode_ablated(all_acts, 0, sae.n_supervised)
         mse_no_sup = F.mse_loss(recon_no_sup, x_test).item()
         r2_no_sup = 1.0 - mse_no_sup / baseline_mse
 
-        # Zero unsupervised → measure supervised-only reconstruction
-        acts_no_unsup = all_acts.clone()
-        acts_no_unsup[:, sae.n_supervised:] = 0
-        recon_no_unsup = sae.decoder(acts_no_unsup)
+        # Zero unsupervised → supervised-only reconstruction
+        recon_no_unsup = _decode_ablated(all_acts, sae.n_supervised, all_acts.shape[1])
         mse_no_unsup = F.mse_loss(recon_no_unsup, x_test).item()
         r2_no_unsup = 1.0 - mse_no_unsup / baseline_mse
 
