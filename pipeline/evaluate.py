@@ -377,6 +377,38 @@ def evaluate(cfg: Config = None):
           f"0.01 of GT positive rate (|r@cal - r@gt| < 0.01)")
     print(f"  Median |r@cal - r@gt|: {float(np.median(cal_error)):.4f}")
 
+    # ── 3c. Ground-truth L0 vs predicted L0 ─────────────────────────────
+    # GT L0 = mean # of features marked positive per position by the LLM
+    # annotations. Equals sum of per-feature gt_positive_rate (linearity of
+    # expectation). This is the "right" number — what calibrated L0 should
+    # match. Naive L0 (>0) almost always overshoots because pre-act > 0
+    # doesn't mean the feature is confidently present.
+    gt_l0_per_pos = gt.sum(axis=-1)
+    gt_l0 = float(gt_l0_per_pos.mean())
+    pred_l0_per_pos = cal_mask_sup.sum(axis=-1)
+    abs_err_per_pos = np.abs(pred_l0_per_pos - gt_l0_per_pos)
+
+    print(f"\n  GROUND-TRUTH L0 vs PREDICTED L0 (supervised slice)")
+    print(f"  GT L0 (from annotations):     {gt_l0:.2f}")
+    print(f"  Calibrated L0 (predicted):    {l0_sup_calibrated:.2f}  "
+          f"(ratio cal/gt = {l0_sup_calibrated / max(gt_l0, 1e-9):.3f})")
+    print(f"  Naive L0 (>0, predicted):     {l0_supervised:.2f}  "
+          f"(ratio naive/gt = {l0_supervised / max(gt_l0, 1e-9):.3f})")
+    print(f"  Per-position |pred - GT|:     "
+          f"mean={float(abs_err_per_pos.mean()):.2f}, "
+          f"median={float(np.median(abs_err_per_pos)):.2f}")
+    if l0_sup_calibrated > 0 and gt_l0 > 0:
+        verdict = (
+            "calibrated L0 matches GT — SAE fires the right amount"
+            if 0.9 <= l0_sup_calibrated / gt_l0 <= 1.1
+            else f"calibrated L0 overshoots GT by "
+                 f"{(l0_sup_calibrated/gt_l0 - 1)*100:+.0f}%"
+            if l0_sup_calibrated > gt_l0
+            else f"calibrated L0 undershoots GT by "
+                 f"{(1 - l0_sup_calibrated/gt_l0)*100:.0f}%"
+        )
+        print(f"  Verdict: {verdict}")
+
     # ── 4. Hierarchy consistency ────────────────────────────────────────
     hier_map = build_hierarchy_map(features)
 
@@ -714,6 +746,10 @@ def evaluate(cfg: Config = None):
             "l0_supervised_calibrated": round(l0_sup_calibrated, 4),
             "l0_total_calibrated": round(l0_total_calibrated, 4),
             "l0_unsupervised": round(l0_unsup, 4),
+            "l0_ground_truth": round(gt_l0, 4),
+            "l0_cal_over_gt_ratio": round(l0_sup_calibrated / max(gt_l0, 1e-9), 4),
+            "l0_naive_over_gt_ratio": round(l0_supervised / max(gt_l0, 1e-9), 4),
+            "l0_pred_minus_gt_mean_abs_err": round(float(abs_err_per_pos.mean()), 4),
             "calibration_median_error": round(float(np.median(cal_error)), 4),
             "n_well_calibrated": n_well_cal,
         },
