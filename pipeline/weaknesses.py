@@ -113,13 +113,22 @@ def run(cfg: Config = None):
     if mse_block and mse_block.get("per_feature"):
         mse_by_id = {f["id"]: f for f in mse_block["per_feature"]}
 
-    # Causal KL per feature (optional)
+    # Causal KL per feature (optional). causal.py saves a nested dict:
+    #   {"approximation": ..., "controllability": ..., "feature_necessity":
+    #    {"features": [{"id": ..., "mean_kl": ...}, ...]}, ...}
+    # Older/flatter layouts may put "features" at the top level.
     causal_by_id = {}
     if cfg.causal_path.exists():
         try:
             causal = json.loads(cfg.causal_path.read_text())
-            for entry in causal.get("features", []):
-                causal_by_id[entry["id"]] = entry.get("mean_kl")
+            feat_block = (
+                causal.get("feature_necessity")
+                or causal  # fallback if flat
+            )
+            for entry in feat_block.get("features", []):
+                kl = entry.get("mean_kl")
+                if kl is not None:
+                    causal_by_id[entry["id"]] = kl
         except (json.JSONDecodeError, KeyError):
             pass
 
