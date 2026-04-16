@@ -1019,8 +1019,8 @@ def run(cfg: Config = None):
         print("Extracting tokens/activations in subprocess (isolates CUDA context)...")
         extract_script = f"""
 import torch
-from transformer_lens import HookedTransformer
 from pipeline.annotate import prepare_corpus, extract_activations
+from pipeline.inventory import load_target_model
 from pipeline.config import Config
 
 cfg = Config(
@@ -1029,11 +1029,13 @@ cfg = Config(
     seq_len={cfg.seq_len}, corpus_batch_size={cfg.corpus_batch_size},
     target_layer={cfg.target_layer}, output_dir="{cfg.output_dir}",
     hook_point="{cfg.hook_point}",
+    sae_release="{cfg.sae_release}", sae_id="{cfg.sae_id}",
 )
 cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-model = HookedTransformer.from_pretrained(cfg.model_name, device=cfg.device, dtype=cfg.model_dtype)
-model.eval()
+# Use the centralized loader so activations match the pretrained SAE's
+# training distribution (no LayerNorm folding, etc.).
+model = load_target_model(cfg)
 
 if not cfg.tokens_path.exists():
     tokens = prepare_corpus(model, cfg)

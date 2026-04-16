@@ -214,14 +214,10 @@ def run(cfg: Config = None):
     if cfg is None:
         cfg = Config()
 
-    from transformer_lens import HookedTransformer
-    from .inventory import load_sae
+    from .inventory import load_sae, load_target_model
 
     print("Loading base model...")
-    model = HookedTransformer.from_pretrained(
-        cfg.model_name, device=cfg.device, dtype=cfg.model_dtype,
-    )
-    model.eval()
+    model = load_target_model(cfg)
 
     dtype_map = {
         "bfloat16": torch.bfloat16,

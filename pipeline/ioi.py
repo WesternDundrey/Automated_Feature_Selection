@@ -357,13 +357,10 @@ def run(cfg: Config = None, skip_annotator: bool = False):
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    from transformer_lens import HookedTransformer
+    from .inventory import load_target_model
 
     print("Loading GPT-2 Small...")
-    model = HookedTransformer.from_pretrained(
-        cfg.model_name, device=cfg.device, dtype=cfg.model_dtype,
-    )
-    model.eval()
+    model = load_target_model(cfg)
     tokenizer = model.tokenizer
 
     n_ioi = min(cfg.n_sequences, 2000)

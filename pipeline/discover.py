@@ -237,13 +237,9 @@ def run(cfg: Config = None):
         top_acts = json.loads(top_acts_path.read_text())
     else:
         print("\n── Collecting top activations ──")
-        from transformer_lens import HookedTransformer
-        from .inventory import collect_top_activations, PretrainedSAE
+        from .inventory import collect_top_activations, PretrainedSAE, load_target_model
 
-        model = HookedTransformer.from_pretrained(
-            cfg.model_name, device=cfg.device, dtype=cfg.model_dtype
-        )
-        model.eval()
+        model = load_target_model(cfg)
         tokenizer = model.tokenizer
 
         # Wrap the trained SAE to match PretrainedSAE interface

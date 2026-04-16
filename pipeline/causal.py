@@ -554,15 +554,12 @@ def run(cfg: Config = None):
         cfg = Config()
 
     import json
-    from transformer_lens import HookedTransformer
+    from .inventory import load_target_model
     from .train import SupervisedSAE
 
     # Load model
     print("Loading base model...")
-    model = HookedTransformer.from_pretrained(
-        cfg.model_name, device=cfg.device, dtype=cfg.model_dtype,
-    )
-    model.eval()
+    model = load_target_model(cfg)
     tokenizer = model.tokenizer
 
     # Load trained SAE

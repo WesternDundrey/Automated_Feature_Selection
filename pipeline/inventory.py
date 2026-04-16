@@ -218,6 +218,46 @@ def _load_sae_gemmascope_npz(cfg: Config) -> tuple[PretrainedSAE, None]:
 
 # ── Select latents by firing rate ───────────────────────────────────────────
 
+def load_target_model(cfg: Config):
+    """Load the target model in the activation space the pretrained SAE expects.
+
+    sae_lens SAEs (e.g., gpt2-small-res-jb) are trained against activations
+    extracted with specific HookedTransformer preprocessing settings. The
+    default `from_pretrained` applies LayerNorm folding, weight centering,
+    etc., which produce activations in a different space than the SAE saw at
+    training time — this is why the pretrained baseline reconstructs at
+    R² ≈ -3 instead of ~0.95.
+
+    Fix per the sae_lens warning: load via `from_pretrained_no_processing`
+    and forward the SAE's `model_from_pretrained_kwargs`. For SAEs without a
+    sae_lens config (GemmaScope npz path), no-processing with default kwargs
+    is correct — GemmaScope was trained on raw residual stream.
+
+    All extraction sites in the pipeline must use this helper to keep the
+    supervised SAE training distribution aligned with the pretrained baseline.
+    """
+    from transformer_lens import HookedTransformer
+
+    kwargs = {}
+    try:
+        from sae_lens import SAE
+        _, cfg_dict, _ = SAE.from_pretrained(
+            release=cfg.sae_release, sae_id=cfg.sae_id, device="cpu",
+        )
+        kwargs = cfg_dict.get("model_from_pretrained_kwargs") or {}
+        if kwargs:
+            print(f"  Target model kwargs from SAE config: {kwargs}")
+    except Exception as e:
+        print(f"  No sae_lens kwargs ({type(e).__name__}); "
+              f"using from_pretrained_no_processing defaults")
+
+    model = HookedTransformer.from_pretrained_no_processing(
+        cfg.model_name, device=cfg.device, dtype=cfg.model_dtype, **kwargs,
+    )
+    model.eval()
+    return model
+
+
 def select_latents(sparsity, cfg: Config) -> list[int]:
     """Select latents whose firing rate falls in [min, max].
 
@@ -598,13 +638,8 @@ def run(cfg: Config = None):
         return json.loads(cfg.catalog_path.read_text())
 
     # 1. Load model and pretrained SAE
-    from transformer_lens import HookedTransformer
-
     print("Loading base model...")
-    model = HookedTransformer.from_pretrained(
-        cfg.model_name, device=cfg.device, dtype=cfg.model_dtype
-    )
-    model.eval()
+    model = load_target_model(cfg)
     tokenizer = model.tokenizer
 
     sae, sparsity = load_sae(cfg)
