@@ -64,7 +64,8 @@ def main():
         choices=["inventory", "annotate", "train", "evaluate",
                  "agreement", "ablation", "residual", "causal", "ioi",
                  "validate-annotator",
-                 "splitting", "circuit", "intervention", "amplify"],
+                 "splitting", "circuit", "intervention", "amplify",
+                 "weaknesses", "siphoning", "discover"],
         help="Run only this step",
     )
     args = parser.parse_args()
@@ -289,6 +290,36 @@ def main():
         from .amplify import run as run_amplify
         run_amplify(cfg)
         print(f"Experiment D completed in {time.time() - t0:.1f}s")
+
+    # Weakness spotlight (reads evaluation.json + causal.json, no retrain)
+    if args.step == "weaknesses":
+        print("\n" + "=" * 70)
+        print("WEAKNESS SPOTLIGHT")
+        print("=" * 70)
+        t0 = time.time()
+        from .weaknesses import run as run_weaknesses
+        run_weaknesses(cfg)
+        print(f"Weakness spotlight completed in {time.time() - t0:.1f}s")
+
+    # FVE siphoning sweep (retrains across n_unsupervised values)
+    if args.step == "siphoning":
+        print("\n" + "=" * 70)
+        print("FVE SIPHONING SWEEP")
+        print("=" * 70)
+        t0 = time.time()
+        from .siphoning import run as run_siphoning
+        run_siphoning(cfg)
+        print(f"Siphoning sweep completed in {time.time() - t0:.1f}s")
+
+    # Plan 2 — Discovery pipeline: unsupervised SAE → annotate → catalog
+    if args.step == "discover":
+        print("\n" + "=" * 70)
+        print("DISCOVERY PIPELINE (unsupervised → annotate → catalog)")
+        print("=" * 70)
+        t0 = time.time()
+        from .discover import run as run_discover
+        run_discover(cfg)
+        print(f"Discovery pipeline completed in {time.time() - t0:.1f}s")
 
     # Annotator validation on trivial features
     if args.step == "validate-annotator":

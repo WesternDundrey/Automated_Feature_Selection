@@ -31,8 +31,16 @@ from .config import Config
 from .train import SupervisedSAE, train_supervised_sae, build_hierarchy_map, set_seed
 
 
-def evaluate_quick(sae: SupervisedSAE, x_test, y_test, features, cfg):
-    """Quick evaluation returning key metrics without full report."""
+def evaluate_quick(sae: SupervisedSAE, x_test, y_test, features, cfg,
+                   post_hoc_match: bool = False):
+    """Quick evaluation returning key metrics without full report.
+
+    Args:
+        post_hoc_match: if True, for each ground-truth feature k, search ALL
+            latents for the one with highest F1 (via threshold scan). Used for
+            the `unsupervised_only` variant where latents aren't aligned to
+            features by construction.
+    """
     sae.eval().to(cfg.device)
 
     all_recon = []
@@ -63,19 +71,54 @@ def evaluate_quick(sae: SupervisedSAE, x_test, y_test, features, cfg):
 
     # Per-feature F1
     gt = y_test.numpy().astype(bool)
-    preds = sup_pre.numpy() > 0
     f1_scores = []
-    for k in range(gt.shape[1]):
-        n_pos = int(gt[:, k].sum())
-        if n_pos == 0:
-            continue
-        tp = int((gt[:, k] & preds[:, k]).sum())
-        fp = int((~gt[:, k] & preds[:, k]).sum())
-        fn = int((gt[:, k] & ~preds[:, k]).sum())
-        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-        f1_scores.append(f1)
+    matched_latents = []  # for post_hoc_match, record which latent matched each feature
+
+    if post_hoc_match:
+        # For each feature, scan all latents, take max F1 over best threshold.
+        # Subsample candidate latents if too many to search exhaustively.
+        acts_np = all_acts.numpy()
+        n_latents = acts_np.shape[1]
+        for k in range(gt.shape[1]):
+            if gt[:, k].sum() == 0:
+                continue
+            best_f1 = 0.0
+            best_l = -1
+            for latent_idx in range(n_latents):
+                scores_l = acts_np[:, latent_idx]
+                if scores_l.max() <= 0:
+                    continue
+                lo, hi = 0.0, float(scores_l.max())
+                for t in np.linspace(lo, hi, 40):
+                    pred = scores_l > t
+                    tp = int((gt[:, k] & pred).sum())
+                    fp = int((~gt[:, k] & pred).sum())
+                    fn = int((gt[:, k] & ~pred).sum())
+                    if tp + fp == 0 or tp + fn == 0:
+                        continue
+                    p = tp / (tp + fp)
+                    r = tp / (tp + fn)
+                    if p + r == 0:
+                        continue
+                    f1 = 2 * p * r / (p + r)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_l = latent_idx
+            f1_scores.append(best_f1)
+            matched_latents.append(best_l)
+    else:
+        preds = sup_pre.numpy() > 0
+        for k in range(gt.shape[1]):
+            n_pos = int(gt[:, k].sum())
+            if n_pos == 0:
+                continue
+            tp = int((gt[:, k] & preds[:, k]).sum())
+            fp = int((~gt[:, k] & preds[:, k]).sum())
+            fn = int((gt[:, k] & ~preds[:, k]).sum())
+            p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+            f1_scores.append(f1)
 
     mean_f1 = float(np.mean(f1_scores)) if f1_scores else 0.0
 
@@ -98,13 +141,16 @@ def evaluate_quick(sae: SupervisedSAE, x_test, y_test, features, cfg):
     hier_consistency = float(np.mean(consistencies)) if consistencies else 1.0
 
     sae.cpu()
-    return {
+    out = {
         "r2": round(r2, 4),
         "mse": round(mse, 6),
         "mean_f1": round(mean_f1, 4),
         "l0": round(l0, 1),
         "hierarchy_consistency": round(hier_consistency, 4),
     }
+    if post_hoc_match:
+        out["matched_latents"] = matched_latents
+    return out
 
 
 def run(cfg: Config = None):
@@ -189,6 +235,19 @@ def run(cfg: Config = None):
         "selectivity_loss": "none",
     }
 
+    # Pure unsupervised baseline: no supervision signal at all. Supervised
+    # slots still exist (needed for model shape), but receive no gradient
+    # pressure from labels. Evaluated via post-hoc best-match F1: for each
+    # annotated feature, scan ALL latents for the one with highest F1.
+    # Answers: "can a purely unsupervised SAE recover our features?"
+    ablations["unsupervised_only"] = {
+        "lambda_sup": 0.0,
+        "lambda_hier": 0.0,
+        "selectivity_loss": "none",
+        "freeze_supervised_decoder": False,
+        "supervision_mode": "bce",  # avoid target_dirs computation
+    }
+
     print("=" * 70)
     print("ABLATION STUDY")
     print("=" * 70)
@@ -215,12 +274,17 @@ def run(cfg: Config = None):
         # Train
         sae = train_supervised_sae(activations, annotations, features, variant_cfg, save_checkpoint=False)
 
-        # Evaluate
-        metrics = evaluate_quick(sae, x_test, y_test, features, variant_cfg)
+        # Evaluate — use post-hoc matching for unsupervised_only since its
+        # latents aren't aligned to features by position
+        post_hoc = (name == "unsupervised_only")
+        metrics = evaluate_quick(
+            sae, x_test, y_test, features, variant_cfg, post_hoc_match=post_hoc,
+        )
         metrics["overrides"] = overrides
         results[name] = metrics
 
-        print(f"  Result: R2={metrics['r2']:.3f}  F1={metrics['mean_f1']:.3f}  "
+        tag = " (post-hoc best-match F1)" if post_hoc else ""
+        print(f"  Result: R2={metrics['r2']:.3f}  F1={metrics['mean_f1']:.3f}{tag}  "
               f"L0={metrics['l0']:.1f}  hier={metrics['hierarchy_consistency']:.3f}")
 
     # Print comparison table

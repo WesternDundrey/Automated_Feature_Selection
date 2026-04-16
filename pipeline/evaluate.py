@@ -331,8 +331,51 @@ def evaluate(cfg: Config = None):
     # ── 3. Sparsity ─────────────────────────────────────────────────────
     l0_supervised = (sup_acts > 0).float().sum(dim=-1).mean().item()
     l0_total = (all_acts > 0).float().sum(dim=-1).mean().item()
-    print(f"\n  L0 (supervised latents): {l0_supervised:.1f}")
-    print(f"  L0 (all latents):        {l0_total:.1f}")
+    print(f"\n  L0 (supervised latents, naive >0): {l0_supervised:.2f}")
+    print(f"  L0 (all latents, naive >0):        {l0_total:.2f}")
+
+    # ── 3b. Calibrated L0 ───────────────────────────────────────────────
+    # Naive L0 counts any non-zero activation. But a feature with optimal
+    # threshold 2.5 firing at sup_pre=0.1 is noise, not "active". True L0
+    # uses each feature's F1-optimal threshold (computed on val) to count
+    # only confidently-active latents. Unsupervised latents retain naive >0
+    # (no labels to calibrate against).
+    test_sup_pre_np = sup_pre.numpy()
+    unsup_acts_np = all_acts[:, sae.n_supervised :].numpy()
+    cal_mask_sup = test_sup_pre_np > calibrated_thresholds[None, :]
+    unsup_active = unsup_acts_np > 0
+    l0_sup_calibrated = float(cal_mask_sup.sum(axis=-1).mean())
+    l0_unsup = float(unsup_active.sum(axis=-1).mean())
+    l0_total_calibrated = l0_sup_calibrated + l0_unsup
+
+    fire_rate_naive = (sup_acts.numpy() > 0).mean(axis=0)
+    fire_rate_calibrated = cal_mask_sup.mean(axis=0)
+    gt_pos_rate = gt.mean(axis=0)
+
+    print(f"\n  L0 (supervised, calibrated):       {l0_sup_calibrated:.2f}  "
+          f"(naive: {l0_supervised:.2f}, ratio: {l0_sup_calibrated / max(l0_supervised, 1e-9):.2f})")
+    print(f"  L0 (all, calibrated sup + naive unsup): {l0_total_calibrated:.2f}  "
+          f"(naive: {l0_total:.2f})")
+    print(f"\n  Per-feature fire rates (test set):")
+    print(f"  {'Feature':<36} {'r@0':>7} {'r@cal':>7} {'r@gt':>7} {'thresh':>8} {'n_pos':>6}")
+    print("  " + "-" * 78)
+    for k, feat in enumerate(features):
+        n_pos = int(gt[:, k].sum())
+        tag = " [G]" if feat["type"] == "group" else ""
+        print(f"  {feat['id']:<36} {fire_rate_naive[k]:>7.4f} "
+              f"{fire_rate_calibrated[k]:>7.4f} {gt_pos_rate[k]:>7.4f} "
+              f"{calibrated_thresholds[k]:>8.3f} {n_pos:>6}{tag}")
+        feature_results[k]["fire_rate_naive"] = round(float(fire_rate_naive[k]), 6)
+        feature_results[k]["fire_rate_calibrated"] = round(float(fire_rate_calibrated[k]), 6)
+        feature_results[k]["gt_positive_rate"] = round(float(gt_pos_rate[k]), 6)
+
+    # Calibration quality: how close is fire rate to ground-truth positive rate?
+    # |fire_rate_cal - gt_pos_rate| < 0.01 = well-calibrated
+    cal_error = np.abs(fire_rate_calibrated - gt_pos_rate)
+    n_well_cal = int((cal_error < 0.01).sum())
+    print(f"\n  Calibration quality: {n_well_cal}/{len(features)} features within "
+          f"0.01 of GT positive rate (|r@cal - r@gt| < 0.01)")
+    print(f"  Median |r@cal - r@gt|: {float(np.median(cal_error)):.4f}")
 
     # ── 4. Hierarchy consistency ────────────────────────────────────────
     hier_map = build_hierarchy_map(features)
@@ -665,7 +708,15 @@ def evaluate(cfg: Config = None):
             "delta_r2_unsupervised": round(delta_r2_unsup, 4),
             "magnitude_correlation": round(mag_corr, 4) if mag_corr is not None else None,
         },
-        "sparsity": {"l0_supervised": l0_supervised, "l0_total": l0_total},
+        "sparsity": {
+            "l0_supervised": l0_supervised,
+            "l0_total": l0_total,
+            "l0_supervised_calibrated": round(l0_sup_calibrated, 4),
+            "l0_total_calibrated": round(l0_total_calibrated, 4),
+            "l0_unsupervised": round(l0_unsup, 4),
+            "calibration_median_error": round(float(np.median(cal_error)), 4),
+            "n_well_calibrated": n_well_cal,
+        },
         "features": feature_results,
         "mean_f1": mean_f1,
         "cal_mean_f1": cal_mean_f1,
