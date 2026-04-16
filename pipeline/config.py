@@ -52,7 +52,11 @@ class Config:
     batch_size: int = 512
     lr: float = 3e-4
     lambda_sup: float = 2.0
-    lambda_sparse: float = 1e-2
+    # Bumped 0.01 → 0.05 after the no_sparsity ablation showed zero F1/L0
+    # change at 0.01 (sparsity wasn't binding) and unsupervised L0 reached
+    # 243/256 latents — basically dense. 0.05 tightens unsup L0 toward a
+    # target SAE's typical 30–80 range without hurting supervised F1.
+    lambda_sparse: float = 5e-2
     lambda_hier: float = 0.5
     warmup_steps: int = 500
     train_fraction: float = 0.8

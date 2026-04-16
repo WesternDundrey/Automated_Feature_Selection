@@ -37,6 +37,12 @@ def main():
     parser.add_argument("--model-dtype", default=None,
                         help="Model dtype (float32/bfloat16)")
     parser.add_argument("--lista", type=int, default=None, help="LISTA refinement steps")
+    parser.add_argument("--lambda-sup", type=float, default=None,
+                        help="Supervision loss weight (default: 2.0)")
+    parser.add_argument("--lambda-sparse", type=float, default=None,
+                        help="L1 sparsity loss weight (default: 0.05; bump for tighter unsup L0)")
+    parser.add_argument("--lambda-hier", type=float, default=None,
+                        help="Hierarchy loss weight (default: 0.5)")
     parser.add_argument("--local-annotator", action="store_true",
                         help="Use local model for annotation (vLLM)")
     parser.add_argument("--annotator-model", default=None,
@@ -97,6 +103,12 @@ def main():
         overrides["model_dtype"] = args.model_dtype
     if args.lista is not None:
         overrides["n_lista_steps"] = args.lista
+    if args.lambda_sup is not None:
+        overrides["lambda_sup"] = args.lambda_sup
+    if args.lambda_sparse is not None:
+        overrides["lambda_sparse"] = args.lambda_sparse
+    if args.lambda_hier is not None:
+        overrides["lambda_hier"] = args.lambda_hier
     if args.local_annotator:
         overrides["use_local_annotator"] = True
     if args.annotator_model:
