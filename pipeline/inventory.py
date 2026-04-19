@@ -262,39 +262,77 @@ def _load_sae_gemmascope_npz(cfg: Config) -> tuple[PretrainedSAE, None]:
 def load_target_model(cfg: Config):
     """Load the target model in the activation space the pretrained SAE expects.
 
-    sae_lens SAEs (e.g., gpt2-small-res-jb) are trained against activations
-    extracted with specific HookedTransformer preprocessing settings. The
-    default `from_pretrained` applies LayerNorm folding, weight centering,
-    etc., which produce activations in a different space than the SAE saw at
-    training time — this is why the pretrained baseline reconstructs at
-    R² ≈ -3 instead of ~0.95.
+    Different SAE releases were trained on activations from different
+    HookedTransformer loading paths. Picking the wrong path produces
+    activations in a different space than the SAE saw at training time,
+    which manifests as catastrophic R² (e.g., R² ≈ -20000 on
+    gpt2-small-res-jb, confirmed empirically via debug_pretrained_sae.py).
 
-    Fix per the sae_lens warning: load via `from_pretrained_no_processing`
-    and forward the SAE's `model_from_pretrained_kwargs`. For SAEs without a
-    sae_lens config (GemmaScope npz path), no-processing with default kwargs
-    is correct — GemmaScope was trained on raw residual stream.
+    Rule — verified by measurement:
 
-    All extraction sites in the pipeline must use this helper to keep the
-    supervised SAE training distribution aligned with the pretrained baseline.
+      GemmaScope releases (contain "gemma-scope" in the name):
+        Trained on activations from `from_pretrained_no_processing`
+        optionally with `model_from_pretrained_kwargs` from the SAE cfg
+        (things like `fold_ln=False`, `center_writing_weights=False`).
+        This is what summary4/5/6's R² > 0.9 on Gemma validated.
+
+      sae_lens-native releases (e.g., gpt2-small-res-jb):
+        Trained on activations from the STANDARD `from_pretrained`
+        (with default LayerNorm folding, weight centering, etc.).
+        Their `model_from_pretrained_kwargs` is empty, and the sae_lens
+        warning to use `from_pretrained_no_processing` is misleading
+        in this case.
+
+    The sae_lens UserWarning ("use from_pretrained_no_processing") fires
+    for every SAE with non-empty kwargs — but non-empty kwargs only
+    exist for GemmaScope. For sae_lens-native SAEs, kwargs are empty and
+    the warning doesn't apply to the intended extraction path.
     """
     from transformer_lens import HookedTransformer
 
-    kwargs = {}
-    try:
-        from sae_lens import SAE
-        _, cfg_dict, _ = SAE.from_pretrained(
-            release=cfg.sae_release, sae_id=cfg.sae_id, device="cpu",
-        )
-        kwargs = cfg_dict.get("model_from_pretrained_kwargs") or {}
-        if kwargs:
-            print(f"  Target model kwargs from SAE config: {kwargs}")
-    except Exception as e:
-        print(f"  No sae_lens kwargs ({type(e).__name__}); "
-              f"using from_pretrained_no_processing defaults")
+    release = cfg.sae_release or ""
+    is_gemmascope = "gemma-scope" in release.lower() or "gemmascope" in release.lower()
 
-    model = HookedTransformer.from_pretrained_no_processing(
-        cfg.model_name, device=cfg.device, dtype=cfg.model_dtype, **kwargs,
-    )
+    if is_gemmascope:
+        kwargs = {}
+        try:
+            from sae_lens import SAE
+            # Try new API first, fall back to deprecated-but-compatible unpacking
+            try:
+                result = SAE.from_pretrained_with_cfg_and_sparsity(
+                    release=cfg.sae_release, sae_id=cfg.sae_id, device="cpu",
+                )
+                cfg_dict = result[1] if isinstance(result, tuple) and len(result) > 1 else {}
+            except (AttributeError, TypeError):
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    result = SAE.from_pretrained(
+                        release=cfg.sae_release, sae_id=cfg.sae_id, device="cpu",
+                    )
+                if isinstance(result, tuple) and len(result) > 1:
+                    cfg_dict = result[1]
+                else:
+                    cfg_dict = {}
+            if isinstance(cfg_dict, dict):
+                kwargs = cfg_dict.get("model_from_pretrained_kwargs") or {}
+            if kwargs:
+                print(f"  Target model kwargs from SAE config: {kwargs}")
+        except Exception as e:
+            print(f"  No sae_lens kwargs ({type(e).__name__}); "
+                  f"using from_pretrained_no_processing defaults")
+        print(f"  Loader: from_pretrained_no_processing (GemmaScope path)")
+        model = HookedTransformer.from_pretrained_no_processing(
+            cfg.model_name, device=cfg.device, dtype=cfg.model_dtype, **kwargs,
+        )
+    else:
+        # sae_lens-native SAEs: standard from_pretrained. Verified empirically
+        # for gpt2-small-res-jb: R²=+0.99 on standard, R²=-20599 on no_processing.
+        print(f"  Loader: from_pretrained (standard sae_lens-native path)")
+        model = HookedTransformer.from_pretrained(
+            cfg.model_name, device=cfg.device, dtype=cfg.model_dtype,
+        )
+
     model.eval()
     return model
 
