@@ -45,11 +45,14 @@ from .config import Config
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 def _read_r2(cfg: Config) -> float | None:
+    """Read `reconstruction.r2` from evaluation.json. evaluate.py stores
+    it under key "r2" (not "r_squared" — a naming inconsistency worth
+    noting; kept as-is to avoid churn across the codebase)."""
     if not cfg.eval_path.exists():
         return None
     try:
         data = json.loads(cfg.eval_path.read_text())
-        return data.get("reconstruction", {}).get("r_squared")
+        return data.get("reconstruction", {}).get("r2")
     except (json.JSONDecodeError, KeyError):
         return None
 
