@@ -63,37 +63,58 @@ def _extract_json_object(text: str) -> dict | None:
 class PretrainedSAE:
     """Thin wrapper for a pretrained SAE with JumpReLU or ReLU activation.
 
-    Follows two conventions depending on training source:
+    Two construction paths depending on source:
 
-      GemmaScope (apply_b_dec_to_input=False, default):
-        encode: z = JumpReLU_theta(x @ W_enc + b_enc)        (no b_dec in enc)
+      GemmaScope npz (bare weights):
+        encode: z = JumpReLU_theta(x @ W_enc + b_enc)
         decode: x_hat = z @ W_dec + b_dec
+        Used when we load weights directly from the `params.npz` file.
 
-      Joseph-Bloom / sae_lens (apply_b_dec_to_input=True):
-        encode: z = ReLU((x - b_dec) @ W_enc + b_enc)        (b_dec subtracted)
-        decode: x_hat = z @ W_dec + b_dec
+      sae_lens native (delegate encode/decode to the sae_lens SAE object):
+        We hold a reference to the live `sae_lens.SAE` and call its own
+        `encode()` / `decode()`, which handle apply_b_dec_to_input,
+        activation normalization, scaling factors, and any other
+        preprocessing the SAE was trained with. The bare-weights path
+        couldn't replicate all of this (normalize_activations and
+        run_time_activation_norm_fn alone produce R² ≈ -10^4 when missed
+        on `gpt2-small-res-jb`). Delegating is both simpler and correct.
 
-    The difference is whether `b_dec` is subtracted from the input before
-    encoding. `gpt2-small-res-jb` (and most sae_lens-native SAEs) require
-    `apply_b_dec_to_input=True`; GemmaScope npz releases require False.
-    Getting this wrong produces R² orders of magnitude off baseline.
+    External code (circuit.py, intervention.py) still accesses
+    `sae.W_enc`, `sae.W_dec`, etc., so those attributes are always
+    populated — either from the live sae_lens weights (native path) or
+    from the npz tensors (GemmaScope path).
     """
 
-    def __init__(self, W_enc, W_dec, b_enc, b_dec, threshold=None,
-                 apply_b_dec_to_input=False):
-        self.W_enc = W_enc        # (d_model, d_sae)
-        self.W_dec = W_dec        # (d_sae, d_model)
-        self.b_enc = b_enc        # (d_sae,)
-        self.b_dec = b_dec        # (d_model,)
-        self.threshold = threshold  # (d_sae,) for JumpReLU, None for ReLU
-        self.apply_b_dec_to_input = apply_b_dec_to_input
-        self.d_model = W_enc.shape[0]
-        self.d_sae = W_enc.shape[1]
+    def __init__(self, W_enc=None, W_dec=None, b_enc=None, b_dec=None,
+                 threshold=None, native_sae=None):
+        self._native = native_sae
+        if native_sae is not None:
+            # Views of the native SAE's parameters. These are the actual
+            # Parameter tensors, not copies — moving the native SAE to a
+            # new device updates them in place.
+            self.W_enc = native_sae.W_enc.data
+            self.W_dec = native_sae.W_dec.data
+            self.b_enc = native_sae.b_enc.data
+            self.b_dec = native_sae.b_dec.data
+            self.threshold = (
+                native_sae.threshold.data
+                if hasattr(native_sae, "threshold")
+                and native_sae.threshold is not None
+                else None
+            )
+        else:
+            self.W_enc = W_enc        # (d_model, d_sae)
+            self.W_dec = W_dec        # (d_sae, d_model)
+            self.b_enc = b_enc        # (d_sae,)
+            self.b_dec = b_dec        # (d_model,)
+            self.threshold = threshold
+        self.d_model = self.W_enc.shape[0]
+        self.d_sae = self.W_enc.shape[1]
 
     def encode(self, x):
         """x: (..., d_model) -> (..., d_sae)"""
-        if self.apply_b_dec_to_input:
-            x = x - self.b_dec
+        if self._native is not None:
+            return self._native.encode(x)
         z = x @ self.W_enc + self.b_enc
         if self.threshold is not None:
             mask = z > self.threshold
@@ -104,9 +125,21 @@ class PretrainedSAE:
 
     def decode(self, z):
         """z: (..., d_sae) -> (..., d_model)"""
+        if self._native is not None:
+            return self._native.decode(z)
         return z @ self.W_dec + self.b_dec
 
     def to(self, device):
+        if self._native is not None:
+            self._native = self._native.to(device)
+            # Re-bind views after the move.
+            self.W_enc = self._native.W_enc.data
+            self.W_dec = self._native.W_dec.data
+            self.b_enc = self._native.b_enc.data
+            self.b_dec = self._native.b_dec.data
+            if hasattr(self._native, "threshold") and self._native.threshold is not None:
+                self.threshold = self._native.threshold.data
+            return self
         self.W_enc = self.W_enc.to(device)
         self.W_dec = self.W_dec.to(device)
         self.b_enc = self.b_enc.to(device)
@@ -158,42 +191,19 @@ def _load_sae_sae_lens(cfg: Config) -> tuple[PretrainedSAE, torch.Tensor | None]
         device="cpu",
     )
 
-    threshold = None
-    if hasattr(sae, "threshold") and sae.threshold is not None:
-        threshold = sae.threshold.data.clone()
-    elif hasattr(sae, "log_threshold"):
-        threshold = sae.log_threshold.data.exp()
-
-    # sae_lens stores W_enc as (d_model, d_sae) and W_dec as (d_sae, d_model).
-    # Both already match our GemmaScope convention:
-    #   W_enc: (d_model, d_sae), W_dec: (d_sae, d_model)
-    W_enc = sae.W_enc.data.clone()    # already (d_model, d_sae) in sae_lens
-    W_dec = sae.W_dec.data.clone()    # already (d_sae, d_model) in sae_lens
-
-    # Read apply_b_dec_to_input from the SAE's config. This flag governs
-    # whether the encoder subtracts b_dec from the input before projection.
-    # gpt2-small-res-jb and most sae_lens-native SAEs set it to True; the
-    # GemmaScope npz path keeps it False. Getting this wrong produces
-    # R²=-O(10^4) on reconstruction (seen in the previous run).
-    apply_b_dec_to_input = False
+    # Delegate encode/decode to the live sae_lens SAE. The bare-weights
+    # path (computing x @ W_enc + b_enc ourselves) misses apply_b_dec_to_input,
+    # normalize_activations, and any scaling the SAE carries — which are
+    # what produced R² ≈ -20000 on gpt2-small-res-jb. Letting sae_lens run
+    # its own forward eliminates the whole class of convention mismatches.
+    sae.eval()
+    wrapped = PretrainedSAE(native_sae=sae)
+    cfg_ap = False
     cfg_obj = getattr(sae, "cfg", None)
     if cfg_obj is not None:
-        apply_b_dec_to_input = bool(
-            getattr(cfg_obj, "apply_b_dec_to_input", False)
-        )
-    elif isinstance(cfg_dict, dict):
-        apply_b_dec_to_input = bool(cfg_dict.get("apply_b_dec_to_input", False))
-
-    wrapped = PretrainedSAE(
-        W_enc=W_enc,
-        W_dec=W_dec,
-        b_enc=sae.b_enc.data.clone(),
-        b_dec=sae.b_dec.data.clone(),
-        threshold=threshold,
-        apply_b_dec_to_input=apply_b_dec_to_input,
-    )
+        cfg_ap = bool(getattr(cfg_obj, "apply_b_dec_to_input", False))
     print(f"  SAE: d_model={wrapped.d_model}, d_sae={wrapped.d_sae}"
-          f"  apply_b_dec_to_input={apply_b_dec_to_input}")
+          f"  (native sae_lens forward, apply_b_dec_to_input={cfg_ap})")
     if sparsity is not None:
         print(f"  Sparsity info available ({sparsity.shape})")
     return wrapped, sparsity
