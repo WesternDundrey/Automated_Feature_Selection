@@ -1065,23 +1065,90 @@ if not cfg.activations_path.exists():
     from transformers import AutoTokenizer
     tokenizer_ref = AutoTokenizer.from_pretrained(cfg.model_name)
 
-    # Annotate (or load cached)
+    # Annotate (or load cached). Supports incremental annotation for the
+    # discovery loop: if the cached annotations tensor has fewer features than
+    # the current catalog, we annotate ONLY the new ones and concat along
+    # the feature dimension — rather than re-annotating the entire catalog.
+    # Logic:
+    #   - Cache exists AND catalog grew: annotate new leaves only, concat.
+    #   - Cache exists AND catalog shrank/reordered: discard cache, full re-run.
+    #   - Cache exists AND catalog matches: load cache.
+    #   - No cache: full annotation.
+    N_tok, T_tok = tokens.shape
+    n_features = len(features)
+
+    cached_ok = False
+    partial_existing = None
+    n_cached_features = 0
     if cfg.annotations_path.exists():
-        print(f"Loading cached annotations: {cfg.annotations_path}")
-        annotations = torch.load(cfg.annotations_path, weights_only=True)
-    else:
-        if cfg.use_local_annotator:
-            # v2: Decomposed single-feature single-token with local model
-            leaf_annotations = annotate_local(tokens, leaf_features, tokenizer_ref, cfg)
+        cached = torch.load(cfg.annotations_path, weights_only=True)
+        n_cached_features = cached.shape[-1]
+        if cached.shape[:2] == (N_tok, T_tok) and n_cached_features == n_features:
+            print(f"Loading cached annotations: {cfg.annotations_path}")
+            annotations = cached
+            cached_ok = True
+        elif cached.shape[:2] == (N_tok, T_tok) and n_cached_features < n_features:
+            # Catalog grew — incremental annotation of the new tail.
+            n_new = n_features - n_cached_features
+            print(
+                f"Incremental annotation: cached tensor has {n_cached_features} "
+                f"features, catalog has {n_features}. Annotating {n_new} new "
+                f"features and concatenating."
+            )
+            partial_existing = cached
         else:
-            # v1: API-based multi-feature annotation
-            leaf_annotations = annotate_corpus(tokens, leaf_features, tokenizer_ref, cfg)
-        # Map leaf annotations back to full feature tensor
-        N_tok, T_tok = tokens.shape
-        annotations = torch.zeros(N_tok, T_tok, len(features))
-        for li, fi in enumerate(leaf_indices):
-            annotations[:, :, fi] = leaf_annotations[:, :, li]
-        # Propagate group labels (OR of children)
+            print(
+                f"Cached annotations shape {tuple(cached.shape)} incompatible "
+                f"with (N={N_tok}, T={T_tok}, n_features={n_features}). "
+                f"Discarding cache and re-annotating from scratch."
+            )
+
+    if not cached_ok:
+        if partial_existing is not None:
+            # Only annotate the tail of the leaf list that corresponds to new features.
+            # leaf_features/leaf_indices are constructed in catalog order; new
+            # leaves are always appended to the end in the discovery loop.
+            # Figure out which leaves need new annotations: any leaf_idx >=
+            # n_cached_features is new.
+            new_leaf_positions = [
+                (li, fi) for li, fi in enumerate(leaf_indices)
+                if fi >= n_cached_features
+            ]
+            new_leaf_features = [leaf_features[li] for li, _ in new_leaf_positions]
+            print(f"  {len(new_leaf_features)} new leaves to annotate "
+                  f"(out of {len(leaf_features)} total leaves)")
+
+            if new_leaf_features:
+                if cfg.use_local_annotator:
+                    new_leaf_annotations = annotate_local(
+                        tokens, new_leaf_features, tokenizer_ref, cfg,
+                    )
+                else:
+                    new_leaf_annotations = annotate_corpus(
+                        tokens, new_leaf_features, tokenizer_ref, cfg,
+                    )
+            else:
+                new_leaf_annotations = torch.zeros(N_tok, T_tok, 0)
+
+            # Start with cached annotations extended with zeros for new features.
+            annotations = torch.zeros(N_tok, T_tok, n_features)
+            annotations[:, :, :n_cached_features] = partial_existing
+
+            # Write the new leaves into their correct positions.
+            for (li, fi), k in zip(new_leaf_positions, range(len(new_leaf_positions))):
+                annotations[:, :, fi] = new_leaf_annotations[:, :, k]
+        else:
+            # Fresh run: annotate all leaves.
+            if cfg.use_local_annotator:
+                leaf_annotations = annotate_local(tokens, leaf_features, tokenizer_ref, cfg)
+            else:
+                leaf_annotations = annotate_corpus(tokens, leaf_features, tokenizer_ref, cfg)
+            annotations = torch.zeros(N_tok, T_tok, n_features)
+            for li, fi in enumerate(leaf_indices):
+                annotations[:, :, fi] = leaf_annotations[:, :, li]
+
+        # Propagate group labels (OR of children) — done for BOTH fresh and
+        # incremental paths so new groups pick up their children's labels.
         annotations = propagate_group_labels(annotations, features)
 
         # Filter out features with very low positive rate

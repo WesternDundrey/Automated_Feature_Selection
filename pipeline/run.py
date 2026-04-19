@@ -71,9 +71,23 @@ def main():
                  "agreement", "ablation", "residual", "causal", "ioi",
                  "validate-annotator",
                  "splitting", "circuit", "intervention", "amplify",
-                 "weaknesses", "siphoning", "discover"],
+                 "weaknesses", "siphoning", "discover", "discover-loop"],
         help="Run only this step",
     )
+    parser.add_argument("--discover-loop-max-iters", type=int, default=5,
+                        help="Max iterations for --step discover-loop")
+    parser.add_argument("--discover-loop-min-new", type=int, default=3,
+                        help="Terminate discover-loop if a round yields fewer "
+                             "than N novel features after merge (default: 3)")
+    parser.add_argument("--discover-loop-min-delta-r2", type=float, default=0.005,
+                        help="Terminate discover-loop if a round's ΔR² falls "
+                             "below this (default: 0.005)")
+    parser.add_argument("--discover-loop-cos-threshold", type=float, default=0.8,
+                        help="Cosine-dedup threshold for merge (default: 0.8). "
+                             "Candidates above this cosine with an existing "
+                             "target_dir are rejected as rediscoveries.")
+    parser.add_argument("--discover-loop-no-llm-separability", action="store_true",
+                        help="Skip LLM separability gate; rely on cosine only")
     args = parser.parse_args()
 
     # Build config with overrides
@@ -332,6 +346,22 @@ def main():
         from .discover import run as run_discover
         run_discover(cfg)
         print(f"Discovery pipeline completed in {time.time() - t0:.1f}s")
+
+    if args.step == "discover-loop":
+        print("\n" + "=" * 70)
+        print("DISCOVERY LOOP — iterative supervised-SAE catalog growth")
+        print("=" * 70)
+        t0 = time.time()
+        from .discover_loop import run as run_discover_loop
+        run_discover_loop(
+            cfg,
+            max_iters=args.discover_loop_max_iters,
+            min_new_features=args.discover_loop_min_new,
+            min_delta_r2=args.discover_loop_min_delta_r2,
+            cos_threshold=args.discover_loop_cos_threshold,
+            use_llm_separability=not args.discover_loop_no_llm_separability,
+        )
+        print(f"Discovery loop completed in {time.time() - t0:.1f}s")
 
     # Annotator validation on trivial features
     if args.step == "validate-annotator":
