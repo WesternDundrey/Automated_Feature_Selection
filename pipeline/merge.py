@@ -80,32 +80,70 @@ def _sonnet_separability_judgment(
     neighbors_block = "\n".join(
         f"  {i+1}. {d}" for i, d in enumerate(neighbor_descriptions)
     )
+    # This prompt is DELIBERATELY CONSERVATIVE. An overly-permissive prompt
+    # (earlier version accepted "partial overlap is OK") resulted in
+    # 495/500 proposals being judged separable — which means the gate did
+    # no filtering work. The catalog must grow selectively: the default
+    # answer is SAME; only clearly-novel concepts should flip to SEPARABLE.
     prompt = textwrap.dedent(f"""\
-        You are auditing a feature catalog for a supervised sparse autoencoder.
-        A candidate feature has been proposed. Determine whether it represents
-        a GENUINELY DIFFERENT concept from the existing features below, or
-        whether it is a rewording of one of them.
+        You are a strict auditor for a supervised sparse-autoencoder
+        feature catalog. A candidate feature has been proposed. Your job
+        is to determine whether it is MEANINGFULLY NOVEL relative to the
+        existing features, or whether any existing feature already
+        substantially covers it.
 
-        Guidance:
-          • DIFFERENT means the candidate would fire on distinct tokens/contexts
-            than any existing feature — not merely a stylistic rephrasing.
-          • Partial overlap is OK as long as there exist tokens/contexts where
-            the candidate and each existing feature diverge.
-          • If the candidate is a strict subset of an existing feature (e.g.,
-            "British comma" vs "comma"), judge as SAME.
-          • If the candidate is a strict superset, judge as SAME unless the
-            broader form adds meaningful coverage the existing one misses.
+        DEFAULT ANSWER IS "SAME" (separable: false). Flip to SEPARABLE
+        (separable: true) only if you are confident the candidate fires
+        on a substantially different set of tokens than every existing
+        feature — not merely edge cases, not a narrower or broader
+        wording of the same concept.
+
+        Decision rules (apply in order):
+
+        1. Paraphrase test: if the candidate's description can be mapped
+           to an existing description by routine rephrasing — e.g.
+           "comma tokens" vs "the comma punctuation feature" — answer
+           SAME, no exceptions.
+
+        2. Subset test: if the candidate is a strict subset of an
+           existing feature (e.g. "serial comma" vs "comma";
+           "British place name" vs "place name"), answer SAME. Subsets
+           do not warrant their own catalog entry unless you can argue
+           the subset has distinct mechanism.
+
+        3. Superset test: if the candidate is a strict superset of an
+           existing feature (e.g. "punctuation" vs "comma" when "comma"
+           is in the catalog), answer SAME.
+
+        4. Overlap ≥ 70% test: estimate what fraction of positive tokens
+           for the candidate would ALSO be positive for at least one
+           existing feature. If the estimated overlap is ≥ 70%, answer
+           SAME.
+
+        5. Domain test: if the candidate is about text genre, semantic
+           domain, or register, it almost certainly overlaps with an
+           existing semantic_domain.* or text_genre.* feature — answer
+           SAME unless it covers a genre none of the existing ones do.
+
+        6. Surface-feature test: if the candidate is about a common
+           punctuation mark, stop-word, or part-of-speech and any
+           existing feature already covers that surface, answer SAME.
+
+        Only answer SEPARABLE when the candidate clears ALL six tests
+        AND you can name one concrete token context where the candidate
+        fires but no existing feature does.
 
         CANDIDATE feature:
           {proposed_description}
 
-        CLOSEST EXISTING features (by direction cosine):
+        CLOSEST EXISTING features (ranked by direction cosine; #1 is
+        most similar):
         {neighbors_block}
 
         Reply with EXACTLY one JSON object, no other text:
         {{
           "separable": <true or false>,
-          "reason": "<one-sentence justification; cite an existing feature by number if 'same'>"
+          "reason": "<one short sentence. If SAME, cite which existing feature by number and why. If SEPARABLE, describe one concrete token context where candidate fires but no existing feature does.>"
         }}
     """)
 
@@ -201,6 +239,33 @@ def merge_catalogs_by_direction(
     # children), the concept is likely already covered.
     max_cos, argmax = _closest_existing_by_cosine(
         proposed_dirs, existing_target_dirs,
+    )
+
+    # Diagnostic: print distribution of max cosines so we can tell
+    # whether the cosine gate is doing any work. An early bug used
+    # decoder columns (writing directions) against target_dirs (reading
+    # directions), which produced a distribution centered near 0 and
+    # rejected nothing. Encoder rows are the right proxy. The spread
+    # should show some mass at 0.3-0.7 and some at > cos_threshold.
+    _mc = max_cos.cpu().float()
+    print(f"  Max-cosine distribution over {len(_mc)} proposals:")
+    print(
+        f"    min={_mc.min():.3f}  median={_mc.median():.3f}  "
+        f"mean={_mc.mean():.3f}  max={_mc.max():.3f}"
+    )
+    if len(_mc) >= 10:
+        q = torch.quantile(
+            _mc, torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]),
+        )
+        print(
+            f"    quantiles: 10%={q[0]:.3f}  25%={q[1]:.3f}  "
+            f"50%={q[2]:.3f}  75%={q[3]:.3f}  90%={q[4]:.3f}  "
+            f"95%={q[5]:.3f}  99%={q[6]:.3f}"
+        )
+    print(
+        f"    at cos_threshold={cos_threshold}: "
+        f"{int((_mc > cos_threshold).sum())}/{len(_mc)} "
+        f"proposals would be cosine-dropped"
     )
 
     # For LLM separability, pre-compute the top-k nearest neighbors per proposal.

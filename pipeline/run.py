@@ -82,10 +82,13 @@ def main():
     parser.add_argument("--discover-loop-min-delta-r2", type=float, default=0.005,
                         help="Terminate discover-loop if a round's ΔR² falls "
                              "below this (default: 0.005)")
-    parser.add_argument("--discover-loop-cos-threshold", type=float, default=0.8,
-                        help="Cosine-dedup threshold for merge (default: 0.8). "
+    parser.add_argument("--discover-loop-cos-threshold", type=float, default=0.6,
+                        help="Cosine-dedup threshold for merge (default: 0.6). "
                              "Candidates above this cosine with an existing "
-                             "target_dir are rejected as rediscoveries.")
+                             "target_dir are rejected as rediscoveries. "
+                             "0.6 is calibrated for encoder-row vs target_dir "
+                             "comparison in d_model=768 space; raise to 0.7-0.8 "
+                             "if the loop rejects too aggressively.")
     parser.add_argument("--discover-loop-no-llm-separability", action="store_true",
                         help="Skip LLM separability gate; rely on cosine only")
     args = parser.parse_args()

@@ -152,14 +152,33 @@ def _propose_via_unsup_sae(cfg: Config, iter_dir: Path):
         descriptions = explain_features(top_acts, tokenizer_ref, cfg)
         desc_path.write_text(json.dumps(descriptions, indent=2))
 
-    # Build proposal list: (feature dict, direction proxy)
+    # Direction proxy for merge-time dedup:
+    #
+    # The supervised target_dir is a READING direction:
+    #   target_dir_i = normalize(mean(x | label_i = 1) - mean(x))
+    # It points along the mean-shift from negative to positive examples.
+    #
+    # For the unsup SAE, the ENCODER row plays the same role:
+    #   enc_row_i  =  the linear direction that excites latent i when
+    #                 dot-producted with x. Latent i fires high when x
+    #                 has large projection onto enc_row_i, i.e. it's a
+    #                 reading direction in activation space.
+    #
+    # The DECODER column is a WRITING direction (where the latent
+    # contributes during reconstruction). Encoder row is the right
+    # analog to target_dir for dedup.
+    #
+    # An earlier version used decoder columns and got cosine_dropped=0
+    # even on clearly redundant unsup latents, because writing and
+    # reading directions can be ~orthogonal for the same concept.
     proposal_features = []
     proposal_dirs_list = []
     for latent_idx_str, desc in sorted(descriptions.items(), key=lambda kv: int(kv[0])):
         latent_idx = int(latent_idx_str)
-        # nn.Linear(d_sae, d_model): weight is (d_model, d_sae); column is (d_model,)
-        dec_col = sae.decoder.weight[:, latent_idx].detach().float()
-        proposal_dirs_list.append(dec_col)
+        # nn.Linear(d_model, d_sae): weight shape (d_sae, d_model);
+        # row latent_idx is the reading direction for that latent.
+        enc_row = sae.encoder.weight[latent_idx, :].detach().float()
+        proposal_dirs_list.append(enc_row)
         proposal_features.append({
             "id": f"discovered.unsup_{latent_idx}",
             "description": desc,
