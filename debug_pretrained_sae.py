@@ -1,13 +1,7 @@
 """Diagnostic — find the activation-extraction path that gpt2-small-res-jb wants.
 
-The pretrained SAE baseline reconstructs at R² = -20000 no matter what we do
-inside the SAE wrapper. The supervised SAE trained on the SAME cached
-activations reconstructs at R² = 0.988. So the activations aren't garbage —
-they're just in a different space than the pretrained SAE expects.
-
-This script runs the pretrained SAE against activations extracted four
-different ways and prints the R² for each. Whichever one gives R² > 0.5 is
-the right path; we hardcode that in the pipeline.
+Writes no assumptions about sae_lens API — inspects what's actually on the
+SAE object and uses string fallbacks where attributes aren't there.
 
 Usage (on vast.ai):
     cd /workspace/Automated_Feature_Selection
@@ -17,109 +11,160 @@ Usage (on vast.ai):
 import torch
 import torch.nn.functional as F
 
+HOOK_NAME = "blocks.6.hook_resid_pre"  # hardcoded — we know what it is for this SAE
+SAE_RELEASE = "gpt2-small-res-jb"
+SAE_ID = "blocks.6.hook_resid_pre"
+
 print("=" * 64)
-print("DIAGNOSTIC: pretrained SAE reconstruction on gpt2-small-res-jb")
+print("DIAGNOSTIC: pretrained SAE on gpt2-small-res-jb")
 print("=" * 64)
 
-# ── Load SAE ─────────────────────────────────────────────────────────
+# ── Load SAE — try new API first, fall back to old ───────────────────
 from sae_lens import SAE
-sae, cfg_dict, _ = SAE.from_pretrained(
-    release="gpt2-small-res-jb",
-    sae_id="blocks.6.hook_resid_pre",
-    device="cuda",
-)
+
+cfg_dict = None
+sparsity = None
+try:
+    # New API (sae_lens >= 4.0 or so)
+    sae, cfg_dict, sparsity = SAE.from_pretrained_with_cfg_and_sparsity(
+        release=SAE_RELEASE, sae_id=SAE_ID, device="cuda",
+    )
+    print("\nLoaded via: from_pretrained_with_cfg_and_sparsity (new API)")
+except (AttributeError, TypeError):
+    # Old API — still works, just deprecated
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = SAE.from_pretrained(
+            release=SAE_RELEASE, sae_id=SAE_ID, device="cuda",
+        )
+    if isinstance(result, tuple):
+        sae = result[0]
+        cfg_dict = result[1] if len(result) > 1 else {}
+        sparsity = result[2] if len(result) > 2 else None
+        print("\nLoaded via: from_pretrained (old tuple-unpacking API)")
+    else:
+        sae = result
+        cfg_dict = {}
+        print("\nLoaded via: from_pretrained (new-API-but-single-return)")
+
 sae.eval()
 
-print(f"\nSAE cfg:")
-print(f"  hook_name: {sae.cfg.hook_name}")
-print(f"  apply_b_dec_to_input: {sae.cfg.apply_b_dec_to_input}")
-print(f"  normalize_activations: {getattr(sae.cfg, 'normalize_activations', '(unset)')}")
-print(f"  activation_fn_str: {getattr(sae.cfg, 'activation_fn_str', '(unset)')}")
-print(f"  finetuning_scaling_factor: {getattr(sae.cfg, 'finetuning_scaling_factor', '(unset)')}")
-print(f"  dtype: {sae.cfg.dtype}")
+# ── Dump cfg attributes so we can see what's actually there ──────────
+print("\nsae type:", type(sae).__name__)
+cfg = getattr(sae, "cfg", None)
+print("sae.cfg type:", type(cfg).__name__ if cfg is not None else "(none)")
+if cfg is not None:
+    print("sae.cfg public attributes:")
+    for attr in sorted(dir(cfg)):
+        if attr.startswith("_"):
+            continue
+        try:
+            val = getattr(cfg, attr)
+            if callable(val):
+                continue
+            sval = repr(val)
+            if len(sval) > 100:
+                sval = sval[:97] + "..."
+            print(f"  {attr} = {sval}")
+        except Exception as e:
+            print(f"  {attr} = <error: {e}>")
 
-mfpk = cfg_dict.get("model_from_pretrained_kwargs") or {}
-print(f"\nmodel_from_pretrained_kwargs: {mfpk}")
-
-# Check for scaling_factor buffer (stored as part of normalize_activations)
+# ── Dump any buffers (scaling_factor, activation_norm, etc.) ─────────
+print("\nsae.named_buffers():")
+had_buffers = False
 for name, buf in sae.named_buffers():
-    print(f"  buffer: {name}  shape={tuple(buf.shape)}  "
-          f"mean={buf.float().mean().item():.4g}  norm={buf.float().norm().item():.4g}")
+    had_buffers = True
+    print(f"  {name:<40}  shape={tuple(buf.shape)}  "
+          f"mean={buf.float().mean().item():.4g}  "
+          f"norm={buf.float().norm().item():.4g}")
+if not had_buffers:
+    print("  (no buffers — nothing to scale)")
+
+print(f"\nhook used for extraction: {HOOK_NAME}")
+
+mfpk = (cfg_dict or {}).get("model_from_pretrained_kwargs", {}) if isinstance(cfg_dict, dict) else {}
+print(f"model_from_pretrained_kwargs (from cfg_dict): {mfpk}")
 
 
-# ── Helper: measure R² of sae(x) ─────────────────────────────────────
+# ── Helper: measure R² of sae(x) and sae.encode/decode ───────────────
 def measure(x, label):
     x = x.to("cuda").float()
+    base = F.mse_loss(x.mean(0, keepdim=True).expand_as(x), x).item()
+    print(f"  {label}")
+    print(f"    x_norm={x.norm(dim=-1).mean().item():.2f}  "
+          f"baseline_mse={base:.2f}")
     with torch.no_grad():
         try:
-            recon_full = sae(x)
+            recon = sae(x)
+            mse = F.mse_loss(recon, x).item()
+            r2 = 1 - mse / max(base, 1e-9)
+            print(f"    sae(x):            R²={r2:+.4f}  MSE={mse:.2f}  "
+                  f"recon_norm={recon.norm(dim=-1).mean().item():.2f}")
         except Exception as e:
-            print(f"  {label}: sae(x) failed ({e})")
-            recon_full = None
+            print(f"    sae(x) FAILED: {type(e).__name__}: {e}")
         try:
             z = sae.encode(x)
-            recon_split = sae.decode(z)
+            recon = sae.decode(z)
+            mse = F.mse_loss(recon, x).item()
+            r2 = 1 - mse / max(base, 1e-9)
+            print(f"    decode(encode(x)): R²={r2:+.4f}  MSE={mse:.2f}  "
+                  f"recon_norm={recon.norm(dim=-1).mean().item():.2f}")
         except Exception as e:
-            print(f"  {label}: encode+decode failed ({e})")
-            recon_split = None
-
-    base = F.mse_loss(x.mean(0, keepdim=True).expand_as(x), x).item()
-    x_norm = x.norm(dim=-1).mean().item()
-    print(f"  {label}")
-    print(f"    x_norm={x_norm:.2f}  baseline_mse={base:.2f}")
-
-    if recon_full is not None:
-        mse_f = F.mse_loss(recon_full, x).item()
-        r2_f = 1 - mse_f / max(base, 1e-9)
-        r_norm_f = recon_full.norm(dim=-1).mean().item()
-        print(f"    sae(x):          R²={r2_f:+.4f}  MSE={mse_f:.2f}  recon_norm={r_norm_f:.2f}")
-    if recon_split is not None:
-        mse_s = F.mse_loss(recon_split, x).item()
-        r2_s = 1 - mse_s / max(base, 1e-9)
-        r_norm_s = recon_split.norm(dim=-1).mean().item()
-        print(f"    decode(encode(x)): R²={r2_s:+.4f}  MSE={mse_s:.2f}  recon_norm={r_norm_s:.2f}")
+            print(f"    encode+decode FAILED: {type(e).__name__}: {e}")
 
 
-# ── Reference text for all tests ─────────────────────────────────────
-sample_text = "The quick brown fox jumps over the lazy dog. " * 10
-hook = sae.cfg.hook_name
-
-# ── Test 1: HookedTransformer.from_pretrained_no_processing with SAE kwargs
+# ── Test 1: from_pretrained_no_processing + SAE kwargs (current pipeline)
 print("\n" + "=" * 64)
 print("Test 1: HookedTransformer.from_pretrained_no_processing + SAE kwargs")
 print("        (what the pipeline currently does)")
 print("=" * 64)
 from transformer_lens import HookedTransformer
-m = HookedTransformer.from_pretrained_no_processing(
-    "gpt2", device="cuda", **mfpk,
-).eval()
-tokens = m.to_tokens(sample_text)
-_, cache = m.run_with_cache(tokens, names_filter=[hook])
-x = cache[hook].reshape(-1, cache[hook].shape[-1])
-measure(x, "activations from Test 1")
-del m, cache
+sample_text = "The quick brown fox jumps over the lazy dog. " * 10
+try:
+    m = HookedTransformer.from_pretrained_no_processing(
+        "gpt2", device="cuda", **mfpk,
+    ).eval()
+    tokens = m.to_tokens(sample_text)
+    _, cache = m.run_with_cache(tokens, names_filter=[HOOK_NAME])
+    x = cache[HOOK_NAME].reshape(-1, cache[HOOK_NAME].shape[-1])
+    measure(x, "Test 1 activations")
+    del m, cache
+    torch.cuda.empty_cache()
+except Exception as e:
+    print(f"  Test 1 failed to load: {type(e).__name__}: {e}")
 
-# ── Test 2: HookedTransformer.from_pretrained_no_processing WITHOUT kwargs
+# ── Test 2: from_pretrained_no_processing WITHOUT kwargs ─────────────
 print("\n" + "=" * 64)
 print("Test 2: HookedTransformer.from_pretrained_no_processing (no kwargs)")
 print("=" * 64)
-m = HookedTransformer.from_pretrained_no_processing("gpt2", device="cuda").eval()
-_, cache = m.run_with_cache(tokens, names_filter=[hook])
-x = cache[hook].reshape(-1, cache[hook].shape[-1])
-measure(x, "activations from Test 2")
-del m, cache
+try:
+    m = HookedTransformer.from_pretrained_no_processing("gpt2", device="cuda").eval()
+    tokens = m.to_tokens(sample_text)
+    _, cache = m.run_with_cache(tokens, names_filter=[HOOK_NAME])
+    x = cache[HOOK_NAME].reshape(-1, cache[HOOK_NAME].shape[-1])
+    measure(x, "Test 2 activations")
+    del m, cache
+    torch.cuda.empty_cache()
+except Exception as e:
+    print(f"  Test 2 failed: {type(e).__name__}: {e}")
 
-# ── Test 3: HookedTransformer.from_pretrained (STANDARD path) ────────
+# ── Test 3: standard from_pretrained (with LN folding etc.) ──────────
 print("\n" + "=" * 64)
-print("Test 3: HookedTransformer.from_pretrained (standard, with LN folding)")
+print("Test 3: HookedTransformer.from_pretrained (standard)")
 print("=" * 64)
-m = HookedTransformer.from_pretrained("gpt2", device="cuda").eval()
-_, cache = m.run_with_cache(tokens, names_filter=[hook])
-x = cache[hook].reshape(-1, cache[hook].shape[-1])
-measure(x, "activations from Test 3")
-del m, cache
+try:
+    m = HookedTransformer.from_pretrained("gpt2", device="cuda").eval()
+    tokens = m.to_tokens(sample_text)
+    _, cache = m.run_with_cache(tokens, names_filter=[HOOK_NAME])
+    x = cache[HOOK_NAME].reshape(-1, cache[HOOK_NAME].shape[-1])
+    measure(x, "Test 3 activations")
+    del m, cache
+    torch.cuda.empty_cache()
+except Exception as e:
+    print(f"  Test 3 failed: {type(e).__name__}: {e}")
 
-# ── Test 4: Cached activations from pipeline_data/ ───────────────────
+# ── Test 4: cached activations from pipeline ─────────────────────────
 print("\n" + "=" * 64)
 print("Test 4: cached pipeline_data/activations.pt (first 4 sequences)")
 print("=" * 64)
@@ -131,15 +176,13 @@ try:
     print(f"  cached shape: {tuple(acts.shape)}, sampled: {tuple(x.shape)}")
     measure(x, "cached activations")
 except FileNotFoundError:
-    print("  pipeline_data/activations.pt not found (run step annotate first)")
+    print("  pipeline_data/activations.pt not found (run annotate first)")
+except Exception as e:
+    print(f"  Test 4 failed: {type(e).__name__}: {e}")
 
 print("\n" + "=" * 64)
-print("INTERPRETATION")
+print("READ THE RESULTS")
 print("=" * 64)
-print(
-    "Whichever test above gives R² > 0.5 is the extraction path that matches\n"
-    "this SAE's training distribution. If Test 1 (our current path) is bad but\n"
-    "another is good, we change load_target_model to match. If ALL paths are\n"
-    "bad, the SAE expects dataset-wide normalization we're not applying and\n"
-    "we need to look for a buffer/scaling_factor on the SAE object.\n"
-)
+print("Whichever test gives R² > 0.5 is the correct extraction path.")
+print("If all tests show recon_norm >> x_norm (5x+), the SAE expects a")
+print("dataset-wide scaling we're missing — look at named_buffers above.")
