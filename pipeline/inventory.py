@@ -63,22 +63,37 @@ def _extract_json_object(text: str) -> dict | None:
 class PretrainedSAE:
     """Thin wrapper for a pretrained SAE with JumpReLU or ReLU activation.
 
-    Follows the GemmaScope convention (matching agentic-delphi JumpReluSae):
-        encode: z = JumpReLU_theta(x @ W_enc + b_enc)
+    Follows two conventions depending on training source:
+
+      GemmaScope (apply_b_dec_to_input=False, default):
+        encode: z = JumpReLU_theta(x @ W_enc + b_enc)        (no b_dec in enc)
         decode: x_hat = z @ W_dec + b_dec
+
+      Joseph-Bloom / sae_lens (apply_b_dec_to_input=True):
+        encode: z = ReLU((x - b_dec) @ W_enc + b_enc)        (b_dec subtracted)
+        decode: x_hat = z @ W_dec + b_dec
+
+    The difference is whether `b_dec` is subtracted from the input before
+    encoding. `gpt2-small-res-jb` (and most sae_lens-native SAEs) require
+    `apply_b_dec_to_input=True`; GemmaScope npz releases require False.
+    Getting this wrong produces R² orders of magnitude off baseline.
     """
 
-    def __init__(self, W_enc, W_dec, b_enc, b_dec, threshold=None):
+    def __init__(self, W_enc, W_dec, b_enc, b_dec, threshold=None,
+                 apply_b_dec_to_input=False):
         self.W_enc = W_enc        # (d_model, d_sae)
         self.W_dec = W_dec        # (d_sae, d_model)
         self.b_enc = b_enc        # (d_sae,)
         self.b_dec = b_dec        # (d_model,)
         self.threshold = threshold  # (d_sae,) for JumpReLU, None for ReLU
+        self.apply_b_dec_to_input = apply_b_dec_to_input
         self.d_model = W_enc.shape[0]
         self.d_sae = W_enc.shape[1]
 
     def encode(self, x):
         """x: (..., d_model) -> (..., d_sae)"""
+        if self.apply_b_dec_to_input:
+            x = x - self.b_dec
         z = x @ self.W_enc + self.b_enc
         if self.threshold is not None:
             mask = z > self.threshold
@@ -155,14 +170,30 @@ def _load_sae_sae_lens(cfg: Config) -> tuple[PretrainedSAE, torch.Tensor | None]
     W_enc = sae.W_enc.data.clone()    # already (d_model, d_sae) in sae_lens
     W_dec = sae.W_dec.data.clone()    # already (d_sae, d_model) in sae_lens
 
+    # Read apply_b_dec_to_input from the SAE's config. This flag governs
+    # whether the encoder subtracts b_dec from the input before projection.
+    # gpt2-small-res-jb and most sae_lens-native SAEs set it to True; the
+    # GemmaScope npz path keeps it False. Getting this wrong produces
+    # R²=-O(10^4) on reconstruction (seen in the previous run).
+    apply_b_dec_to_input = False
+    cfg_obj = getattr(sae, "cfg", None)
+    if cfg_obj is not None:
+        apply_b_dec_to_input = bool(
+            getattr(cfg_obj, "apply_b_dec_to_input", False)
+        )
+    elif isinstance(cfg_dict, dict):
+        apply_b_dec_to_input = bool(cfg_dict.get("apply_b_dec_to_input", False))
+
     wrapped = PretrainedSAE(
         W_enc=W_enc,
         W_dec=W_dec,
         b_enc=sae.b_enc.data.clone(),
         b_dec=sae.b_dec.data.clone(),
         threshold=threshold,
+        apply_b_dec_to_input=apply_b_dec_to_input,
     )
-    print(f"  SAE: d_model={wrapped.d_model}, d_sae={wrapped.d_sae}")
+    print(f"  SAE: d_model={wrapped.d_model}, d_sae={wrapped.d_sae}"
+          f"  apply_b_dec_to_input={apply_b_dec_to_input}")
     if sparsity is not None:
         print(f"  Sparsity info available ({sparsity.shape})")
     return wrapped, sparsity

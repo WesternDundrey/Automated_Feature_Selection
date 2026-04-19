@@ -47,19 +47,103 @@ TARGET_FEATURE_HINTS = [
 ]
 
 
-def _find_targets(features, annotations, target_count=5, min_pos=30):
+def _find_targets(features, annotations, cfg=None, target_count=10, min_pos=30):
+    """Select features to sweep.
+
+    Selection strategy (Pattern B-aware):
+      1. Read causal.json if available. Include a "weak-ablation" cohort
+         (0.005 < mean_kl < 0.1) AND a "strong" cohort (mean_kl >= 0.1).
+         Weak cohort tests whether amplification REVEALS causality that
+         ablation misses (Pattern B from summary6). Strong cohort tests
+         whether targeting holds at high multipliers.
+      2. Legacy hint matching for backward compatibility on catalogs that
+         use the summary4/5/6 feature IDs (section_header, etc.).
+      3. Fallback: top-k by positive count (what the pre-fix version did).
+
+    This guarantees the sweep includes candidates where Pattern B can
+    appear, not just high-fire features whose ablation is already strong.
+    """
     matched = []
     used = set()
-    for hint in TARGET_FEATURE_HINTS:
-        for idx, feat in enumerate(features):
-            if feat.get("type") == "group" or idx in used:
-                continue
-            if hint in feat["id"]:
-                matched.append((idx, feat["id"]))
-                used.add(idx)
-                break
 
-    if len(matched) < max(3, target_count // 2) and annotations is not None:
+    # ── Cohort 1: causal.json weak + strong bands ─────────────────────
+    if cfg is not None and getattr(cfg, "causal_path", None) is not None:
+        try:
+            from pathlib import Path
+            causal_path = Path(cfg.causal_path)
+            if causal_path.exists():
+                causal = json.loads(causal_path.read_text())
+                feat_block = causal.get("feature_necessity") or causal
+                kl_by_id = {
+                    e["id"]: e.get("mean_kl")
+                    for e in feat_block.get("features", [])
+                    if e.get("mean_kl") is not None
+                }
+
+                # Build per-feature lookup
+                pos_counts = None
+                if annotations is not None:
+                    pos_counts = annotations.reshape(
+                        -1, annotations.shape[-1]
+                    ).sum(dim=0)
+
+                # Split into weak (Pattern B candidates) and strong cohorts.
+                # Weak cohort is critical — without it, Pattern B cannot appear.
+                weak, strong = [], []
+                for idx, feat in enumerate(features):
+                    if feat.get("type") == "group":
+                        continue
+                    kl = kl_by_id.get(feat["id"])
+                    if kl is None:
+                        continue
+                    n_pos = (int(pos_counts[idx].item())
+                             if pos_counts is not None and idx < len(pos_counts)
+                             else 0)
+                    if n_pos < min_pos:
+                        continue
+                    if 0.005 <= kl < 0.1:
+                        weak.append((idx, feat["id"], kl))
+                    elif kl >= 0.1:
+                        strong.append((idx, feat["id"], kl))
+
+                # Take half from each band (sorted to spread the range)
+                weak.sort(key=lambda t: t[2])       # low→high
+                strong.sort(key=lambda t: -t[2])    # high→low
+                n_each = max(1, target_count // 2)
+                for idx, fid, _ in weak[:n_each]:
+                    if idx not in used:
+                        matched.append((idx, fid))
+                        used.add(idx)
+                for idx, fid, _ in strong[:target_count - len(matched)]:
+                    if idx not in used:
+                        matched.append((idx, fid))
+                        used.add(idx)
+                if matched:
+                    n_weak = sum(
+                        1 for idx, _ in matched if idx in {i for i, _, _ in weak}
+                    )
+                    n_strong = len(matched) - n_weak
+                    print(f"  Selection from causal.json: "
+                          f"{n_weak} weak-ablation (Pattern B candidates) + "
+                          f"{n_strong} strong cohort")
+        except Exception as e:
+            print(f"  [warn] Could not load causal.json for selection: {e}")
+
+    # ── Cohort 2: legacy hint matching ────────────────────────────────
+    if len(matched) < target_count:
+        for hint in TARGET_FEATURE_HINTS:
+            if len(matched) >= target_count:
+                break
+            for idx, feat in enumerate(features):
+                if feat.get("type") == "group" or idx in used:
+                    continue
+                if hint in feat["id"]:
+                    matched.append((idx, feat["id"]))
+                    used.add(idx)
+                    break
+
+    # ── Cohort 3: fallback top-k by positive count ────────────────────
+    if len(matched) < target_count and annotations is not None:
         pos_counts = annotations.reshape(-1, annotations.shape[-1]).sum(dim=0)
         leaves = [
             i for i, f in enumerate(features)
@@ -152,7 +236,7 @@ def run(cfg: Config = None):
     catalog = json.loads(cfg.catalog_path.read_text())
     features = catalog["features"]
 
-    targets = _find_targets(features, annotations)
+    targets = _find_targets(features, annotations, cfg=cfg)
     if not targets:
         print("ERROR: no target features found.")
         return

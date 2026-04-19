@@ -473,7 +473,15 @@ def test_feature_necessity(model, sae, cfg):
             # log_softmax→KL computation produces NaN for Gemma (bf16 model).
             recon_logprobs.append(F.log_softmax(logits[0].float().cpu(), dim=-1))
 
-    # Per-feature ablation
+    # Per-feature ablation — compute KL at BOTH active (positive) and
+    # matched-random negative positions to get a specificity/targeting ratio.
+    # A feature with high KL_pos but also high KL_neg is spraying off-target
+    # (not causally specific). A true causal feature has KL_pos >> KL_neg.
+    # Seeded RNG for reproducible negative sampling.
+    import numpy as np
+    rng = np.random.RandomState(cfg.seed)
+    T = tokens_sub.shape[1]
+
     results = []
 
     for k in tqdm(range(n_sup), desc="  Feature ablation"):
@@ -486,62 +494,126 @@ def test_feature_necessity(model, sae, cfg):
                 "id": feat["id"], "type": feat["type"],
                 "n_active": n_active,
                 "mean_kl": None, "pred_change_rate": None,
+                "mean_kl_neg": None, "targeting_ratio": None,
             })
             continue
 
+        # Match n_active random negative positions (positions where the
+        # feature does NOT fire). Same ablation hook; positions differ.
+        neg_mask_flat = (~active_mask).reshape(-1).numpy()
+        neg_flat = np.where(neg_mask_flat)[0]
+        n_neg = min(n_active, len(neg_flat))
+        chosen = rng.choice(neg_flat, size=n_neg, replace=False) if n_neg > 0 else []
+        neg_mask = torch.zeros_like(active_mask)
+        for i in chosen:
+            neg_mask[int(i) // T, int(i) % T] = True
+
         ablate_hook = _make_ablate_hook(sae, k)
 
-        kl_sum = 0.0
+        kl_pos_sum = 0.0
+        kl_neg_sum = 0.0
         pred_changes = 0
-        total = 0
+        total_pos = 0
+        total_neg = 0
 
         with torch.no_grad():
             for i in range(n_seqs):
-                if not active_mask[i].any():
+                has_pos = active_mask[i].any()
+                has_neg = neg_mask[i].any()
+                if not has_pos and not has_neg:
                     continue
                 toks = tokens_sub[i : i + 1].to(cfg.device)
                 abl_logits = model.run_with_hooks(
                     toks, fwd_hooks=[(cfg.hook_point, ablate_hook)]
                 )
 
-                active_pos = active_mask[i].nonzero(as_tuple=True)[0]
-                base_lp = recon_logprobs[i][active_pos]
-                abl_lp = F.log_softmax(abl_logits[0, active_pos].float().cpu(), dim=-1)
+                if has_pos:
+                    pos = active_mask[i].nonzero(as_tuple=True)[0]
+                    base_lp = recon_logprobs[i][pos]
+                    abl_lp = F.log_softmax(
+                        abl_logits[0, pos].float().cpu(), dim=-1,
+                    )
+                    kl = (base_lp.exp() * (base_lp - abl_lp)).sum(dim=-1)
+                    kl_pos_sum += kl.clamp(min=0).sum().item()
+                    pred_changes += (
+                        base_lp.argmax(-1) != abl_lp.argmax(-1)
+                    ).sum().item()
+                    total_pos += len(pos)
 
-                kl = (base_lp.exp() * (base_lp - abl_lp)).sum(dim=-1)
-                kl_sum += kl.clamp(min=0).sum().item()
+                if has_neg:
+                    neg = neg_mask[i].nonzero(as_tuple=True)[0]
+                    base_lp = recon_logprobs[i][neg]
+                    abl_lp = F.log_softmax(
+                        abl_logits[0, neg].float().cpu(), dim=-1,
+                    )
+                    kl = (base_lp.exp() * (base_lp - abl_lp)).sum(dim=-1)
+                    kl_neg_sum += kl.clamp(min=0).sum().item()
+                    total_neg += len(neg)
 
-                pred_changes += (base_lp.argmax(-1) != abl_lp.argmax(-1)).sum().item()
-                total += len(active_pos)
-
-        mean_kl = kl_sum / total if total > 0 else 0
-        change_rate = pred_changes / total if total > 0 else 0
+        mean_kl = kl_pos_sum / total_pos if total_pos > 0 else 0.0
+        mean_kl_neg = kl_neg_sum / total_neg if total_neg > 0 else 0.0
+        change_rate = pred_changes / total_pos if total_pos > 0 else 0.0
+        # Targeting ratio: KL_pos / KL_neg. A causally-specific feature has
+        # high ratio (> 3×). Low ratio (~1×) means the ablation effect is
+        # non-specific — the feature direction isn't really what drives the
+        # model's behavior at active positions. This is the per-feature
+        # cleanness score (analogous to intervention_precision.json's
+        # targeting_ratio but computed for EVERY feature, not just 5).
+        eps = 1e-9
+        targeting_ratio = (mean_kl / max(mean_kl_neg, eps)
+                           if mean_kl_neg > eps else None)
 
         results.append({
             "id": feat["id"], "type": feat["type"],
             "n_active": n_active,
+            "n_neg_sampled": total_neg,
             "mean_kl": round(mean_kl, 6),
+            "mean_kl_neg": round(mean_kl_neg, 6),
+            "targeting_ratio": (round(targeting_ratio, 3)
+                                if targeting_ratio is not None else None),
             "pred_change_rate": round(change_rate, 4),
         })
 
-    # Print sorted by causal impact
-    print(f"\n  {'Feature':<30} {'KL':>8} {'dPred':>7} {'Active':>7}")
-    print("  " + "-" * 55)
+    # Print sorted by causal impact, with targeting ratio visible.
+    print(f"\n  {'Feature':<30} {'KL_pos':>8} {'KL_neg':>8} "
+          f"{'ratio':>7} {'dPred':>7} {'Active':>7}")
+    print("  " + "-" * 72)
     for r in sorted(results, key=lambda x: -(x["mean_kl"] or 0)):
         if r["mean_kl"] is None:
-            print(f"  {r['id']:<30} {'--':>8} {'--':>7} {r['n_active']:>7}")
+            print(f"  {r['id']:<30} {'--':>8} {'--':>8} {'--':>7} "
+                  f"{'--':>7} {r['n_active']:>7}")
             continue
         tag = " [G]" if r["type"] == "group" else ""
-        print(f"  {r['id']:<30} {r['mean_kl']:>8.4f} {r['pred_change_rate']:>7.3f} "
+        ratio_str = (f"{r['targeting_ratio']:7.2f}"
+                     if r["targeting_ratio"] is not None else "    n/a")
+        print(f"  {r['id']:<30} {r['mean_kl']:>8.4f} {r['mean_kl_neg']:>8.4f} "
+              f"{ratio_str} {r['pred_change_rate']:>7.3f} "
               f"{r['n_active']:>7}{tag}")
 
     valid = [r for r in results if r["mean_kl"] is not None]
     if valid:
         mean_kl = sum(r["mean_kl"] for r in valid) / len(valid)
+        mean_kl_neg = sum(r["mean_kl_neg"] for r in valid) / len(valid)
         mean_change = sum(r["pred_change_rate"] for r in valid) / len(valid)
         n_causal = sum(1 for r in valid if r["mean_kl"] > 0.01)
-        print(f"\n  Mean KL: {mean_kl:.4f}  |  Mean pred change: {mean_change:.3f}")
-        print(f"  Features with KL > 0.01 (causally active): {n_causal}/{len(valid)}")
+        # A feature passes the "causally specific" bar if it has KL > 0.01
+        # AND targeting ratio > 3 (effect at positives is 3×+ stronger than
+        # at negatives). This is the tight causal claim.
+        n_specific = sum(
+            1 for r in valid
+            if r["mean_kl"] > 0.01
+            and (r["targeting_ratio"] or 0) > 3.0
+        )
+        ratios = [r["targeting_ratio"] for r in valid
+                  if r["targeting_ratio"] is not None]
+        median_ratio = (sorted(ratios)[len(ratios) // 2]
+                        if ratios else float("nan"))
+        print(f"\n  Mean KL_pos: {mean_kl:.4f}  |  Mean KL_neg: {mean_kl_neg:.4f}"
+              f"  |  Median targeting ratio: {median_ratio:.2f}")
+        print(f"  Mean pred change: {mean_change:.3f}")
+        print(f"  Causally active (KL>0.01): {n_causal}/{len(valid)}")
+        print(f"  Causally specific (KL>0.01 AND ratio>3): "
+              f"{n_specific}/{len(valid)}")
 
     return {"features": results}
 
