@@ -217,9 +217,10 @@ def run(
 
     from .merge import merge_catalogs_by_direction
     # Deferred imports for the round loop — avoid cold-load when not needed.
+    # Note: evaluate.py exposes its entry point as `evaluate`, not `run`.
     from .annotate import run as run_annotate
     from .train import run as run_train
-    from .evaluate import run as run_evaluate
+    from .evaluate import evaluate as run_evaluate
 
     for iter_idx in range(max_iters):
         iter_dir = loop_dir / f"round_{iter_idx:02d}"
