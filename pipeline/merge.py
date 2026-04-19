@@ -165,16 +165,25 @@ def merge_catalogs_by_direction(
         dropped: list of {id, description, reason, max_cos,
                          closest_existing_id, ...} for audit.
     """
-    # Identify existing leaf features in catalog order (target_dirs align to these).
+    # target_dirs has one row per supervised feature in catalog order —
+    # BOTH leaves AND groups (train.py computes a target_dir per feature
+    # column, regardless of type). Shape must match total features count.
     existing_features = existing_catalog["features"]
-    existing_leaves = [f for f in existing_features if f.get("type") == "leaf"]
-    n_existing_leaves = len(existing_leaves)
+    n_existing_features = len(existing_features)
+    n_existing_leaves = sum(
+        1 for f in existing_features if f.get("type") == "leaf"
+    )
+    n_existing_groups = sum(
+        1 for f in existing_features if f.get("type") == "group"
+    )
 
-    if n_existing_leaves != existing_target_dirs.shape[0]:
+    if n_existing_features != existing_target_dirs.shape[0]:
         raise ValueError(
             f"existing_target_dirs has {existing_target_dirs.shape[0]} rows but "
-            f"existing_catalog has {n_existing_leaves} leaves — mismatch. Ensure "
-            f"target_dirs was computed on this exact catalog."
+            f"existing_catalog has {n_existing_features} features "
+            f"({n_existing_leaves} leaves + {n_existing_groups} groups). "
+            f"target_dirs is expected to have one row per feature in catalog "
+            f"order (leaves AND groups), matching train.compute_target_directions."
         )
 
     if len(proposed_features) != proposed_dirs.shape[0]:
@@ -186,15 +195,20 @@ def merge_catalogs_by_direction(
     # Existing feature IDs for downstream conflict checks.
     existing_ids = {f["id"] for f in existing_features}
 
-    # Cosine-based dedup: for each proposal, find nearest existing leaf.
-    max_cos, argmax = _closest_existing_by_cosine(proposed_dirs, existing_target_dirs)
+    # Cosine-based dedup: for each proposal, find nearest existing feature
+    # (may be a leaf OR a group). Comparing against groups is still
+    # meaningful — if a proposal's direction matches a group (an OR of
+    # children), the concept is likely already covered.
+    max_cos, argmax = _closest_existing_by_cosine(
+        proposed_dirs, existing_target_dirs,
+    )
 
     # For LLM separability, pre-compute the top-k nearest neighbors per proposal.
     if use_llm_separability:
         p = _normalize_dirs(proposed_dirs)
         e = _normalize_dirs(existing_target_dirs)
-        sim = p @ e.T                               # (n_prop, n_existing_leaves)
-        topk = min(n_neighbors_for_llm, n_existing_leaves)
+        sim = p @ e.T                               # (n_prop, n_existing_features)
+        topk = min(n_neighbors_for_llm, n_existing_features)
         _, neighbors_idx = sim.topk(topk, dim=1)    # (n_prop, topk)
     else:
         neighbors_idx = None
@@ -205,7 +219,7 @@ def merge_catalogs_by_direction(
     for i, feat in enumerate(proposed_features):
         cos_i = float(max_cos[i].item())
         close_idx = int(argmax[i].item())
-        close_leaf = existing_leaves[close_idx]
+        close_feat = existing_features[close_idx]
 
         # Gate 1: cosine dedup
         if cos_i > cos_threshold:
@@ -213,7 +227,8 @@ def merge_catalogs_by_direction(
                 "id": feat.get("id", f"proposal_{i}"),
                 "description": feat.get("description", ""),
                 "reason": f"redundant_direction (cos={cos_i:.3f} > {cos_threshold})",
-                "closest_existing_id": close_leaf["id"],
+                "closest_existing_id": close_feat["id"],
+                "closest_existing_type": close_feat.get("type", ""),
                 "max_cos": round(cos_i, 4),
             })
             continue
@@ -221,7 +236,7 @@ def merge_catalogs_by_direction(
         # Gate 2: LLM separability on survivors
         if use_llm_separability and cfg is not None:
             neighbor_descs = [
-                existing_leaves[int(j)]["description"]
+                existing_features[int(j)]["description"]
                 for j in neighbors_idx[i].tolist()
             ]
             separable, reason = _sonnet_separability_judgment(
@@ -232,7 +247,8 @@ def merge_catalogs_by_direction(
                     "id": feat.get("id", f"proposal_{i}"),
                     "description": feat.get("description", ""),
                     "reason": f"nonseparable_semantic ({reason})",
-                    "closest_existing_id": close_leaf["id"],
+                    "closest_existing_id": close_feat["id"],
+                    "closest_existing_type": close_feat.get("type", ""),
                     "max_cos": round(cos_i, 4),
                 })
                 continue
@@ -267,7 +283,9 @@ def merge_catalogs_by_direction(
         **existing_catalog,
         "features": merged_features,
         "_discovery_metadata": {
-            "n_existing_before_merge": n_existing_leaves,
+            "n_existing_before_merge": n_existing_features,
+            "n_existing_leaves_before_merge": n_existing_leaves,
+            "n_existing_groups_before_merge": n_existing_groups,
             "n_proposed": len(proposed_features),
             "n_kept": len(kept),
             "n_dropped_cosine": sum(
