@@ -13,14 +13,17 @@ from pathlib import Path
 class Config:
     # ── Base model ───────────────────────────────────────────────────
     model_name: str = "gpt2"
-    target_layer: int = 6  # middle layer of GPT-2 Small (12 layers) — most interesting residual stream
+    # Layer 9 is the densest semantic band in GPT-2 Small. Validated in
+    # summary7: 64 leaves from Sonnet vs 31 at layer 6; cal_F1=0.625 vs 0.484;
+    # pretrained SAE R²=0.985 (with the standard from_pretrained loader fix).
+    target_layer: int = 9
     hook_point: str = ""  # auto-set in __post_init__
     device: str = "cuda"
     model_dtype: str = "float32"  # GPT-2 Small runs in fp32
 
     # ── Pretrained SAE (sae_lens format) ─────────────────────────────
     sae_release: str = "gpt2-small-res-jb"
-    sae_id: str = "blocks.6.hook_resid_pre"
+    sae_id: str = "blocks.9.hook_resid_pre"
 
     # ── Feature selection from pretrained SAE ────────────────────────
     n_latents_to_explain: int = 500
