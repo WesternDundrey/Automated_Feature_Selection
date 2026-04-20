@@ -4,6 +4,115 @@
 
 ---
 
+## [v8.0] — Publication-track Experiments: Composition + Layer Sweep
+
+**Date:** 2026-04-20
+
+### Motivation
+
+Summary5 established that supervised SAEs beat unsupervised-within-same-architecture by 15.4× on `targeting_ratio` at Gemma-2-2B layer 20. Summary7 established that layer 9 of GPT-2 Small gives cal_F1=0.625 with frozen-decoder cosine=1.000 and R²=0.971 at 75× fewer latents than the pretrained SAE. Both are single-layer, single-model point results. To turn these into a publishable paper, we need two additional pieces of evidence:
+
+1. **Compositionality**: if ablating feature A alone and feature B alone gives KLs `k_A`, `k_B`, does ablating both jointly give `≈ k_A + k_B`? A "yes" would show the supervised SAE is a *usable editor* of model computation, not just a collection of classifiers.
+
+2. **Cross-layer robustness**: does the 15× supervised-over-unsupervised targeting_ratio advantage survive at every layer, or only at layer 9 / layer 20?
+
+Both are additions of new infrastructure — no breaking changes to existing steps. Neither requires re-training existing artifacts.
+
+### New files
+
+**`pipeline/composition.py`** — `--step composition`
+
+For each subset of size `K ∈ {2, 3}` drawn from the top-5 causally-relevant features, computes:
+- `KL_i` for each `i ∈ subset` (individual ablation)
+- `KL_{∪ subset}` (joint ablation)
+- `linearity = 1 − |KL_{∪} − Σ KL_i| / max(|KL_{∪}|, |Σ KL_i|) ∈ [0, 1]`
+
+Reported per pool — supervised (S), best-match unsupervised (U), best-match pretrained (P) — on the same position set (union of per-feature positive positions). For `K=2` we additionally log the pairwise decoder cosine, enabling the sanity-check correlation `corr(decoder_cos, linearity)`.
+
+Output: `pipeline_data/composition.json` with per-subset records and an aggregate `{supervised, unsupervised, pretrained} × {K=2, K=3}` table plus the `corr(decoder_cos, linearity)` scalar for `S, K=2`.
+
+**`pipeline/layer_sweep.py`** — `--step layer-sweep --layers 4,6,8,9,10,11`
+
+Cross-layer orchestrator that runs the pipeline under `pipeline_data/layer_sweep/layer_{N}/` for each `N` in the list. Each step is idempotent via artifact presence (`evaluation.json`, `causal.json`, `intervention_precision.json`), so re-invocation picks up where a previous run left off. Per-layer failures don't abort the sweep — errors are logged and the next layer continues.
+
+Substitutes the `blocks.{N}.` fragment of `cfg.sae_id` to point at the layer-specific pretrained SAE (applies to `gpt2-small-res-jb`, layers 0-11 all covered).
+
+Output: `pipeline_data/layer_sweep/layer_sweep_summary.json` with one row per layer containing `calibrated_f1`, `r2`, `pretrained_sae_r2`, `mean_cosine_to_target`, `mean_fve`, `causal_mean_kl`, `causal_n_live_features`, `intervention_supervised_mean_ratio`, `intervention_pretrained_mean_ratio`. A formatted ASCII table is also printed to stdout.
+
+CLI additions:
+- `--layers` (comma-separated list for `--step layer-sweep`)
+- `--sweep-skip-intervention` (faster layer sweep without the 3-way S/U/P comparison)
+- `--sweep-skip-causal` (faster layer sweep without per-feature KL necessity)
+
+### Mathematical detail
+
+**Composition linearity metric.** For a subset S with per-feature ablation KLs `k_i` and joint-ablation KL `k_S`:
+```
+lin(S) = 1 - |k_S - Σ_{i∈S} k_i| / max(|k_S|, |Σ_{i∈S} k_i|, ε)
+```
+This is symmetric under `joint ↔ sum`, bounded to `[0, 1]`, and robust to both *subadditive* failure (`k_S ≪ Σ k_i`, features interfering — e.g. parallel decoder columns) and *superadditive* failure (`k_S ≫ Σ k_i`, joint effect amplified nonlinearly). `lin = 1` is exact linearity, `lin = 0` is 50% relative error or worse.
+
+**Decoder-cosine vs linearity correlation.** For frozen-decoder supervised features, `W_dec[:, i] = target_dir_i` exactly, so `cos(W_dec[:, i], W_dec[:, j]) = cos(target_dir_i, target_dir_j)`. The geometric prediction is that orthogonal `target_dir`s give independent interventions, hence `linearity ≈ 1`. Supervised features should show higher `linearity` at matched `|cos|` than unsupervised features, because the supervised decoder direction is locked to the mean-shift direction and cannot drift into a correlated subspace.
+
+### What did NOT change
+
+- `pipeline/intervention.py`, `pipeline/causal.py`, `pipeline/ioi.py`, `pipeline/evaluate.py`: unchanged. The new code imports their helpers.
+- Existing `--step` commands: unchanged. Both new steps are additive.
+- Config defaults: unchanged. Composition's internal knobs (`composition_n_targets`, `composition_pair_ks`, `composition_min_positives`, `composition_max_subsets_per_k`) are attached to `cfg` at runtime rather than added to the dataclass, to keep the existing saved `supervised_sae_config.pt` loadable.
+
+### Expected runtimes (5090, GPT-2 Small, 50 causal sequences)
+
+| Step | Time |
+|---|---|
+| `--step composition` (5 features, K ∈ {2, 3}, 20 subsets total) | 10-20 min |
+| `--step layer-sweep` (6 layers, no annotator reuse) | 3-4 hours |
+| `--step layer-sweep --sweep-skip-intervention` | 1.5-2 hours |
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/composition.py` | **NEW** — K-way joint ablation linearity |
+| `pipeline/layer_sweep.py` | **NEW** — Cross-layer orchestrator + aggregator |
+| `pipeline/run.py` | Added `--step composition`, `--step layer-sweep`, `--layers`, `--sweep-skip-intervention`, `--sweep-skip-causal` |
+| `RUNNING.md` | New step documentation |
+| `changes.md` | This entry |
+
+---
+
+## [v7.0] — Layer 9 validation, discovery loop, mean-shift proxy fix
+
+**Date:** 2026-04-13 to 2026-04-20
+
+### Highlights (see `summary7.md` for the full writeup)
+
+- Switched default layer 6 → 9 on GPT-2 Small after a direct comparison: 64 leaves vs 31, cal_F1 0.625 vs 0.484. Layer 9 is the densest semantic band in GPT-2 Small.
+- Fixed the silent `from_pretrained_no_processing` bug that made the pretrained-SAE baseline read activations in the wrong distribution, yielding R²=-20,599. `load_target_model` now dispatches on release: `gemma-scope-*` → `no_processing`, everything else → standard `from_pretrained` (with LayerNorm folding). Diagnostic script at `debug_pretrained_sae.py`.
+- Bumped `lambda_sparse` default 0.01 → 0.05 after the no-sparsity ablation showed zero F1 change at 0.01 (the penalty was too weak to do any work).
+- Added `pipeline/discover_loop.py` and `pipeline/merge.py` for iterative catalog growth via: unsupervised SAE latents → Sonnet descriptions → two-gate dedup (cosine then LLM separability) → incremental annotation → retrain.
+- Direction proxy for the merge gate went through three iterations before settling: decoder column (writing direction — wrong) → encoder row (reading direction — produced ~0.04 cosine mean, indistinguishable from random) → mean-shift direction from firing mask (`normalize(mean(x|latent fires) − mean(x))`, matches supervised `compute_target_directions` formula exactly).
+
+### New files
+
+| File | Purpose |
+|------|---------|
+| `pipeline/discover_loop.py` | Iterative catalog growth orchestrator |
+| `pipeline/merge.py` | Two-gate dedup (cosine + Sonnet separability) |
+| `pipeline/weaknesses.py` | Per-feature triage against 5 weakness categories |
+| `pipeline/agreement.py` | Two independent annotation passes + Cohen's κ |
+| `pipeline/residual.py` | Sonnet proposes new features from high-MSE positions |
+| `pipeline/amplify.py` | Amplification sweep (0×, 2×, 5×, 10×) for Pattern B testing |
+| `pipeline/siphoning.py` | FVE siphoning sweep across `n_unsupervised ∈ {0, 64, 128, 256, 512}` |
+| `pipeline/ablation.py` | 12-variant loss-term ablation matrix |
+| `debug_pretrained_sae.py` | Standalone diagnostic for `from_pretrained` vs `no_processing` |
+| `summary7.md` | Run writeup |
+
+### Breaking changes
+
+None. All new steps are additive; legacy steps unchanged.
+
+---
+
 ## [v6.0] — Phase 3: Supervised vs Pretrained SAE Comparison
 
 **Date:** 2026-04-09

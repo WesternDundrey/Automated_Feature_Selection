@@ -71,8 +71,23 @@ def main():
                  "agreement", "ablation", "residual", "causal", "ioi",
                  "validate-annotator",
                  "splitting", "circuit", "intervention", "amplify",
-                 "weaknesses", "siphoning", "discover", "discover-loop"],
+                 "weaknesses", "siphoning", "discover", "discover-loop",
+                 "composition", "layer-sweep"],
         help="Run only this step",
+    )
+    parser.add_argument(
+        "--layers", default=None,
+        help="Comma-separated layer list for --step layer-sweep "
+             "(default: 4,6,8,9,10,11 for GPT-2 Small).",
+    )
+    parser.add_argument(
+        "--sweep-skip-intervention", action="store_true",
+        help="For --step layer-sweep, skip the intervention experiment "
+             "per layer (faster, no 3-way S/U/P comparison).",
+    )
+    parser.add_argument(
+        "--sweep-skip-causal", action="store_true",
+        help="For --step layer-sweep, skip per-feature KL necessity per layer.",
     )
     parser.add_argument("--discover-loop-max-iters", type=int, default=5,
                         help="Max iterations for --step discover-loop")
@@ -365,6 +380,36 @@ def main():
             use_llm_separability=not args.discover_loop_no_llm_separability,
         )
         print(f"Discovery loop completed in {time.time() - t0:.1f}s")
+
+    # Composition — K-way joint ablation linearity
+    if args.step == "composition":
+        print("\n" + "=" * 70)
+        print("COMPOSITION — K-WAY JOINT ABLATION LINEARITY")
+        print("=" * 70)
+        t0 = time.time()
+        from .composition import run as run_composition
+        run_composition(cfg)
+        print(f"Composition completed in {time.time() - t0:.1f}s")
+
+    # Layer sweep — cross-layer pipeline orchestrator
+    if args.step == "layer-sweep":
+        print("\n" + "=" * 70)
+        print("LAYER SWEEP — cross-layer pipeline orchestrator")
+        print("=" * 70)
+        t0 = time.time()
+        from .layer_sweep import run as run_layer_sweep, DEFAULT_LAYERS_GPT2
+        if args.layers:
+            layers = tuple(
+                int(x.strip()) for x in args.layers.split(",") if x.strip()
+            )
+        else:
+            layers = DEFAULT_LAYERS_GPT2
+        run_layer_sweep(
+            cfg, layers=layers,
+            run_intervention=not args.sweep_skip_intervention,
+            run_causal=not args.sweep_skip_causal,
+        )
+        print(f"Layer sweep completed in {time.time() - t0:.1f}s")
 
     # Annotator validation on trivial features
     if args.step == "validate-annotator":
