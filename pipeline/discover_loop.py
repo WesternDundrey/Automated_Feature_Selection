@@ -154,37 +154,76 @@ def _propose_via_unsup_sae(cfg: Config, iter_dir: Path):
 
     # Direction proxy for merge-time dedup:
     #
-    # The supervised target_dir is a READING direction:
-    #   target_dir_i = normalize(mean(x | label_i = 1) - mean(x))
-    # It points along the mean-shift from negative to positive examples.
+    # The supervised target_dir is a MEAN-SHIFT direction:
+    #     target_dir_i = normalize(mean(x | label_i = 1) - mean(x))
     #
-    # For the unsup SAE, the ENCODER row plays the same role:
-    #   enc_row_i  =  the linear direction that excites latent i when
-    #                 dot-producted with x. Latent i fires high when x
-    #                 has large projection onto enc_row_i, i.e. it's a
-    #                 reading direction in activation space.
+    # To get apples-to-apples cosines against it, we use the SAME formula
+    # for each unsup latent, substituting its firing mask for labels:
+    #     d_k = normalize(mean(x | latent_k fires) - mean(x))
     #
-    # The DECODER column is a WRITING direction (where the latent
-    # contributes during reconstruction). Encoder row is the right
-    # analog to target_dir for dedup.
+    # This is the third proxy attempt. The first two failed:
     #
-    # An earlier version used decoder columns and got cosine_dropped=0
-    # even on clearly redundant unsup latents, because writing and
-    # reading directions can be ~orthogonal for the same concept.
+    # - Decoder column (writing direction): decoder columns can be
+    #   arbitrarily aligned, so cosines were near 0 even for clearly
+    #   redundant latents.
+    #
+    # - Encoder row (reading direction): cosines came out ~1/sqrt(d_model)
+    #   = 0.036 on layer 9 (d=768), indistinguishable from random
+    #   directions. Encoder rows are separator-hyperplane normals learned
+    #   by gradient descent; two methods can perfectly capture the same
+    #   concept while having encoder rows that are nearly orthogonal.
+    #   The linear direction that maximally SEPARATES a class is not the
+    #   same geometric object as the mean-shift BETWEEN the class means.
+    #
+    # Mean-shift lives entirely in activation space, is a function of the
+    # firing mask only, and is architecture-agnostic — so it's the only
+    # proxy that can be meaningfully compared across supervision regimes.
+    N_tot = activations.shape[0] * activations.shape[1]
+    X = activations.reshape(N_tot, d_model).float()
+    mean_all = X.mean(dim=0)
+
+    selected_to_pos = {l: i for i, l in enumerate(selected)}
+    selected_tensor = torch.tensor(selected, dtype=torch.long)
+    W_enc_sel = sae.encoder.weight[selected_tensor, :].detach().float()
+    b_enc_sel = sae.encoder.bias[selected_tensor].detach().float()
+
+    # Firing masks in chunks to cap peak memory.
+    chunk = 16384
+    active_mask = torch.zeros(N_tot, len(selected), dtype=torch.bool)
+    for start in range(0, N_tot, chunk):
+        end = min(start + chunk, N_tot)
+        pre = X[start:end] @ W_enc_sel.T + b_enc_sel
+        active_mask[start:end] = (pre > 0)
+
     proposal_features = []
     proposal_dirs_list = []
+    n_too_sparse = 0
     for latent_idx_str, desc in sorted(descriptions.items(), key=lambda kv: int(kv[0])):
         latent_idx = int(latent_idx_str)
-        # nn.Linear(d_model, d_sae): weight shape (d_sae, d_model);
-        # row latent_idx is the reading direction for that latent.
-        enc_row = sae.encoder.weight[latent_idx, :].detach().float()
-        proposal_dirs_list.append(enc_row)
+        sel_pos = selected_to_pos.get(latent_idx)
+        if sel_pos is None:
+            continue
+        mask = active_mask[:, sel_pos]
+        n_pos = int(mask.sum())
+        if n_pos < 10:
+            n_too_sparse += 1
+            continue
+        mean_pos = X[mask].mean(dim=0)
+        d = mean_pos - mean_all
+        d = d / (d.norm() + 1e-8)
+        proposal_dirs_list.append(d)
         proposal_features.append({
             "id": f"discovered.unsup_{latent_idx}",
             "description": desc,
             "type": "leaf",
             "parent": None,
         })
+    if n_too_sparse:
+        print(f"  Skipped {n_too_sparse} latents with <10 active positions")
+    print(
+        f"  Computed mean-shift directions for {len(proposal_features)} "
+        f"proposals (matches supervised target_dir formula)"
+    )
 
     proposal_dirs = (
         torch.stack(proposal_dirs_list) if proposal_dirs_list
