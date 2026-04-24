@@ -36,6 +36,13 @@ logger = logging.getLogger(__name__)
 
 from .config import Config
 
+# Module-global accumulator for silent-failure auditing. annotate_sequence_async
+# appends a record per (seq_idx, chunk_start, chunk_end, last_err) when a
+# chunk's labels are left zero after max retries. The top-level async entry
+# point clears it at start, checks it at end, and raises if the failure rate
+# exceeds a configurable threshold.
+_ANNOTATION_FAILURE_COUNT: list = []
+
 
 # ── Corpus preparation ──────────────────────────────────────────────────────
 
@@ -174,6 +181,7 @@ async def annotate_sequence_async(
 
         async with semaphore:
             last_err = None
+            succeeded = False
             for attempt in range(cfg.annotation_max_retries):
                 try:
                     # Scale max_tokens with feature count: ~30 tokens per feature
@@ -185,25 +193,37 @@ async def annotate_sequence_async(
                     )
                     text = response.choices[0].message.content.strip()
                     result = _extract_json_object(text)
-                    if result:
-                        for k in range(len(chunk)):
-                            key = f"F{chunk_start + k}"
-                            indices = result.get(key, [])
-                            for idx in indices:
-                                if isinstance(idx, int) and 0 <= idx < len(token_strs):
-                                    labels[idx, chunk_start + k] = 1.0
-                    break  # Success — exit retry loop
+                    # Treat JSON-parse failure as retryable, not as "success
+                    # with zero labels". Previously a None result silently
+                    # fell through the if-guard and broke out of the retry
+                    # loop, yielding an all-zero label block with no
+                    # diagnostic — bad labels are worse than missing labels.
+                    if not result:
+                        raise ValueError(
+                            f"annotation JSON parse failed: {text[:200]!r}"
+                        )
+                    for k in range(len(chunk)):
+                        key = f"F{chunk_start + k}"
+                        indices = result.get(key, [])
+                        for idx in indices:
+                            if isinstance(idx, int) and 0 <= idx < len(token_strs):
+                                labels[idx, chunk_start + k] = 1.0
+                    succeeded = True
+                    break
                 except Exception as e:
                     last_err = e
                     if attempt < cfg.annotation_max_retries - 1:
                         delay = cfg.annotation_retry_base_delay * (2 ** attempt)
                         await asyncio.sleep(delay)
-            else:
-                # All retries exhausted → labels stay zero (safe default)
+            if not succeeded:
                 logger.warning(
-                    "Annotation failed for seq %d, chunk %d-%d after %d retries: %s",
+                    "Annotation failed for seq %d, chunk %d-%d after %d "
+                    "retries; leaving labels zero. Last error: %s",
                     seq_idx, chunk_start, chunk_start + len(chunk),
                     cfg.annotation_max_retries, last_err,
+                )
+                _ANNOTATION_FAILURE_COUNT.append(
+                    (seq_idx, chunk_start, chunk_start + len(chunk), str(last_err))
                 )
 
     return seq_idx, labels
@@ -225,6 +245,8 @@ async def annotate_corpus_async(
     from .llm import get_async_client
     client = get_async_client()
     semaphore = asyncio.Semaphore(cfg.max_annotation_concurrency)
+    # Reset the global failure accumulator for this run.
+    _ANNOTATION_FAILURE_COUNT.clear()
 
     # Decode all sequences to strings (use .tolist() to avoid per-element overhead)
     print("Decoding tokens to strings...")
@@ -286,6 +308,44 @@ async def annotate_corpus_async(
 
     elapsed = time.time() - t0
     total_pos = int(all_labels.sum().item())
+
+    # Post-run failure audit. With parse-failure-as-exception wired in, every
+    # left-zero chunk is now logged to _ANNOTATION_FAILURE_COUNT. Surface
+    # the rate and abort if it crosses a configurable ceiling — a few
+    # stragglers are tolerable, but 10%+ silent failure means the prompt or
+    # model is broken and the labels can't be trusted.
+    n_failed_chunks = len(_ANNOTATION_FAILURE_COUNT)
+    chunk_size = cfg.features_per_annotation_call
+    n_chunks_per_seq = (n_features + chunk_size - 1) // chunk_size
+    total_chunks = max(N * n_chunks_per_seq, 1)
+    failure_rate = n_failed_chunks / total_chunks
+    threshold = getattr(cfg, "annotation_max_failure_rate", 0.10)
+
+    if n_failed_chunks > 0:
+        print(
+            f"\n  WARNING: {n_failed_chunks}/{total_chunks} chunks "
+            f"({failure_rate:.1%}) left zero after {cfg.annotation_max_retries} "
+            f"retries. See first few below; full list in "
+            f"annotations_failures.json."
+        )
+        for rec in _ANNOTATION_FAILURE_COUNT[:5]:
+            print(f"    seq={rec[0]}  features [{rec[1]}..{rec[2]})  err={rec[3][:120]}")
+        # Persist the audit log
+        import json as _json
+        (cfg.output_dir / "annotations_failures.json").write_text(_json.dumps([
+            {"seq": s, "feat_start": cs, "feat_end": ce, "error": err}
+            for s, cs, ce, err in _ANNOTATION_FAILURE_COUNT
+        ], indent=2))
+        if failure_rate > threshold:
+            raise RuntimeError(
+                f"annotation failure rate {failure_rate:.1%} exceeds "
+                f"threshold {threshold:.1%}; aborting rather than saving "
+                f"a catalog with silently-zeroed labels. Inspect "
+                f"annotations_failures.json and lower the prompt / "
+                f"max_tokens / chunk_size, or raise the threshold via "
+                f"cfg.annotation_max_failure_rate."
+            )
+
     # Remove partial checkpoints on success
     if partial_path.exists():
         partial_path.unlink()
@@ -539,18 +599,31 @@ def _annotate_local_vllm_pertoken(
             seq_tok_ids.append(ids)
         tok_ids_per_seq.append(seq_tok_ids)
 
-    # Token name cache: cached across features at same position
+    # Token name cache: cached across features at same position.
+    #
+    # IMPORTANT: preserve the raw token string — do NOT strip whitespace or
+    # lowercase. For GPT-2-style BPE the leading space on " The" is the
+    # word-boundary marker, and the distinction between "US" and "us" is a
+    # real feature. We JSON-encode the token so embedded quotes, newlines,
+    # and tabs survive as escape sequences the model can read unambiguously.
     tok_name_cache = {}
+    import json as _json
     for seq_j in range(N):
         for tok_k in range(T):
-            tok_str = all_token_strs[seq_j][tok_k].strip()
+            tok_str = all_token_strs[seq_j][tok_k]
             if tok_str not in tok_name_cache:
-                s = f'"\nToken: "{tok_str}". '
+                # Inline a closing quote + newline for the Text:"..." block,
+                # then a json-encoded token literal that preserves whitespace.
+                s = f'"\nToken: {_json.dumps(tok_str)}. '
                 tok_name_cache[tok_str] = tuple(
                     ann_tokenizer.encode(s, add_special_tokens=False)
                 )
 
-    # Feature suffix: only non-cached part per prompt
+    # Feature suffix: only non-cached part per prompt. Descriptions are
+    # NOT lowercased any more — "Token is US" and "Token is us" are
+    # different questions for any sensible annotator, and plenty of our
+    # features are case-sensitive by design (capitalization, acronym,
+    # code identifier).
     if use_findex:
         feat_suffix_list = [
             tuple(ann_tokenizer.encode(f'F{fi}? ', add_special_tokens=False))
@@ -559,7 +632,7 @@ def _annotate_local_vllm_pertoken(
     else:
         feat_suffix_list = [
             tuple(ann_tokenizer.encode(
-                f'{f["description"].rstrip(".").lower()}? ', add_special_tokens=False
+                f'{f["description"].rstrip(".")}? ', add_special_tokens=False
             ))
             for f in features
         ]
@@ -628,7 +701,7 @@ def _annotate_local_vllm_pertoken(
     total_decisions = n_features * N * T
     t_start = time.time()
 
-    seq_chunk = min(2, N)
+    seq_chunk = min(getattr(cfg, "local_annotation_seq_chunk", 2), N)
 
     # Resume from partial checkpoint (crash recovery)
     partial_path = cfg.output_dir / "annotations_local_partial.pt"
@@ -670,7 +743,7 @@ def _annotate_local_vllm_pertoken(
             prefix = sys_tuple + text_open_tuple
             for tok_k in range(T):
                 prefix = prefix + tok_id_tuples[seq_j][tok_k]
-                tok_str = all_token_strs[seq_j][tok_k].strip()
+                tok_str = all_token_strs[seq_j][tok_k]  # preserve whitespace
                 # Token name in prefix: cached across all features at this position
                 pos_prefix = prefix + tok_name_cache[tok_str]
                 for fi in range(n_features):
@@ -798,6 +871,12 @@ def _annotate_local_vllm_batch(
                     for idx in indices:
                         if isinstance(idx, int) and 0 <= idx < T:
                             annotations[seq_j, idx, k] = 1.0
+            else:
+                # Silent-zero was the pre-v8.5 behavior. Now: warn so the
+                # failure is auditable, and track the rate across the run.
+                _ANNOTATION_FAILURE_COUNT.append(
+                    (seq_j, 0, n_features, f"vLLM parse fail: {text[:160]!r}")
+                )
 
         elapsed = time.time() - t_start
         done = (seq_end) * n_features * T
@@ -1011,8 +1090,21 @@ def run(cfg: Config = None):
     # ── Tokenization + activation extraction ──────────────────────────
     # Run in a subprocess if needed so CUDA context doesn't corrupt vLLM.
     # The subprocess loads GPT-2, extracts, saves to disk, and exits cleanly.
-    need_tokens = not cfg.tokens_path.exists()
-    need_acts = not cfg.activations_path.exists()
+    # Cache freshness is checked by sidecar meta BEFORE deciding to reuse —
+    # a layer-9 activations.pt silently reused in a layer-6 run is the
+    # exact silent corruption the sidecars are designed to catch.
+    from .cache_meta import (
+        load_or_die as _cache_load_or_die,
+        write_cache_meta as _cache_write_meta,
+    )
+    tokens_ok = cfg.tokens_path.exists() and _cache_load_or_die(
+        cfg.tokens_path, "tokens", cfg,
+    )
+    acts_ok = cfg.activations_path.exists() and _cache_load_or_die(
+        cfg.activations_path, "activations", cfg,
+    )
+    need_tokens = not tokens_ok
+    need_acts = not acts_ok
 
     if need_tokens or need_acts:
         import subprocess, sys
@@ -1037,9 +1129,12 @@ cfg.output_dir.mkdir(parents=True, exist_ok=True)
 # training distribution (no LayerNorm folding, etc.).
 model = load_target_model(cfg)
 
+from pipeline.cache_meta import write_cache_meta
+
 if not cfg.tokens_path.exists():
     tokens = prepare_corpus(model, cfg)
     torch.save(tokens, cfg.tokens_path)
+    write_cache_meta(cfg.tokens_path, "tokens", cfg)
     print(f"Saved tokens: {{cfg.tokens_path}}")
 else:
     tokens = torch.load(cfg.tokens_path, weights_only=True)
@@ -1047,6 +1142,7 @@ else:
 if not cfg.activations_path.exists():
     activations = extract_activations(model, tokens, cfg)
     torch.save(activations, cfg.activations_path)
+    write_cache_meta(cfg.activations_path, "activations", cfg)
     print(f"Saved activations: {{cfg.activations_path}}")
 """
         result = subprocess.run(

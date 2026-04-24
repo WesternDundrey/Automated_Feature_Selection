@@ -89,7 +89,13 @@ def evaluate(cfg: Config = None):
     )
     sae.eval().to(cfg.device)
 
-    # Load data
+    # Load data. Verify cache identity before reading — a mismatched
+    # activations.pt or SAE checkpoint here silently invalidates every
+    # reported number downstream.
+    from .cache_meta import load_or_die as _cache_load_or_die
+    _cache_load_or_die(cfg.activations_path, "activations", cfg)
+    _cache_load_or_die(cfg.checkpoint_path, "supervised_sae", cfg)
+
     activations = torch.load(cfg.activations_path, weights_only=True)
     annotations = torch.load(cfg.annotations_path, weights_only=True)
     catalog = json.loads(cfg.catalog_path.read_text())
@@ -630,16 +636,20 @@ def evaluate(cfg: Config = None):
 
     val_gt_np = y_val.numpy().astype(bool)
 
-    # Per-feature calibrated threshold, optimized on val, applied on test.
-    # This matches the protocol used for the supervised SAE at line 161-167;
-    # reporting probe F1 at t=0 against the supervised SAE at calibrated
-    # thresholds is an apples-to-oranges comparison that inflates the
-    # supervised advantage.
+    # Per-feature calibrated threshold, optimized on the SAME val_calib
+    # half used for the supervised SAE's calibration (val_calib_slice),
+    # and evaluated on test. Before v8.5 the probe used the FULL val set
+    # for threshold search while the supervised SAE used only val_calib,
+    # so the probe effectively had a larger calibration budget. Matching
+    # the budgets here makes the cross-baseline F1 comparison honest.
     probe_cal_thresholds = np.zeros(n_features)
     for k in range(n_features):
-        if int(val_gt_np[:, k].sum()) == 0:
+        calib_labels = val_gt_np[val_calib_slice, k]
+        if int(calib_labels.sum()) == 0:
             continue
-        _, _, _, best_t = optimal_threshold_f1(val_gt_np[:, k], probe_val_logits[:, k])
+        _, _, _, best_t = optimal_threshold_f1(
+            calib_labels, probe_val_logits[val_calib_slice, k],
+        )
         probe_cal_thresholds[k] = best_t
     probe_cal_preds = probe_logits > probe_cal_thresholds[None, :]
 
@@ -800,14 +810,19 @@ def evaluate(cfg: Config = None):
                 rt_logits_list.append(readout(z_b))
             rt_logits = torch.cat(rt_logits_list).numpy()
 
-        # Calibrated thresholds for the post-training readout, same protocol
-        # as the supervised SAE: pick best per-feature t on val, evaluate on
-        # test. Without this the readout is under-scored at the t=0 default.
+        # Calibrated thresholds — same val_calib budget as the supervised
+        # SAE and the linear probe, so the cross-baseline F1 comparison
+        # uses matched calibration data. Pre-v8.5 the readout used the
+        # full val set, which quietly gave it a larger calibration budget
+        # than the supervised SAE's half-val calibration.
         rt_cal_thresholds = np.zeros(n_features)
         for k in range(n_features):
-            if int(val_gt_np[:, k].sum()) == 0:
+            calib_labels = val_gt_np[val_calib_slice, k]
+            if int(calib_labels.sum()) == 0:
                 continue
-            _, _, _, best_t = optimal_threshold_f1(val_gt_np[:, k], rt_val_logits[:, k])
+            _, _, _, best_t = optimal_threshold_f1(
+                calib_labels, rt_val_logits[val_calib_slice, k],
+            )
             rt_cal_thresholds[k] = best_t
         rt_cal_preds = rt_logits > rt_cal_thresholds[None, :]
 
@@ -913,6 +928,11 @@ def evaluate(cfg: Config = None):
     }
 
     cfg.eval_path.write_text(json.dumps(results, indent=2))
+    from .cache_meta import write_cache_meta
+    write_cache_meta(
+        cfg.eval_path, "evaluation", cfg,
+        n_features=n_features,
+    )
     print(f"\nResults saved: {cfg.eval_path}")
     return results
 

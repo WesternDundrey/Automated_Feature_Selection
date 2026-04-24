@@ -4,6 +4,79 @@
 
 ---
 
+## [v8.5] — Fourth-round reviewer fixes: target_dir validity, case-preservation, cache sidecars, silent-zero fix
+
+**Date:** 2026-04-21
+
+### Motivation
+
+Fourth review on v8.4 flagged three HIGH and four MEDIUM issues: (a) `compute_target_directions` treats zero-positive features as valid; (b) the annotator prompt strips/lowercases tokens and descriptions, mangling case-sensitive features; (c) shared caches are path-presence-keyed with no identity check, so layer/model/corpus changes silently reuse stale artifacts; (d) annotation JSON parse failures silently produce zero labels; (e) probe/readout thresholds still fit on full val; (f) stale mini-prefilter CLI flag; (g) `seq_chunk` hardcoded. All seven addressed.
+
+### Fixes
+
+**HIGH — `compute_target_directions` zero-positive bug** (`pipeline/train.py:65-80`)
+
+Previous code clamped `counts.min` to 1 before division, so a feature with zero positives computed `mean_pos = 0 / 1 = 0`, `direction = -mean_all`, and `raw_norm = ||mean_all||`. That passed the `raw_norms > 1e-6` validity check with a "direction" that is anti-parallel to the global activation centroid — meaningless but load-bearing under frozen decoder, where the decoder column is locked to `target_dir` by construction.
+
+Fix: validity is now `(raw_counts > 0) & (raw_norms > 1e-6)`. The clamp stays for the division (safe), but the validity gate uses raw counts. Returned counts are now the pre-clamp raw values for honest downstream reporting.
+
+**HIGH — annotator prompt case/whitespace preservation** (`pipeline/annotate.py:546-565, 673`)
+
+Per-token prompts stripped whitespace from the token string (`tok_str = all_token_strs[seq_j][tok_k].strip()`) and lowercased the feature description (`.lower()`). Both break case-sensitive features:
+- Stripping destroys GPT-2 BPE word-boundary markers — `" The"` (start of word) and `"The"` (subword continuation) become the same token name in the prompt.
+- Lowercasing turns "token is `US`?" into "token is `us`?" — different questions for any sensible annotator.
+
+Fix: token strings are preserved verbatim and embedded via `json.dumps(tok_str)` so newlines, quotes, and whitespace survive as escape sequences. Feature descriptions are no longer lowercased. The `.rstrip(".")` trim is kept (purely cosmetic, not semantic).
+
+Caveat for existing runs: existing `annotations.pt` files were produced with the old (stripped/lowered) prompts. v8.1's id-keyed cache accepts them, so the incremental path will mix old-prompt labels for existing features with new-prompt labels for newly-added features. To get uniform labeling, delete `annotations.pt` (+ sidecar) and re-run annotate.
+
+**HIGH — artifact cache identity sidecars** (`pipeline/cache_meta.py` new; `annotate.py`, `train.py`, `evaluate.py` call sites)
+
+New `pipeline/cache_meta.py` provides `write_cache_meta` / `verify_cache_meta` / `load_or_die` helpers that write a `.meta.json` sidecar next to each expensive artifact with the minimal set of Config fields needed to detect staleness:
+- `tokens.pt` → model_name, corpus_dataset/split, n_sequences, seq_len
+- `activations.pt` → above + target_layer, hook_point, model_dtype, sae_release, sae_id
+- `supervised_sae.pt` → above + n_features
+- `evaluation.json` → above + n_features
+
+Wired at: tokens+activations save (`annotate.py` subprocess), checkpoint save (`train.py:522`), evaluation save (`evaluate.py:915`). Verification at: activation load in annotate's need-tokens/need-acts gate, activations + checkpoint load at start of evaluate. Missing sidecars (pre-v8.5 runs) are accepted with a warning — "legacy (no sidecar)" — so existing pipelines keep working.
+
+Deliberately NOT wired: inventory-step artifacts (`top_activations.json`, `descriptions.json`, `feature_catalog.json`). Those are cheaper to regenerate and the silent-reuse footgun there is smaller. If it becomes a problem, same pattern extends trivially.
+
+**MEDIUM — annotation JSON parse failures no longer silent-zero** (`pipeline/annotate.py:187-210, 793-810`)
+
+The API path's retry loop previously treated a `_extract_json_object(...) → None` as "success, no positives" because the `if result:` guard silently fell through and `break` exited the retry loop. Fix: parse failure now raises `ValueError` inside the try block, which:
+1. Fires the `except Exception` handler and counts as a retry-eligible failure.
+2. After `cfg.annotation_max_retries`, appends a record to a module-global `_ANNOTATION_FAILURE_COUNT` list.
+3. At end of `annotate_corpus_async`, the list is flushed to `annotations_failures.json` and the failure rate is compared against `cfg.annotation_max_failure_rate` (default 0.10). A rate above that aborts the run rather than saving a catalog with silently-zeroed labels.
+
+Same pattern wired in the batch-positions vLLM path.
+
+**MEDIUM — probe/readout now use val_calib for thresholds** (`pipeline/evaluate.py:648, 816`)
+
+v8.4 split val 50/50 for the supervised SAE (threshold on val_calib, honest F1 on val_promo) but left the linear probe and post-training readout still fitting thresholds on the full val set. That gave the baselines a larger calibration budget than the SAE, quietly inflating their fair-comparison F1. Both baselines now use `val_calib_slice` for threshold search, matching the SAE's protocol.
+
+**MEDIUM — mini-prefilter CLI flag aligned with current gate** (`pipeline/run.py:94`)
+
+v8.4 switched the drop metric to AUROC but the CLI still exposed `--promote-mini-prefilter-min-f1`. Added `--promote-mini-prefilter-min-auroc` as the new flag; the old one is now `argparse.SUPPRESS`'d from help and prints a deprecation note at runtime if passed.
+
+**MEDIUM/LOW — `local_annotation_seq_chunk` is now a config knob**
+
+Previously hardcoded `min(2, N)`. Added `cfg.local_annotation_seq_chunk: int = 2` (default unchanged). Users hitting the ~800 decisions/s ceiling the reviewer flagged can now sweep {2, 4, 8, 16, 32} by overriding the config; throughput vs KV-cache memory trade-off is architecture-specific so no CLI flag yet.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/train.py` | raw_counts validity gate in `compute_target_directions`; write cache-meta sidecar on checkpoint save; verify activations sidecar on load |
+| `pipeline/annotate.py` | json.dumps-based token prompt; no .lower() on descriptions; parse-failure-as-exception in both API and vLLM paths; failure rate ceiling; `seq_chunk` from config; write/verify cache-meta sidecars on tokens+activations |
+| `pipeline/evaluate.py` | verify activation/checkpoint sidecars on load; write evaluation sidecar on save; probe/readout use val_calib_slice for thresholds |
+| `pipeline/cache_meta.py` | **NEW** — shared sidecar protocol |
+| `pipeline/config.py` | `local_annotation_seq_chunk`, `annotation_max_failure_rate` |
+| `pipeline/run.py` | `--promote-mini-prefilter-min-auroc`; deprecation of `--promote-mini-prefilter-min-f1` |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.4] — Third-round reviewer fixes: honest gating metrics + AUROC prefilter
 
 **Date:** 2026-04-21

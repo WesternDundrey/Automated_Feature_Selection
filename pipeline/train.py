@@ -65,19 +65,29 @@ def compute_target_directions(
     y = y_flat[:, :n_supervised].float()
     mean_all = x_flat.mean(dim=0)  # (d_model,)
 
-    # Vectorized weighted mean: (y.T @ x) / counts
-    counts = y.sum(dim=0).clamp(min=1)  # (n_sup,)
-    mean_pos = (y.T @ x_flat) / counts.unsqueeze(1)  # (n_sup, d_model)
+    # Vectorized weighted mean: (y.T @ x) / counts.
+    # IMPORTANT: clamp counts only for the division, NOT for validity. A
+    # feature with raw_counts == 0 gets mean_pos == 0 via clamped division
+    # and directions == -mean_all, whose norm is the norm of the global
+    # mean. That passes a norm-only validity check but is a meaningless
+    # direction — the supervised slot then gets a frozen decoder column
+    # pointing anti-parallel to the activation centroid, which hurts both
+    # reconstruction and interventions. Use raw_counts for the validity
+    # gate so zero-positive features stay zeroed.
+    raw_counts = y.sum(dim=0)                                 # (n_sup,)
+    counts = raw_counts.clamp(min=1)
+    mean_pos = (y.T @ x_flat) / counts.unsqueeze(1)           # (n_sup, d_model)
 
-    directions = mean_pos - mean_all.unsqueeze(0)  # (n_sup, d_model)
-    raw_norms = directions.norm(dim=1)  # (n_sup,)
+    directions = mean_pos - mean_all.unsqueeze(0)             # (n_sup, d_model)
+    raw_norms = directions.norm(dim=1)                        # (n_sup,)
 
-    # Normalize, zeroing features with no signal
-    valid = raw_norms > 1e-6
+    valid = (raw_counts > 0) & (raw_norms > 1e-6)
     target_dirs = torch.zeros_like(directions)
     target_dirs[valid] = directions[valid] / raw_norms[valid].unsqueeze(1)
 
-    return target_dirs, raw_norms, counts
+    # Return the honest raw counts (not the clamped version) so downstream
+    # reporting reflects true positive-sample sizes.
+    return target_dirs, raw_norms, raw_counts
 
 
 def mse_supervision_loss(
@@ -521,6 +531,14 @@ def train_supervised_sae(
             },
             cfg.checkpoint_config_path,
         )
+        # Identity sidecar so a later --step evaluate / --step intervention
+        # can detect a layer/model/catalog mismatch instead of silently
+        # loading an SAE trained against a different activation distribution.
+        from .cache_meta import write_cache_meta
+        write_cache_meta(
+            cfg.checkpoint_path, "supervised_sae", cfg,
+            n_features=n_supervised,
+        )
         print(f"\nModel saved: {cfg.checkpoint_path}")
 
     return sae_cpu
@@ -544,6 +562,12 @@ def run(cfg: Config = None):
 
     catalog = json.loads(cfg.catalog_path.read_text())
     features = catalog["features"]
+
+    # Cache identity check before loading. Train is the biggest downstream
+    # consumer — a mismatched activations.pt here means the whole trained
+    # model is wrong.
+    from .cache_meta import load_or_die as _cache_load_or_die
+    _cache_load_or_die(cfg.activations_path, "activations", cfg)
 
     activations = torch.load(cfg.activations_path, weights_only=True)
     annotations = torch.load(cfg.annotations_path, weights_only=True)

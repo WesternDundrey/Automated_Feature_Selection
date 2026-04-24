@@ -91,8 +91,11 @@ def main():
                         help="Skip mini-annotation prefilter (always do full annotation)")
     parser.add_argument("--promote-mini-prefilter-n", type=int, default=None,
                         help="Sequences for mini-prefilter annotation (default 50)")
+    parser.add_argument("--promote-mini-prefilter-min-auroc", type=float, default=None,
+                        help="Mini-prefilter AUROC floor (default 0.70). "
+                             "The v8.3 --min-f1 flag is deprecated — the real gate has been AUROC since v8.4.")
     parser.add_argument("--promote-mini-prefilter-min-f1", type=float, default=None,
-                        help="Mini-prefilter F1 floor (default 0.20)")
+                        help=argparse.SUPPRESS)  # deprecated; retained for backwards compat only
     parser.add_argument("--use-findex", action="store_true",
                         help="Opt back into F-index annotation suffix (deprecated-by-default)")
     parser.add_argument(
@@ -436,8 +439,13 @@ def main():
             cfg.promote_mini_prefilter = False
         if args.promote_mini_prefilter_n is not None:
             cfg.promote_mini_prefilter_n_seqs = args.promote_mini_prefilter_n
+        if args.promote_mini_prefilter_min_auroc is not None:
+            cfg.promote_mini_prefilter_min_auroc = args.promote_mini_prefilter_min_auroc
         if args.promote_mini_prefilter_min_f1 is not None:
-            cfg.promote_mini_prefilter_min_f1 = args.promote_mini_prefilter_min_f1
+            print(
+                "  [deprecated] --promote-mini-prefilter-min-f1 is a no-op since v8.4; "
+                "use --promote-mini-prefilter-min-auroc instead."
+            )
         run_promote_loop(cfg)
         print(f"Promote loop completed in {time.time() - t0:.1f}s")
 

@@ -98,6 +98,20 @@ class Config:
     # `--use-findex` to opt back in if you know your catalog matches.
     use_findex_suffix: bool = False  # True = "F3? " (~3 tok), False = full description (~15 tok)
 
+    # Sequences per vLLM batch in the per-token annotator. Previously
+    # hardcoded to 2; the actual throughput optimum depends on feature count
+    # × seq_len × KV-cache budget. Sweep {2,4,8,16,32} on your GPU and pick
+    # the knee. A knob here instead of a constant lets the user tune without
+    # code changes. Too high wastes KV-cache (exceeds `max_model_len *
+    # max_num_seqs` budget in vLLM); too low underfeeds the engine.
+    local_annotation_seq_chunk: int = 2
+
+    # Maximum fraction of annotation chunks that may end up zero-labeled
+    # (after max retries) before the run aborts. A few stragglers are
+    # tolerable; >10% means the prompt or the annotator is broken, and
+    # training on those labels would silently corrupt the catalog.
+    annotation_max_failure_rate: float = 0.10
+
     # ── Feature filtering ──────────────────────────────────────
     min_feature_positive_rate: float = 0.0  # disabled by default (rare features are intentional)
 
