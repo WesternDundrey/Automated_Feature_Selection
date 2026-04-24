@@ -66,16 +66,36 @@ class Config:
     seed: int = 42
     n_lista_steps: int = 0  # LISTA refinement iterations (0 = disabled)
 
-    # ── v2: Supervision mode ────────────────────────────────────────
-    # "hybrid" = BCE selectivity + cosine direction alignment (recommended)
-    # "mse"    = MSE magnitude + cosine direction (Makelov-inspired)
-    # "bce"    = legacy BCE only (no decoder alignment)
-    supervision_mode: str = "hybrid"
+    # ── Supervision mode ───────────────────────────────────────────
+    # "hinge"           = ReLU + hinge on pre-activations (NEW DEFAULT, v8.11).
+    #                     End-to-end training, no frozen decoder, no
+    #                     pre-computed target_dirs in loss. See
+    #                     `supervised_saes_hinge_loss.md`.
+    # "hinge_jumprelu"  = JumpReLU + hinge on (z - θ), per-feature θ
+    #                     learnable. Use when a minimum firing magnitude
+    #                     is useful for interpretability.
+    # "gated_bce"       = Two-path encoder (gate + magnitude), BCE on
+    #                     gate logit. Fully decouples gate from magnitude.
+    # --- Legacy modes (frozen-decoder pipeline, summary6/7 numbers) ---
+    # "hybrid"          = BCE selectivity + cosine direction alignment.
+    # "mse"             = MSE magnitude + cosine direction (Makelov-inspired).
+    # "bce"             = legacy BCE only, no decoder alignment.
+    supervision_mode: str = "hinge"
     use_mse_supervision: bool = True    # DEPRECATED: use supervision_mode instead
     direction_loss_weight: float = 1.0  # α: decoder direction alignment (hybrid/mse)
     magnitude_loss_weight: float = 0.5  # β: activation magnitude alignment (mse only)
     selectivity_loss: str = "bce"       # "bce", "hinge", or "none"
     hinge_margin: float = 1.0           # margin for hinge selectivity loss
+
+    # Knobs for the new (v8.11) hinge / gated modes:
+    # - gated_tie_weights: if True, GatedBCESAE ties W_mag = exp(r) · W_gate
+    #   (per-feature scale r), halving supervised-slice encoder params at
+    #   the cost of some expressiveness.
+    # - jumprelu_theta_init: initial value of the per-feature θ threshold
+    #   in JumpReLUHingeSAE. Small positive (0.1) gives the hinge something
+    #   to push against on step 1.
+    gated_tie_weights: bool = False
+    jumprelu_theta_init: float = 0.1
 
     # ── v3: Frozen decoder ──────────────────────────────────────────
     # Fix supervised decoder columns to target_dirs before training.

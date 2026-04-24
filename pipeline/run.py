@@ -65,8 +65,17 @@ def main():
     parser.add_argument("--flat", action="store_true",
                         help="Strip group features from catalog, keep only leaves (no hierarchy loss)")
     parser.add_argument("--supervision", default=None,
-                        choices=["hybrid", "mse", "bce"],
-                        help="Supervision mode: hybrid (BCE+direction), mse, bce")
+                        choices=["hinge", "hinge_jumprelu", "gated_bce",
+                                 "hybrid", "mse", "bce"],
+                        help="Supervision mode. NEW (v8.11, end-to-end): "
+                             "hinge (default), hinge_jumprelu, gated_bce. "
+                             "LEGACY (frozen-decoder pipeline): hybrid, mse, bce.")
+    parser.add_argument("--gated-tie-weights", action="store_true",
+                        help="For --supervision gated_bce: tie magnitude encoder "
+                             "to gate encoder via per-feature scale (halves params)")
+    parser.add_argument("--jumprelu-theta-init", type=float, default=None,
+                        help="For --supervision hinge_jumprelu: initial value "
+                             "of per-feature θ threshold (default 0.1)")
     parser.add_argument("--no-freeze-decoder", action="store_true",
                         help="Train decoder columns (legacy). Default: frozen to target_dirs")
     parser.add_argument("--selectivity", default=None,
@@ -198,6 +207,10 @@ def main():
         overrides["scaffold_catalog"] = args.scaffold_catalog
     if args.supervision:
         overrides["supervision_mode"] = args.supervision
+    if args.gated_tie_weights:
+        overrides["gated_tie_weights"] = True
+    if args.jumprelu_theta_init is not None:
+        overrides["jumprelu_theta_init"] = args.jumprelu_theta_init
     if args.no_mse:
         overrides["supervision_mode"] = "bce"
     if args.full_desc:

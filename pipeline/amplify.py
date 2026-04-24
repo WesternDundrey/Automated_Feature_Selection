@@ -221,10 +221,8 @@ def run(cfg: Config = None):
     model_cfg = torch.load(
         cfg.checkpoint_config_path, map_location="cpu", weights_only=True,
     )
-    sae = SupervisedSAE(
-        model_cfg["d_model"], model_cfg["n_supervised"],
-        model_cfg["n_unsupervised"], model_cfg.get("n_lista_steps", 0),
-    )
+    from .train import load_trained_sae
+    sae = load_trained_sae(model_cfg)
     sae.load_state_dict(
         torch.load(cfg.checkpoint_path, map_location="cpu", weights_only=True)
     )

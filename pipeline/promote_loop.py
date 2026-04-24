@@ -977,10 +977,8 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
         model_cfg = torch.load(
             cfg.checkpoint_config_path, map_location="cpu", weights_only=True,
         )
-        sae = SupervisedSAE(
-            model_cfg["d_model"], model_cfg["n_supervised"],
-            model_cfg["n_unsupervised"], model_cfg.get("n_lista_steps", 0),
-        )
+        from .train import load_trained_sae
+        sae = load_trained_sae(model_cfg)
         sae.load_state_dict(torch.load(
             cfg.checkpoint_path, map_location="cpu", weights_only=True,
         ))
@@ -1629,11 +1627,7 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
         new_model_cfg = torch.load(
             cfg.checkpoint_config_path, map_location="cpu", weights_only=True,
         )
-        new_sae = SupervisedSAE(
-            new_model_cfg["d_model"], new_model_cfg["n_supervised"],
-            new_model_cfg["n_unsupervised"],
-            new_model_cfg.get("n_lista_steps", 0),
-        )
+        new_sae = load_trained_sae(new_model_cfg)
         new_sae.load_state_dict(torch.load(
             cfg.checkpoint_path, map_location="cpu", weights_only=True,
         ))

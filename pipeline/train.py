@@ -243,6 +243,36 @@ def hierarchy_loss(sup_acts: torch.Tensor, hierarchy: dict[int, list[int]]) -> t
 
 # ── Training loop ───────────────────────────────────────────────────────────
 
+def load_trained_sae(model_cfg: dict) -> "torch.nn.Module":
+    """Instantiate the right SAE class for a saved checkpoint.
+
+    Older checkpoints written by the legacy supervision_mode ∈
+    {"hybrid", "mse", "bce"} paths use the `SupervisedSAE` class in this
+    module. New hinge-family checkpoints (v8.11+) use
+    `HingeSAE` / `JumpReLUHingeSAE` / `GatedBCESAE` from
+    `supervised_hinge.py`. Dispatches based on the `supervision_mode`
+    field in the saved model_cfg dict, falling back to the legacy class
+    for checkpoints that predate the field.
+    """
+    supervision_mode = model_cfg.get("supervision_mode", "hybrid")
+    from .supervised_hinge import is_hinge_mode, build_hinge_sae
+    if is_hinge_mode(supervision_mode):
+        return build_hinge_sae(
+            supervision_mode=supervision_mode,
+            d_model=model_cfg["d_model"],
+            n_supervised=model_cfg["n_supervised"],
+            n_unsupervised=model_cfg["n_unsupervised"],
+            gated_tie_weights=model_cfg.get("gated_tie_weights", False),
+            theta_init=model_cfg.get("jumprelu_theta_init", 0.1),
+        )
+    return SupervisedSAE(
+        model_cfg["d_model"],
+        model_cfg["n_supervised"],
+        model_cfg["n_unsupervised"],
+        model_cfg.get("n_lista_steps", 0),
+    )
+
+
 def train_supervised_sae(
     activations: torch.Tensor,
     labels: torch.Tensor,
@@ -261,6 +291,15 @@ def train_supervised_sae(
     Returns:
         Trained SupervisedSAE on CPU.
     """
+    # Dispatch to the hinge-family trainer for the new supervision modes.
+    # These modes train end-to-end (no frozen decoder, no target_dir-as-loss
+    # constraint) per supervised_saes_hinge_loss.md.
+    from .supervised_hinge import is_hinge_mode, train_hinge_sae
+    if is_hinge_mode(cfg.supervision_mode):
+        return train_hinge_sae(
+            activations, labels, features, cfg, save_checkpoint=save_checkpoint,
+        )
+
     set_seed(cfg.seed)
 
     N, T, d_model = activations.shape

@@ -644,10 +644,8 @@ def run(cfg: Config = None):
     if not cfg.checkpoint_path.exists():
         raise FileNotFoundError(f"No trained SAE: {cfg.checkpoint_path}")
     model_cfg = torch.load(cfg.checkpoint_config_path, weights_only=True)
-    sae = SupervisedSAE(
-        model_cfg["d_model"], model_cfg["n_supervised"],
-        model_cfg["n_unsupervised"], model_cfg.get("n_lista_steps", 0),
-    )
+    from .train import load_trained_sae
+    sae = load_trained_sae(model_cfg)
     sae.load_state_dict(torch.load(cfg.checkpoint_path, weights_only=True))
 
     # Match model dtype (SAE trained in fp32, but Gemma runs in bf16)

@@ -4,6 +4,102 @@
 
 ---
 
+## [v8.11] — Hinge / JumpReLU / Gated-BCE supervision modes (per mentor's methodology note)
+
+**Date:** 2026-04-25
+
+### Motivation
+
+Mentor's `supervised_saes_hinge_loss.md` lays out three principled supervised-SAE formulations that train end-to-end (encoder + decoder jointly) without the frozen-decoder workaround. The core insight: hinge loss on pre-activations gives zero gradient when a feature is correctly gated, which is exactly what you want — MSE reconstruction then shapes magnitude alone, no shrinkage bias, no straight-through estimators, no target_dir pre-computation, no validation-threshold hacks. The legacy frozen-decoder path (summary6, summary7) gave the cos = 1.000 interpretability guarantee but at the cost of a more complex training pipeline; the mentor's trade is elegance for that guarantee.
+
+User chose to adopt this as the default. The frozen-decoder modes stay available for reproducing prior numbers; new runs default to hinge.
+
+### Additions
+
+**`pipeline/supervised_hinge.py` (NEW).** Three SAE classes + three loss functions + training loop for the end-to-end modes:
+
+- `HingeSAE` — ReLU encoder, no frozen decoder, per-step unit-norm column normalization on the full decoder. Hinge loss on the pre-activation of each supervised latent; sparsity (L1) applies only to the unsupervised slice.
+- `JumpReLUHingeSAE` — identical to HingeSAE plus a per-feature learnable threshold `θ_i`. Forward: `f_i = z_i · H(z_i - θ_i)`. The Heaviside gate is non-differentiable but `θ` gets its gradient from the hinge term (which is piecewise-linear in `θ` with gradient ±1 on the active side, 0 on satisfied). MSE contributes zero gradient to `θ` (autograd drops the Dirac) — this is what the doc means by "no STE needed for JumpReLU under supervised training."
+- `GatedBCESAE` — two encoder paths (`gate_encoder`, `mag_encoder` or tied-via-scale variant). Forward: `f_i = H(π_i) · ReLU(m_i)`. BCE on `σ(π)` supervises the gate; MSE supervises magnitude. Optional weight tying `W_mag = exp(r) · W_gate` (per-feature scale, halves encoder params).
+- `hinge_supervision_loss`, `jumprelu_hinge_supervision_loss`, `gated_bce_supervision_loss` — all accept per-feature `pos_weight` (`(n_neg / n_pos).clamp(max=100)`) so the supervised signal isn't swamped by rare features' large positive-class imbalance. The doc is silent on class balance; we add it explicitly so cross-mode comparison isn't confounded by imbalance handling.
+- `build_hinge_sae(supervision_mode, ...)` dispatcher and `train_hinge_sae(activations, labels, features, cfg)` trainer — the latter replaces the legacy `train_supervised_sae` path for hinge-family modes.
+
+**`cfg.supervision_mode` default flipped `"hybrid"` → `"hinge"`.** New fresh runs use the end-to-end design. Reproducing summary6/7 requires `--supervision hybrid` explicitly. Two new sub-knobs: `gated_tie_weights` (for `gated_bce`) and `jumprelu_theta_init` (for `hinge_jumprelu`).
+
+**`pipeline/train.py`:**
+- Early dispatch in `train_supervised_sae(...)`: if `supervision_mode` is one of the hinge-family modes, delegate to `train_hinge_sae`. Legacy path unchanged.
+- New `load_trained_sae(model_cfg)` helper — instantiates the right SAE class based on `model_cfg["supervision_mode"]` (checkpoint metadata). Falls back to `SupervisedSAE` for pre-v8.11 checkpoints (which didn't record a supervision_mode).
+
+**9 downstream sites updated** (evaluate, promote_loop ×2, composition, intervention, causal, circuit, residual, amplify, feature_splitting): each `sae = SupervisedSAE(d_model, n_sup, n_unsup, n_lista)` replaced with `sae = load_trained_sae(model_cfg)`. Checkpoints written by hinge-family training will load correctly into the right class for all downstream steps.
+
+**CLI:** `--supervision` choices extended to include `hinge`, `hinge_jumprelu`, `gated_bce`. New flags `--gated-tie-weights` and `--jumprelu-theta-init`.
+
+### What's different about the hinge path (vs legacy frozen-decoder)
+
+- **No frozen decoder.** All decoder columns (supervised + unsupervised) train freely, unit-normalized after each step.
+- **No pre-computed target_dirs constraint.** `compute_target_directions` still runs post-hoc so `target_directions.pt` is written for downstream diagnostics (intervention, promote_loop cosine gate, composition), but target_dirs aren't used in the loss.
+- **Per-feature sparsity disabled on the supervised slice.** L1 penalty `cfg.lambda_sparse * acts.abs().mean()` applies only to `acts[..., n_supervised:]`. Rationale from the doc: supervised sparsity is inherited from the labels; adding L1 on top re-introduces the shrinkage pressure hinge was designed to avoid.
+- **Hierarchy loss still applies** (orthogonal regularizer, not coupled to supervision mode).
+- **Warmup of supervision weight** (linear from 0 → `cfg.lambda_sup` over `cfg.warmup_steps`) preserved.
+- **Decoder init** kaiming + unit-norm columns; same conventions as legacy.
+- **Checkpoint format** includes `supervision_mode` + mode-specific params (`gated_tie_weights`, `jumprelu_theta_init`). Legacy checkpoints (missing these fields) load via the legacy `SupervisedSAE` class in `load_trained_sae`.
+
+### What this does NOT change
+
+- Downstream pipeline semantics: `causal.py`, `intervention.py`, `composition.py`, `promote_loop.py`, `layer_sweep.py`, `usweep.py` all expect the same `(recon, sup_pre, sup_acts, all_acts)` forward signature, which all three new classes honor.
+- `evaluate.py`'s reconstruction / F1 / AUROC / cosine-to-target computation. The cos-to-target number that was "always 1.000" under frozen decoder will now report a learned number (0 to 1) as a post-hoc diagnostic.
+- Role tags / scaffold / denylist (v8.10) — independent of supervision mode.
+- BOS masking (v8.6) — independent of supervision mode.
+
+### What the user should run first
+
+To validate the new default works end-to-end on the existing cached artifacts:
+
+```
+rm -f pipeline_data/supervised_sae.pt \\
+pipeline_data/supervised_sae.pt.meta.json \\
+pipeline_data/supervised_sae_config.pt \\
+pipeline_data/target_directions.pt \\
+pipeline_data/split_indices.pt \\
+pipeline_data/evaluation.json \\
+pipeline_data/evaluation.json.meta.json
+F="--layer 9 --sae_id blocks.9.hook_resid_pre --local-annotator --n_sequences 1000 --epochs 15"
+python -m pipeline.run --step train $F
+python -m pipeline.run --step evaluate $F
+```
+
+The run log should print `supervision_mode=hinge` and `decoder: NOT FROZEN (end-to-end training)`. The cos-to-target-dir metric will be a learned number, not 1.000 — that's the expected change.
+
+A/B comparison against legacy:
+
+```
+python -m pipeline.run --step train --supervision hybrid $F
+python -m pipeline.run --step evaluate --supervision hybrid $F
+# (output_dir becomes pipeline_data again; both runs overlap on checkpoint_path
+# unless --output_dir is routed to a separate subdir — see RUNNING.md)
+```
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/supervised_hinge.py` | **NEW** — three SAE classes + losses + trainer |
+| `pipeline/train.py` | `load_trained_sae` dispatcher; `train_supervised_sae` routes hinge modes to `train_hinge_sae` |
+| `pipeline/config.py` | `supervision_mode` default `"hybrid"` → `"hinge"`; new `gated_tie_weights`, `jumprelu_theta_init` |
+| `pipeline/run.py` | `--supervision` choices extended; `--gated-tie-weights`, `--jumprelu-theta-init` |
+| `pipeline/evaluate.py` | load via `load_trained_sae` |
+| `pipeline/promote_loop.py` | load via `load_trained_sae` (both main + capacity-transfer sites) |
+| `pipeline/composition.py` | load via `load_trained_sae` |
+| `pipeline/intervention.py` | load via `load_trained_sae` |
+| `pipeline/causal.py` | load via `load_trained_sae` |
+| `pipeline/circuit.py` | load via `load_trained_sae` |
+| `pipeline/residual.py` | load via `load_trained_sae` |
+| `pipeline/amplify.py` | load via `load_trained_sae` |
+| `pipeline/feature_splitting.py` | load via `load_trained_sae` |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.10] — Pre-discovery scaffold + role tags + denylist
 
 **Date:** 2026-04-21
