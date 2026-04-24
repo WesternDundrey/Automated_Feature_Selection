@@ -308,9 +308,23 @@ CRISPNESS_CATEGORIES = (
     "not_token_local",    # about context / sequence, not the specific token
     "uninterpretable",    # description itself is incoherent
     "nuisance",           # catches what nuisance_check missed
+    "denylist",           # substring match against cfg.promote_denylist
     "unknown",            # LLM didn't categorize
     "llm_error",          # unreachable / unparseable — fails closed
 )
+
+
+def _denylist_match(description: str, cfg: Config) -> tuple[bool, str]:
+    """Return (is_denied, matched_pattern). Case-insensitive substring match
+    against cfg.promote_denylist. Used BEFORE Sonnet crispness to cheaply
+    auto-reject descriptions that name known-artifact directions (BOS,
+    padding, etc.) the catalog wants to audit but never promote."""
+    patterns = getattr(cfg, "promote_denylist", ()) or ()
+    desc_lc = (description or "").lower()
+    for pat in patterns:
+        if pat.lower() in desc_lc:
+            return True, pat
+    return False, ""
 
 
 def _crispness_judgment(description: str, cfg: Config) -> tuple[bool, str, str]:
@@ -1145,9 +1159,23 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
             all_descriptions.update(batch_descs)
             descriptions_path.write_text(json.dumps(all_descriptions, indent=2))
 
-            # Crispness gate with rejection taxonomy.
+            # Denylist + crispness gate with rejection taxonomy.
             for u_str, desc in batch_descs.items():
                 u_local = int(u_str)
+                # Cheap substring denylist FIRST (pre-Sonnet). Catches
+                # descriptions naming BOS / padding / known artifacts
+                # the catalog should audit but never promote.
+                is_denied, deny_pat = _denylist_match(desc, cfg)
+                if is_denied:
+                    crispness_log[u_str] = {
+                        "crisp": False,
+                        "category": "denylist",
+                        "reason": f"denylist match: {deny_pat!r}",
+                        "description": desc,
+                    }
+                    already_processed.add(u_str)
+                    spent += 1
+                    continue
                 is_crisp, reason, category = _crispness_judgment(desc, cfg)
                 crispness_log[u_str] = {
                     "crisp": is_crisp,
@@ -1213,6 +1241,7 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
                     "description": desc_by_u[u],
                     "type": "leaf",
                     "parent": None,
+                    "role": "discovery",
                     "source_u_local_idx": int(u),
                     "source_kind": "u_latent_crisp",
                     "n_pos_at_proposal": int(n_pos_list[i]),
@@ -1355,6 +1384,7 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
                         "description": a["description"],
                         "type": "leaf",
                         "parent": None,
+                        "role": "discovery",
                         "source_u_local_idx": int(a["source_u"]),
                         "source_kind": "decomposed_atom",
                         "n_pos_at_mini": int(atom_n_pos[idx_in_kept]),

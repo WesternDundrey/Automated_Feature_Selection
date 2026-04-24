@@ -1,0 +1,161 @@
+{
+  "_docstring": "Scaffold / control features. These are surface/artifact directions that the residual stream spends significant capacity on. Seeding them pre-discovery prevents the promote-loop from consuming its proposal budget on rediscovery. All are tagged role='control' so downstream eval stats can report 'discovery-only' headline numbers separately from 'all features'. Descriptions are operationally testable at the token level (yes/no decidable for one token in context).",
+  "features": [
+    {
+      "id": "control.document_boundary",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is the very first token of a sequence (position 0) OR a document-boundary marker like the literal string '<|endoftext|>'."
+    },
+    {
+      "id": "control.whitespace_run",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token consists entirely of whitespace (two or more spaces, tabs, or multiple newlines run together). A single space as part of a word token does NOT match."
+    },
+    {
+      "id": "control.tab_or_indent",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token starts with a tab character or is a multi-space indent at the start of a line (as used for code indentation or outlined lists)."
+    },
+    {
+      "id": "control.list_bullet_or_asterisk",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a standalone list marker: '*', '-', '•', or a numeric-dot like '1.' appearing at the start of a line."
+    },
+    {
+      "id": "control.currency_symbol",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a currency symbol ('$', '€', '£', '¥') or a currency code fragment ('USD', 'EUR', 'GBP')."
+    },
+    {
+      "id": "control.math_operator",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a mathematical/comparison operator in isolation: '=', '+', '-', '*', '/', '<', '>', '%', '≤', '≥', '≠', '±'."
+    },
+    {
+      "id": "control.bracket_opening",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is an opening bracket/paren/brace in isolation: '(', '[', '{'. Does NOT include closing variants."
+    },
+    {
+      "id": "control.bracket_closing",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a closing bracket/paren/brace in isolation: ')', ']', '}'. Does NOT include opening variants."
+    },
+    {
+      "id": "control.semicolon",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is the semicolon character ';' used as a statement or clause separator."
+    },
+    {
+      "id": "control.ampersand",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is the ampersand character '&' or an HTML entity fragment like '&amp;', '&gt;', '&lt;'."
+    },
+    {
+      "id": "control.ellipsis",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is an ellipsis: '...', '…', or two/three consecutive periods used mid-sentence for omission or pause."
+    },
+    {
+      "id": "control.repeated_character",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a repeated-character run used for emphasis or separation: '!!!', '???', '---', '===', '***', '______'. Minimum 3 repeats of a non-whitespace character."
+    },
+    {
+      "id": "control.html_tag_fragment",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is part of an HTML/XML tag: an opening angle bracket followed by a tag name ('<div', '<p'), or a closing tag ('</p>', '</span>'), or a self-closing fragment ('/>')."
+    },
+    {
+      "id": "control.code_identifier",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token looks like a programming-language identifier: snake_case ('my_variable'), camelCase ('myVariable'), PascalCase ('MyClass'), or ALL_CAPS_CONST. Must contain an underscore OR have case-mixing in an otherwise-alphabetic token."
+    },
+    {
+      "id": "control.hex_or_uuid_fragment",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a hex-string or UUID fragment: 4+ consecutive characters all in [0-9a-fA-F], NOT a plain decimal number. Examples: 'a1b2', '0xDEAD', 'ffa-b12'."
+    },
+    {
+      "id": "control.at_mention",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is '@' followed by an alphanumeric handle, like in '@username' or '@company_name'."
+    },
+    {
+      "id": "control.hashtag_fragment",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is '#' followed by an alphanumeric tag, like in '#hashtag' or '#MondayMotivation'. NOT a markdown header (markdown headers have a trailing space)."
+    },
+    {
+      "id": "control.byline_or_attribution_fragment",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is part of a news byline or attribution phrase: 'By', 'Reuters', 'AP', '(AP)', a wire-service marker at the start of a paragraph or news item."
+    },
+    {
+      "id": "control.emoji_or_symbol",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a Unicode emoji or pictographic symbol (face, object, arrow, etc.). NOT a plain ASCII character."
+    },
+    {
+      "id": "control.url_scheme",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is part of a URL scheme prefix: 'http://', 'https://', 'ftp://', 'mailto:', or the '://' separator fragment."
+    },
+    {
+      "id": "control.separator_rule",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a standalone separator rule used between sections: a line of 5+ consecutive '=', '-', '_', '—', or '*' characters."
+    }
+  ],
+  "groups": [
+    {
+      "id": "control",
+      "type": "group",
+      "parent": null,
+      "role": "control",
+      "description": "Umbrella for surface / artifact / nuisance features seeded into the catalog as scaffolding. These are NEVER headline findings — they exist to absorb residual-stream capacity that would otherwise dominate unsupervised discovery and pollute composition/intervention metrics."
+    }
+  ]
+}

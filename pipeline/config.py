@@ -128,6 +128,27 @@ class Config:
     # training on those labels would silently corrupt the catalog.
     annotation_max_failure_rate: float = 0.10
 
+    # ── Scaffold / control catalog ─────────────────────────────────
+    # Path to an optional scaffold catalog (see `pipeline/scaffold_catalog.json`)
+    # merged into feature_catalog.json before training. Scaffold features
+    # are tagged `role="control"` so downstream evaluation stats can
+    # report "headline / discovery-only" numbers separately from "all
+    # features (including scaffold)". Empty string = no scaffold merge.
+    scaffold_catalog: str = ""
+
+    # Denylist of description patterns. During promote-loop triage, any
+    # candidate description (from Sonnet) that contains ANY of these
+    # substrings (case-insensitive) is auto-rejected as `denylist`
+    # without further gates. Used to prevent the loop from promoting
+    # things like BOS tokens, padding, known artifacts — directions the
+    # catalog should *audit* but not promote as discoveries.
+    promote_denylist: tuple = (
+        "endoftext", "<|endoftext|>",
+        "beginning of sequence", "bos token",
+        "document boundary marker", "padding token",
+        "start-of-sequence", "sequence start marker",
+    )
+
     # ── Feature filtering ──────────────────────────────────────
     min_feature_positive_rate: float = 0.0  # disabled by default (rare features are intentional)
 

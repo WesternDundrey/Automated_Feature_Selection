@@ -343,6 +343,30 @@ def evaluate(cfg: Config = None):
     print(f"\n  Mean F1 (features with positives):    {mean_f1:.3f}")
     print(f"  Mean AUROC (features with positives): {mean_auroc:.3f}")
 
+    # Discovery-only aggregates: exclude role='control' (scaffold) features
+    # from headline means. Scaffold exists to absorb surface capacity; paper
+    # numbers shouldn't credit the method for finding seeded concepts.
+    from .catalog_utils import discovery_only_ids
+    disc_ids = discovery_only_ids(features)
+    disc_f1 = [
+        feature_results[k].get("f1") for k, feat in enumerate(features)
+        if feat["id"] in disc_ids and feature_results[k].get("f1") is not None
+    ]
+    disc_auroc = [
+        feature_results[k].get("auroc") for k, feat in enumerate(features)
+        if feat["id"] in disc_ids and feature_results[k].get("auroc") is not None
+    ]
+    mean_f1_discovery = (
+        float(np.mean(disc_f1)) if disc_f1 else mean_f1
+    )
+    mean_auroc_discovery = (
+        float(np.mean(disc_auroc)) if disc_auroc else mean_auroc
+    )
+    if len(disc_ids) != len(features):
+        print(f"  Mean F1 (discovery-only, {len(disc_ids)} of {len(features)}): "
+              f"{mean_f1_discovery:.3f}")
+        print(f"  Mean AUROC (discovery-only): {mean_auroc_discovery:.3f}")
+
     # ── 2a. Calibrated-threshold F1 (tuned on val, applied to test) ──
     print(f"\n  CALIBRATED F1 (thresholds from val set, evaluated on test):")
     print(f"  {'Feature':<36} {'calF1':>6} {'calP':>6} {'calR':>6} {'thresh':>8}")
@@ -380,6 +404,30 @@ def evaluate(cfg: Config = None):
     print(f"\n  Mean calibrated F1 (on test):             {cal_mean_f1:.3f}  (vs t=0: {mean_f1:.3f})")
     print(f"  Mean val-calib F1 (overfit, fit=score on val-calib): {val_mean_f1_cal:.3f}")
     print(f"  Mean val-promo F1 (HONEST, held-out val half):       {val_mean_promo_f1:.3f}  ← use this for promote-loop gating")
+
+    # Discovery-only calibrated F1
+    disc_cal_f1_scores = []
+    disc_val_promo_f1_scores = []
+    for k, feat in enumerate(features):
+        if feat["id"] not in disc_ids:
+            continue
+        rec = feature_results[k]
+        if rec.get("cal_f1") is not None:
+            disc_cal_f1_scores.append(rec["cal_f1"])
+        if rec.get("val_promo_f1") is not None and rec.get("val_promo_n_pos", 0) > 0:
+            disc_val_promo_f1_scores.append(rec["val_promo_f1"])
+    cal_mean_f1_discovery = (
+        float(np.mean(disc_cal_f1_scores)) if disc_cal_f1_scores else cal_mean_f1
+    )
+    val_promo_f1_discovery = (
+        float(np.mean(disc_val_promo_f1_scores))
+        if disc_val_promo_f1_scores else val_mean_promo_f1
+    )
+    if len(disc_ids) != len(features):
+        print(f"  Mean calibrated F1 (discovery-only, n={len(disc_cal_f1_scores)}):  "
+              f"{cal_mean_f1_discovery:.3f}")
+        print(f"  Mean val-promo F1 (discovery-only):                  "
+              f"{val_promo_f1_discovery:.3f}  ← HEADLINE number")
 
     # ── 2b. Oracle-threshold F1 (per-feature optimum on test — reference only)
     print(f"\n  ORACLE F1 (per-feature optimum on test set — NOT honest eval):")
@@ -907,6 +955,13 @@ def evaluate(cfg: Config = None):
         "cal_mean_f1": cal_mean_f1,
         "opt_mean_f1": opt_mean_f1,
         "mean_auroc": mean_auroc,
+        # Discovery-only (role != "control"). Use these in summaries.
+        "mean_f1_discovery": mean_f1_discovery,
+        "mean_auroc_discovery": mean_auroc_discovery,
+        "cal_mean_f1_discovery": cal_mean_f1_discovery,
+        "val_promo_f1_discovery": val_promo_f1_discovery,
+        "n_discovery_features": len(disc_ids),
+        "n_total_features": len(features),
         "n_val_vectors": int(x_val.shape[0]),
         "mse_supervision_metrics": {
             "mean_cosine_to_target": mean_cosine,

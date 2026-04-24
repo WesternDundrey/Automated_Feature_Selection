@@ -51,6 +51,13 @@ def main():
                         help="Full-sequence JSON output (vs per-token)")
     parser.add_argument("--catalog", default=None,
                         help="Path to manual feature catalog JSON (skips inventory step)")
+    parser.add_argument("--scaffold-catalog", default=None,
+                        help="Optional scaffold catalog merged into the "
+                             "main catalog pre-training. Features inherit "
+                             "role='control' so downstream eval stats can "
+                             "separate discovery-only headlines from scaffold. "
+                             "Default pipeline/scaffold_catalog.json ships with "
+                             "~20 surface/artifact features.")
     parser.add_argument("--no-mse", action="store_true",
                         help="Use legacy BCE supervision instead of MSE")
     parser.add_argument("--full-desc", action="store_true",
@@ -187,6 +194,8 @@ def main():
         overrides["batch_positions"] = True
     if args.catalog:
         overrides["manual_catalog"] = args.catalog
+    if args.scaffold_catalog:
+        overrides["scaffold_catalog"] = args.scaffold_catalog
     if args.supervision:
         overrides["supervision_mode"] = args.supervision
     if args.no_mse:
@@ -238,6 +247,18 @@ def main():
         from .inventory import run as run_inventory
         run_inventory(cfg)
         print(f"Step 1 completed in {time.time() - t0:.1f}s")
+
+    # Merge scaffold catalog (if provided) into the main catalog BEFORE
+    # annotation. Scaffold entries carry role="control" so eval stats can
+    # separate headline/discovery from surface scaffolding.
+    if cfg.scaffold_catalog and cfg.catalog_path.exists():
+        scaffold_path = Path(cfg.scaffold_catalog)
+        if scaffold_path.exists():
+            from .catalog_utils import merge_scaffold
+            print(f"\n  Merging scaffold catalog: {scaffold_path}")
+            merge_scaffold(cfg.catalog_path, scaffold_path)
+        else:
+            print(f"\n  WARNING: scaffold_catalog not found at {scaffold_path}")
 
     # Flatten catalog if requested (strip groups, keep only leaves)
     if args.flat and cfg.catalog_path.exists():

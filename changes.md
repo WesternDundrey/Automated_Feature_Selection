@@ -4,6 +4,72 @@
 
 ---
 
+## [v8.10] — Pre-discovery scaffold + role tags + denylist
+
+**Date:** 2026-04-21
+
+### Motivation
+
+Reviewer point: the promote-loop's top-ΔR² U latents consistently rediscover surface/artifact directions (BOS, whitespace, bracket variants, code-identifier shapes) because those dominate residual-stream variance. Every round burns a portion of its budget on descriptions of features the catalog *already* knows it doesn't want to promote. Pre-seeding scaffold ("these directions are ours by construction, not by discovery") lets the supervised slice absorb surface capacity before the loop runs, freeing U's top-variance mass for actual semantic discovery.
+
+Separately: the user wants BOS/artifact directions *identified and measured* but *not credited as discoveries* in headline stats — i.e., train/eval them normally so they're not hidden, but filter them out when reporting paper-facing numbers. Needs a principled role tag on features.
+
+### Fixes / additions
+
+**1. `role` field on catalog feature schema.** Optional, default `"discovery"` for backward-compat. `"control"` marks scaffold/artifact features that participate in training+eval but don't contribute to headline means.
+
+**2. `pipeline/scaffold_catalog.json` (new).** ~20 hand-written surface features tagged `role="control"`: document_boundary, whitespace_run, tab_or_indent, list_bullet, currency_symbol, math_operator, bracket_opening/closing, semicolon, ampersand, ellipsis, repeated_character, html_tag_fragment, code_identifier, hex_or_uuid_fragment, at_mention, hashtag_fragment, byline_or_attribution, emoji_or_symbol, url_scheme, separator_rule. Descriptions are operationally testable at the token level.
+
+**3. `pipeline/catalog_utils.py` (new).** `merge_scaffold`, `split_by_role`, `discovery_only_ids` helpers. `merge_scaffold` appends scaffold entries to an existing catalog, skipping id collisions by default so custom hand-written entries win over scaffold defaults.
+
+**4. CLI:** `--scaffold-catalog PATH` merges scaffold into the main catalog after inventory and before annotation. Config default is empty string (opt-in).
+
+**5. `evaluate.py` reports discovery-only means alongside full-catalog means.** `mean_f1_discovery`, `mean_auroc_discovery`, `cal_mean_f1_discovery`, `val_promo_f1_discovery` are added to `evaluation.json`. Console output prints both the full-catalog and discovery-only F1 with the discovery-only number flagged as `← HEADLINE`.
+
+**6. Promote-loop denylist (`cfg.promote_denylist`).** Tuple of case-insensitive substrings. Any Sonnet-generated description whose text contains any denylist pattern is auto-rejected pre-crispness with `category="denylist"`. Default patterns cover BOS / endoftext / padding / start-of-sequence mentions. Complementary to the v8.7 nuisance prefilter (which operates on top-activation token diversity, not description text).
+
+**7. Promoted features tagged `role="discovery"` explicitly** in `promote_loop` so they don't silently adopt whatever default. Scaffold features that roll into the catalog stay tagged `role="control"`.
+
+### Usage
+
+```
+python -m pipeline.run \
+--step inventory \
+--layer 9 \
+--sae_id blocks.9.hook_resid_pre \
+--scaffold-catalog pipeline/scaffold_catalog.json \
+--local-annotator \
+--n_sequences 1000
+```
+
+After inventory, the main catalog has Sonnet's ~60-70 discovery features + 20 scaffold controls. Annotate/train/evaluate treat them identically; the headline eval numbers only include the ~60-70 discovery features.
+
+### BOS tension (left deliberately unresolved)
+
+`mask_first_n_positions=1` (v8.6) is still on by default — masking position 0 from all analysis was the critical fix for target_dir collapse and we don't want to regress that. The scaffold's `control.document_boundary` feature therefore sees *no* training signal from actual BOS positions today; it'd only be useful if you flip the mask off (`cfg.mask_first_n_positions = 0`).
+
+Preserving the v8.6 stability AND properly training BOS as a control feature requires decoupling "mask BOS for target_dir computation" from "mask BOS everywhere in analysis". That's a separate design question; parking it until there's evidence the current role-tag infrastructure catches what the paper needs.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/scaffold_catalog.json` | **NEW** — 20 control/scaffold features |
+| `pipeline/catalog_utils.py` | **NEW** — scaffold merge + role helpers |
+| `pipeline/config.py` | `scaffold_catalog`, `promote_denylist` fields |
+| `pipeline/run.py` | `--scaffold-catalog` flag + merge step post-inventory |
+| `pipeline/evaluate.py` | discovery-only aggregates alongside full-catalog |
+| `pipeline/promote_loop.py` | denylist gate; promoted features tagged `role="discovery"` |
+| `changes.md` | This entry |
+
+---
+
+## [v8.9.1] — Hotfix: stale `candidate_u_indices` in promote-loop round summary
+
+Post-round summary block in `promote_loop.run()` referenced `candidate_u_indices`, a variable removed in v8.7's adaptive-batching rewrite. When round 0 succeeded for the first time (2 promoted features survived all gates), the summary-building crashed with NameError after all the expensive work had already completed. Fix: reference `all_candidates` + `spent` (which do exist in the adaptive path), and include `crispness_breakdown` + `n_atom_proposals` in the round record for downstream diagnostic reading.
+
+---
+
 ## [v8.9] — U-width sweep (`--step usweep`) + triage-only mode for promote-loop
 
 **Date:** 2026-04-21
