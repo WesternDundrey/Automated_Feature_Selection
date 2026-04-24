@@ -351,12 +351,34 @@ def question2_annotation(activations, tokens, labels_gt, features, cfg):
 # ── Main entry point ───────────────────────────────────────────────────────
 
 def run(cfg: Config = None, skip_annotator: bool = False):
-    """Run IOI validation."""
+    """Run IOI validation.
+
+    IMPORTANT: all IOI artifacts are scoped under `pipeline_data/ioi/` rather
+    than the shared output dir. IOI trains its own SAE on synthetic IOI
+    sentences with only 7 features; writing that SAE to
+    `pipeline_data/supervised_sae.pt` (the path the main pipeline uses)
+    would clobber the catalog-trained SAE every time IOI runs, breaking
+    every downstream step that depends on it (intervention, composition,
+    promote-loop). Scoping cfg.output_dir inside this function redirects
+    all cfg.*_path properties to the ioi subdir.
+    """
     if cfg is None:
         cfg = Config()
 
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    main_output_dir = cfg.output_dir
+    ioi_dir = main_output_dir / "ioi"
+    ioi_dir.mkdir(parents=True, exist_ok=True)
+    cfg.output_dir = ioi_dir
 
+    try:
+        return _run_inner(cfg, skip_annotator)
+    finally:
+        # Restore so subsequent steps in the same Python process see the
+        # real output dir again.
+        cfg.output_dir = main_output_dir
+
+
+def _run_inner(cfg: Config, skip_annotator: bool):
     from .inventory import load_target_model
 
     print("Loading GPT-2 Small...")
