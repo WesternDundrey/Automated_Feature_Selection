@@ -4,6 +4,77 @@
 
 ---
 
+## [v8.8] — Multi-concept decomposition with atom-specific target_dirs
+
+**Date:** 2026-04-21
+
+### Motivation
+
+v8.7.1 round-0 produced a clean diagnostic: 100 proposals, 22 nuisance, 78 described, 64 of those rejected as `multi_concept`, 1 crisp. The top-ΔR² U latents at layer 9 are almost all **reconstructive bundles** — real activation structure, but bundling 2–5 distinct concepts under one latent. Describing them as singletons fails the crispness gate correctly; the fix is to mine the bundle for atomic features instead of discarding it.
+
+### Design (reviewer-specified)
+
+For every `multi_concept` rejection:
+
+1. **Decompose via Sonnet.** Pass the original description + top-activating contexts back to Sonnet with a prompt asking for 2-5 atomic token-level feature hypotheses ("each must be yes/no answerable for a single token in context, no 'or'/'and'/'sometimes'").
+2. **Crispness gate on atoms.** Each atomic hypothesis runs through the existing crispness gate independently. Non-crisp atoms are dropped here.
+3. **Within-round semantic dedup.** A single Sonnet call groups all surviving atoms by semantic equivalence; one representative is kept per group, the rest are logged as merged duplicates. Cheap (1 API call for N atoms).
+4. **Mini-annotation on atoms.** Annotate each deduped atom on a random 50-sequence subset (drawn deterministically by `cfg.seed + 9001`). Produces real label tensors per atom.
+5. **Atom-specific target_dirs from mini labels.** `d_atom = normalize(mean(x | atom_label=1) − mean(x))` computed on the mini subset. **NOT** the source U's firing-mask direction — the source U is exactly the bundle we're decomposing, so its mask is not evidence for any one atom. Atoms with fewer than `promote_atom_mini_min_pos` (default 3) positives in the mini subset are dropped as under-supported.
+6. **Merge using atom-specific directions.** Atoms go into the same merge gate as source-U crisp proposals (cosine against existing `target_dirs` + Sonnet separability), but their cosine is computed against their atom-specific mini-label direction, not the bundle's direction.
+7. **Full annotation + retrain on survivors only.** Everything past merge uses the existing v8.1+ id-keyed cache path.
+
+### New proposal set
+
+Each round's proposals list is now the union of:
+- **source-U crisp proposals**: latents that passed crispness as singletons. `source_kind = "u_latent_crisp"`. Target_dir = source U mean-shift (existing behavior).
+- **decomposed atom proposals**: atoms extracted from `multi_concept` rejections. `source_kind = "decomposed_atom"`. Target_dir = mini-annotation mean-shift.
+
+Both are passed to `merge_catalogs_by_direction` with their respective dirs stacked; no change to merge itself.
+
+### Diagnostic warning (reviewer's #5)
+
+When `multi_concept_rate > promote_multi_concept_warn_rate` (default 0.70) in a round, the loop prints a warning that the U slice is dominated by bundles. This is **per-round diagnostic only** — decomposition runs unconditionally whenever multi_concept rejections exist, regardless of rate. A later round with cleaner U latents still gets normal describe→crispness handling.
+
+### New config + CLI
+
+Config defaults:
+- `promote_decompose_multi_concept = True`
+- `promote_decompose_max_atoms = 5`
+- `promote_atom_mini_min_pos = 3`
+- `promote_multi_concept_warn_rate = 0.70`
+
+CLI:
+- `--promote-no-decompose` (opt out, e.g., for A/B comparison)
+- `--promote-decompose-max-atoms`
+- `--promote-atom-mini-min-pos`
+
+### Cost accounting (500 seqs, n_features=74, ~50 multi_concepts per round)
+
+Rough estimates:
+- Decomposition: ~50 Sonnet calls (≈$0.50)
+- Atom crispness: ~200 atoms → 200 calls (≈$0.50)
+- Semantic dedup: 1 batched call (≈$0.05)
+- Mini-annotation: ~100 deduped atoms × 50 seqs × 128 tokens = 640K vLLM decisions. At ~800 dec/s steady-state with prefix caching, ≈13 min. Most expensive step.
+- Atom target_dir computation: negligible (vectorized mean-shift on a 6400-vector mini tensor)
+
+Total round overhead vs. v8.7.1: roughly +$1 API + ~15 min vLLM. In exchange, `multi_concept` rejections become potential crisp-atom contributions rather than dead ends.
+
+### What's deferred (reviewer's #3)
+
+Clustering U latents by firing-mask overlap before description ("multiple U latents are the same bundle, describe the cluster as a unit"). Bigger rewrite; leaving until we see whether decomposition alone produces enough crisp atoms per round. If the next run still terminates at `too_few_crisp`, clustering is the next lever.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/promote_loop.py` | `_decompose_multi_concept`, `_semantic_dedup_atoms`, `_atom_target_dirs_from_labels` helpers; decomposition path injected after crispness triage; proposals = crisp-U ∪ atoms with their respective dirs |
+| `pipeline/config.py` | four new `promote_decompose_*` + `promote_atom_*` knobs |
+| `pipeline/run.py` | `--promote-no-decompose`, `--promote-decompose-max-atoms`, `--promote-atom-mini-min-pos` |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.7] — Adaptive promote-loop triage: nuisance prefilter, rejection taxonomy, proposal budget
 
 **Date:** 2026-04-21

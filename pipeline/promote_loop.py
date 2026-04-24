@@ -142,6 +142,28 @@ def _attach_defaults(cfg: Config) -> None:
         # 0.3 = at least 30% of top-K tokens are different tokens.
         cfg.promote_nuisance_token_diversity = 0.30
 
+    # Multi-concept decomposition: when the crispness gate rejects a U
+    # description as `multi_concept`, ask Sonnet to split it into 2-5
+    # atomic token-level feature hypotheses, validate each via
+    # crispness + within-round semantic dedup + mini-annotation, and
+    # compute atom-specific target_dirs from the mini labels (NOT from
+    # the source U's firing mask — the source U is precisely the bundle
+    # we're decomposing, so its mask is not evidence for any one atom).
+    if not hasattr(cfg, "promote_decompose_multi_concept"):
+        cfg.promote_decompose_multi_concept = True
+    if not hasattr(cfg, "promote_decompose_max_atoms"):
+        cfg.promote_decompose_max_atoms = 5
+    if not hasattr(cfg, "promote_atom_mini_min_pos"):
+        # minimum n_pos on the mini-annotation subset for an atom to
+        # receive an atom-specific target_dir and pass to merge.
+        cfg.promote_atom_mini_min_pos = 3
+    if not hasattr(cfg, "promote_multi_concept_warn_rate"):
+        # per-round diagnostic: warn if this fraction of described
+        # candidates are rejected as multi_concept. Does NOT change
+        # behavior (decomposition is always on for multi_concept);
+        # just surfaces when the U slice is dominated by bundles.
+        cfg.promote_multi_concept_warn_rate = 0.70
+
 
 # ── Rank U latents by per-latent ΔR² on val ─────────────────────────────────
 
@@ -370,6 +392,198 @@ def _crispness_judgment(description: str, cfg: Config) -> tuple[bool, str, str]:
         return False, reason, "multi_concept"
     except json.JSONDecodeError:
         return False, f"crispness JSON invalid: {text[:120]}", "llm_error"
+
+
+# ── Multi-concept decomposition: bundle → atomic hypotheses ──────────────
+
+def _decompose_multi_concept(
+    description: str, top_contexts: list[dict], tokenizer, cfg: Config,
+    max_atoms: int,
+) -> list[str]:
+    """Ask Sonnet to split a multi-concept description into 2-5 atomic
+    token-level feature hypotheses. Returns the list of atomic description
+    strings (may be fewer than max_atoms if Sonnet thinks there's less).
+
+    Fails closed (returns empty list) on LLM error or parse failure.
+    """
+    from .llm import get_client, chat
+    client = get_client()
+
+    # Build a short snippet of the top contexts so Sonnet can ground the
+    # decomposition in what the source latent actually fires on.
+    snippets = []
+    for ex in top_contexts[:8]:
+        ctx_ids = ex.get("context_ids") or []
+        pos = ex.get("pos", 0)
+        try:
+            decoded = tokenizer.decode(ctx_ids)
+            marked_tok = tokenizer.decode([ctx_ids[pos]]) if 0 <= pos < len(ctx_ids) else ""
+            snippets.append(f"  • [{marked_tok!r}] in: {decoded[:120]}")
+        except Exception:
+            continue
+    snippets_block = "\n".join(snippets) if snippets else "  (no contexts available)"
+
+    prompt = textwrap.dedent(f"""\
+        A sparse-autoencoder latent was described as a MULTI-CONCEPT
+        bundle (two or more distinct features in one latent). Your job
+        is to propose 2-{max_atoms} ATOMIC token-level feature hypotheses
+        that might each be a sub-component of the bundle.
+
+        Each atomic hypothesis must:
+          - Name ONE operationally-testable property of a single token.
+          - Be a yes/no question a reader can answer for one token in
+            context without ambiguity.
+          - NOT mix multiple concepts with "or" / "and" / "sometimes".
+
+        ORIGINAL MULTI-CONCEPT DESCRIPTION:
+          {description}
+
+        TOP-ACTIVATING EXAMPLES (the marked token is in []):
+        {snippets_block}
+
+        Return EXACTLY one JSON object, no other text:
+        {{
+          "atoms": [
+            "atomic description 1",
+            "atomic description 2",
+            ...
+          ]
+        }}
+        Return 2-{max_atoms} atoms. If the original is actually crisp
+        (not multi-concept after all), return a single-element list
+        with the cleaned-up wording.
+    """)
+
+    try:
+        text = chat(client, cfg.organization_model, prompt, max_tokens=400)
+    except Exception as e:
+        print(f"    decompose LLM unreachable: {type(e).__name__}: {e}")
+        return []
+
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return []
+    try:
+        obj = json.loads(m.group(0))
+        atoms = obj.get("atoms") or []
+        return [str(a).strip() for a in atoms if str(a).strip()][:max_atoms]
+    except json.JSONDecodeError:
+        return []
+
+
+def _semantic_dedup_atoms(
+    atoms: list[dict], cfg: Config,
+) -> tuple[list[dict], list[dict]]:
+    """Group atoms that describe the same concept using a single Sonnet
+    pass. Returns (kept, dropped) atom lists; 'kept' has one
+    representative per group.
+
+    Each atom dict must have 'atom_id' (stable identifier) and
+    'description'. Dropped atoms get a 'dedup_merged_into' field.
+    """
+    if len(atoms) <= 1:
+        return atoms, []
+
+    from .llm import get_client, chat
+    client = get_client()
+
+    listing = "\n".join(
+        f"  {a['atom_id']}: {a['description']}" for a in atoms
+    )
+    prompt = textwrap.dedent(f"""\
+        Group the following atomic feature descriptions by semantic
+        equivalence. Two atoms belong to the SAME group if a reader
+        would answer yes/no identically for every token in context.
+
+        Atoms:
+        {listing}
+
+        Return EXACTLY one JSON object, no other text:
+        {{
+          "groups": [
+            ["atom_id_a", "atom_id_b"],   # group of duplicates
+            ["atom_id_c"],                # singleton group
+            ...
+          ]
+        }}
+        Every atom_id must appear in exactly one group.
+    """)
+
+    try:
+        text = chat(client, cfg.organization_model, prompt, max_tokens=500)
+    except Exception as e:
+        print(f"    semantic_dedup LLM unreachable: {type(e).__name__}: {e}")
+        # Fallback: keep all atoms (no dedup). Merge can still drop them
+        # via cosine + separability later.
+        return atoms, []
+
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return atoms, []
+    try:
+        obj = json.loads(m.group(0))
+        groups = obj.get("groups") or []
+    except json.JSONDecodeError:
+        return atoms, []
+
+    by_id = {a["atom_id"]: a for a in atoms}
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for group in groups:
+        ids_in_group = [gid for gid in group if gid in by_id]
+        if not ids_in_group:
+            continue
+        rep_id = ids_in_group[0]
+        kept.append(by_id[rep_id])
+        for gid in ids_in_group[1:]:
+            dup = dict(by_id[gid])
+            dup["dedup_merged_into"] = rep_id
+            dropped.append(dup)
+    # Any atoms Sonnet forgot to place in a group stay as singletons.
+    grouped_ids = {gid for group in groups for gid in group}
+    for a in atoms:
+        if a["atom_id"] not in grouped_ids:
+            kept.append(a)
+    return kept, dropped
+
+
+def _atom_target_dirs_from_labels(
+    atom_labels: torch.Tensor,   # (n_seqs, T, n_atoms) boolean/float
+    activations_sub: torch.Tensor,   # (n_seqs, T, d_model) — mini subset
+    d_model: int,
+    min_n_pos: int,
+) -> tuple[list[int], torch.Tensor, list[int]]:
+    """For each atom, compute mean-shift direction from its mini-annotation
+    labels on the mini subset:
+        d_atom = normalize(mean(x | atom_label=1) - mean(x))
+    Returns (kept_atom_indices, dirs, n_pos_per_atom).
+
+    This replaces "use source U's firing mask" — atoms need atom-specific
+    evidence, not the bundle's.
+    """
+    X = activations_sub.reshape(-1, d_model).float()
+    Y = atom_labels.reshape(-1, atom_labels.shape[-1]).bool()
+    mean_all = X.mean(dim=0)
+
+    kept_indices: list[int] = []
+    dirs: list[torch.Tensor] = []
+    n_pos_list: list[int] = []
+    for ai in range(Y.shape[1]):
+        mask = Y[:, ai]
+        n_pos = int(mask.sum().item())
+        if n_pos < min_n_pos:
+            continue
+        mean_pos = X[mask].mean(dim=0)
+        d = mean_pos - mean_all
+        norm = d.norm()
+        if norm < 1e-8:
+            continue
+        kept_indices.append(ai)
+        dirs.append(d / norm)
+        n_pos_list.append(n_pos)
+    if not dirs:
+        return [], torch.zeros(0, d_model), []
+    return kept_indices, torch.stack(dirs), n_pos_list
 
 
 # ── Mini-annotation prefilter (cheap agreement check before full corpus) ──
@@ -961,52 +1175,212 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
                 if cat in cat_counts:
                     print(f"    {cat:<18} {cat_counts[cat]}")
 
-        if n_crisp < cfg.promote_min_kept:
+        # Diagnostic warning for high multi_concept rate (reviewer's #5).
+        described = max(n_described, 1)
+        mc_rate = cat_counts.get("multi_concept", 0) / described
+        if mc_rate > cfg.promote_multi_concept_warn_rate:
             print(
-                f"► TERMINATED: only {n_crisp} crisp candidates after "
-                f"spending {spent} proposals (< {cfg.promote_min_kept})."
+                f"  WARNING: multi_concept_rate = {mc_rate:.0%} (> "
+                f"{cfg.promote_multi_concept_warn_rate:.0%}) — "
+                f"the U slice at this layer is dominated by bundled "
+                f"latents. Decomposition mines these for atomic features."
+            )
+
+        # ── 3b. Source-U crisp proposals get mean-shift target_dirs from
+        # source U's firing mask. Atoms (from decomposition below) get
+        # atom-specific target_dirs from mini-annotation labels.
+        proposals: list[dict] = []
+        proposal_dirs_list: list[torch.Tensor] = []
+
+        if crisp_candidates:
+            crisp_u_indices = [u for u, _ in crisp_candidates]
+            kept_u, source_u_dirs, n_pos_list = _compute_mean_shift_dirs(
+                sae, crisp_u_indices, x_flat.to(torch.float32),
+                n_supervised, d_model, min_n_pos=cfg.promote_min_n_pos,
+            )
+            desc_by_u = dict(crisp_candidates)
+            for i, u in enumerate(kept_u):
+                proposals.append({
+                    "id": f"promoted.u{u}_r{iter_idx}",
+                    "description": desc_by_u[u],
+                    "type": "leaf",
+                    "parent": None,
+                    "source_u_local_idx": int(u),
+                    "source_kind": "u_latent_crisp",
+                    "n_pos_at_proposal": int(n_pos_list[i]),
+                    "delta_r2_at_proposal": round(float(ranking_map[u]), 6),
+                })
+                proposal_dirs_list.append(source_u_dirs[i])
+
+        # ── 3c. DECOMPOSITION PATH: rescue multi_concept rejections ──
+        # For each multi_concept rejection: ask Sonnet to split into
+        # atomic hypotheses → crispness on each atom → dedup within-round
+        # → mini-annotate atoms (NEW labels, not source U firing) →
+        # compute atom-specific target_dirs from those labels → merge.
+        # This is the reviewer's design: source U's firing mask is NOT
+        # evidence for any single atom of a bundle, so atoms need their
+        # own target_dirs computed from real annotator labels on a mini
+        # subset.
+        multi_concept_u = [
+            (int(u), rec["description"])
+            for u, rec in crispness_log.items()
+            if (not rec.get("crisp"))
+            and rec.get("category") == "multi_concept"
+        ]
+        atom_log: dict = {}
+        atom_dedup_log: dict = {}
+        atom_proposals: list[dict] = []
+        atom_dirs_list: list[torch.Tensor] = []
+
+        if cfg.promote_decompose_multi_concept and multi_concept_u:
+            print(f"\n── Decomposition path: {len(multi_concept_u)} "
+                  f"multi_concept rejections → atoms ──")
+
+            # 1. Decompose each multi_concept into atoms.
+            decompose_tokenizer = tokenizer_ref  # reuse
+            all_atoms_raw: list[dict] = []
+            for u, desc in multi_concept_u:
+                top_ctx = all_top_acts.get(str(u), [])
+                atom_descs = _decompose_multi_concept(
+                    desc, top_ctx, decompose_tokenizer, cfg,
+                    max_atoms=cfg.promote_decompose_max_atoms,
+                )
+                for ai, a_desc in enumerate(atom_descs):
+                    all_atoms_raw.append({
+                        "atom_id": f"u{u}_a{ai}",
+                        "source_u": int(u),
+                        "description": a_desc,
+                    })
+            print(f"  decomposed into {len(all_atoms_raw)} raw atomic "
+                  f"hypotheses")
+
+            # 2. Crispness gate on each atom.
+            crisp_atoms: list[dict] = []
+            atom_cat_counts: dict[str, int] = {}
+            for atom in all_atoms_raw:
+                is_crisp, reason, cat = _crispness_judgment(
+                    atom["description"], cfg,
+                )
+                atom["crisp"] = is_crisp
+                atom["crisp_category"] = cat
+                atom["crisp_reason"] = reason
+                atom_log[atom["atom_id"]] = atom
+                atom_cat_counts[cat] = atom_cat_counts.get(cat, 0) + 1
+                if is_crisp:
+                    crisp_atoms.append(atom)
+            (iter_dir / "atoms.json").write_text(json.dumps(atom_log, indent=2))
+            print(f"  crispness on atoms: {len(crisp_atoms)}/{len(all_atoms_raw)} "
+                  f"passed (" + ", ".join(
+                      f"{k}={v}" for k, v in sorted(atom_cat_counts.items())
+                  ) + ")")
+
+            # 3. Within-round semantic dedup.
+            if crisp_atoms:
+                kept_atoms, dedup_dropped = _semantic_dedup_atoms(
+                    crisp_atoms, cfg,
+                )
+                atom_dedup_log = {
+                    "kept": [a["atom_id"] for a in kept_atoms],
+                    "dropped": dedup_dropped,
+                }
+                (iter_dir / "atoms_dedup.json").write_text(
+                    json.dumps(atom_dedup_log, indent=2)
+                )
+                print(f"  semantic dedup: {len(kept_atoms)} kept, "
+                      f"{len(dedup_dropped)} duplicates merged")
+            else:
+                kept_atoms = []
+
+            # 4-6. Mini-annotate atoms on a random subset, compute
+            # atom-specific target_dirs from real labels.
+            if kept_atoms:
+                # Build the features list shape annotate_local expects.
+                atom_as_feats = [
+                    {
+                        "id": a["atom_id"], "description": a["description"],
+                        "type": "leaf", "parent": None,
+                    }
+                    for a in kept_atoms
+                ]
+                n_seqs = min(
+                    cfg.promote_mini_prefilter_n_seqs, activations.shape[0],
+                )
+                rng = np.random.RandomState(cfg.seed + 9001)
+                sampled = np.sort(
+                    rng.choice(activations.shape[0], size=n_seqs, replace=False)
+                )
+                sampled_t = torch.from_numpy(sampled).long()
+                tokens_full = torch.load(cfg.tokens_path, weights_only=True)
+                tokens_full = mask_leading(tokens_full, cfg=cfg)
+                mini_tokens = tokens_full[sampled_t]
+                mini_acts = activations[sampled_t]
+
+                print(f"  mini-annotating {len(atom_as_feats)} atoms on "
+                      f"{n_seqs} sequences (for atom target_dirs)...")
+                from .annotate import annotate_local, annotate_corpus
+                if cfg.use_local_annotator:
+                    atom_labels = annotate_local(
+                        mini_tokens, atom_as_feats, decompose_tokenizer, cfg,
+                    )
+                else:
+                    atom_labels = annotate_corpus(
+                        mini_tokens, atom_as_feats, decompose_tokenizer, cfg,
+                    )
+                # atom_labels: (n_seqs, T, len(kept_atoms))
+
+                kept_indices, atom_target_dirs, atom_n_pos = (
+                    _atom_target_dirs_from_labels(
+                        atom_labels, mini_acts, d_model,
+                        min_n_pos=cfg.promote_atom_mini_min_pos,
+                    )
+                )
+                print(
+                    f"  atom target_dirs: {len(kept_indices)}/"
+                    f"{len(kept_atoms)} atoms have ≥ "
+                    f"{cfg.promote_atom_mini_min_pos} mini-positives"
+                )
+
+                for idx_in_kept, atom_idx in enumerate(kept_indices):
+                    a = kept_atoms[atom_idx]
+                    atom_proposals.append({
+                        "id": f"promoted.{a['atom_id']}_r{iter_idx}",
+                        "description": a["description"],
+                        "type": "leaf",
+                        "parent": None,
+                        "source_u_local_idx": int(a["source_u"]),
+                        "source_kind": "decomposed_atom",
+                        "n_pos_at_mini": int(atom_n_pos[idx_in_kept]),
+                    })
+                    atom_dirs_list.append(atom_target_dirs[idx_in_kept])
+
+                if atom_proposals:
+                    proposals.extend(atom_proposals)
+                    proposal_dirs_list.extend(atom_dirs_list)
+
+        # Combined proposal set: source-U crisp + decomposed atoms.
+        if not proposals:
+            print(
+                f"\n► TERMINATED: 0 proposals after describe + "
+                f"decomposition (crisp={n_crisp}, "
+                f"atoms_with_dirs={len(atom_proposals)})."
             )
             history.append({
                 "iter": iter_idx,
-                "converged_reason": "too_few_crisp",
+                "converged_reason": "no_proposals",
                 "n_crisp": n_crisp,
+                "n_atom_proposals": len(atom_proposals),
                 "spent": spent,
                 "n_nuisance_dropped": n_nuisance,
                 "crispness_breakdown": cat_counts,
             })
             break
 
-        # Downstream steps expect `descriptions` dict (u_str -> desc) for
-        # the crisp set. Build it from all_descriptions filtered to crisp.
-        descriptions = {
-            str(u): desc for u, desc in crisp_candidates
-        }
-
-        # ── 3b. Compute mean-shift directions for the crisp candidates ──
-        crisp_u_indices = [u for u, _ in crisp_candidates]
-        kept_u, proposal_dirs, n_pos_list = _compute_mean_shift_dirs(
-            sae, crisp_u_indices, x_flat.to(torch.float32),
-            n_supervised, d_model, min_n_pos=cfg.promote_min_n_pos,
+        proposal_dirs = torch.stack(proposal_dirs_list)
+        print(
+            f"\n  Proposals heading into merge: {len(proposals)} "
+            f"(source-U crisp: {sum(1 for p in proposals if p['source_kind'] == 'u_latent_crisp')}, "
+            f"decomposed atoms: {len(atom_proposals)})"
         )
-        if not kept_u:
-            print(
-                f"► TERMINATED: no crisp candidate has ≥ "
-                f"{cfg.promote_min_n_pos} active positions."
-            )
-            break
-        desc_by_u = dict(crisp_candidates)
-        proposals = [
-            {
-                "id": f"promoted.u{u}_r{iter_idx}",
-                "description": desc_by_u[u],
-                "type": "leaf",
-                "parent": None,
-                "source_u_local_idx": int(u),
-                "n_pos_at_proposal": int(n_pos_list[i]),
-                "delta_r2_at_proposal": round(float(ranking_map[u]), 6),
-            }
-            for i, u in enumerate(kept_u)
-        ]
 
         # ── 4. Merge: cosine + separability against existing catalog ────
         print("\n── Merging into existing catalog ──")
