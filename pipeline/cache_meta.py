@@ -137,8 +137,15 @@ def verify_cache_meta(
     for field in CACHE_FIELDS.get(artifact_kind, ()):
         if field not in meta:
             continue
+        # Fields in CACHE_FIELDS that aren't Config attributes (e.g.,
+        # `n_features`, which is derived from the catalog at save time,
+        # not stored on Config) are only checkable via `extra_required`.
+        # Skipping them here prevents bogus "stale cache: n_features=X
+        # vs cfg=None" warnings when the caller didn't pass the override.
+        if not hasattr(cfg, field):
+            continue
         cached = meta[field]
-        expected = getattr(cfg, field, None)
+        expected = getattr(cfg, field)
         if isinstance(expected, Path):
             expected = str(expected)
         if cached != expected:
