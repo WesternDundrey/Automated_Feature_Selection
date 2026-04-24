@@ -87,6 +87,14 @@ def main():
                         help="Cosine-dedup threshold for merge (default 0.6)")
     parser.add_argument("--promote-no-llm-separability", action="store_true",
                         help="Skip LLM separability gate in the merge step")
+    parser.add_argument("--promote-no-mini-prefilter", action="store_true",
+                        help="Skip mini-annotation prefilter (always do full annotation)")
+    parser.add_argument("--promote-mini-prefilter-n", type=int, default=None,
+                        help="Sequences for mini-prefilter annotation (default 50)")
+    parser.add_argument("--promote-mini-prefilter-min-f1", type=float, default=None,
+                        help="Mini-prefilter F1 floor (default 0.20)")
+    parser.add_argument("--use-findex", action="store_true",
+                        help="Opt back into F-index annotation suffix (deprecated-by-default)")
     parser.add_argument(
         "--layers", default=None,
         help="Comma-separated layer list for --step layer-sweep "
@@ -167,6 +175,8 @@ def main():
         overrides["supervision_mode"] = "bce"
     if args.full_desc:
         overrides["use_findex_suffix"] = False
+    if args.use_findex:
+        overrides["use_findex_suffix"] = True
     if args.no_freeze_decoder:
         overrides["freeze_supervised_decoder"] = False
     if args.selectivity:
@@ -422,6 +432,12 @@ def main():
             cfg.promote_cos_threshold = args.promote_cos_threshold
         if args.promote_no_llm_separability:
             cfg.promote_use_llm_separability = False
+        if args.promote_no_mini_prefilter:
+            cfg.promote_mini_prefilter = False
+        if args.promote_mini_prefilter_n is not None:
+            cfg.promote_mini_prefilter_n_seqs = args.promote_mini_prefilter_n
+        if args.promote_mini_prefilter_min_f1 is not None:
+            cfg.promote_mini_prefilter_min_f1 = args.promote_mini_prefilter_min_f1
         run_promote_loop(cfg)
         print(f"Promote loop completed in {time.time() - t0:.1f}s")
 

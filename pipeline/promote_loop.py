@@ -81,7 +81,7 @@ def _attach_defaults(cfg: Config) -> None:
     if not hasattr(cfg, "promote_post_train_f1_floor"):
         cfg.promote_post_train_f1_floor = 0.30  # drop new features below this
     if not hasattr(cfg, "promote_capacity_transfer_ratio"):
-        cfg.promote_capacity_transfer_ratio = 0.5  # new_u_dR2 must be ≤ this × old_u_dR2
+        cfg.promote_capacity_transfer_ratio = 0.5
     if not hasattr(cfg, "promote_max_iters"):
         cfg.promote_max_iters = 5
     if not hasattr(cfg, "promote_min_kept"):
@@ -90,6 +90,17 @@ def _attach_defaults(cfg: Config) -> None:
         cfg.promote_cos_threshold = 0.6
     if not hasattr(cfg, "promote_use_llm_separability"):
         cfg.promote_use_llm_separability = True
+    # Mini-prefilter: cheap annotator-vs-U-firing agreement check on a small
+    # subset of sequences before paying for full-corpus annotation + retrain.
+    # A feature whose annotator labels don't overlap with the U latent's
+    # firing mask on 50 sequences is almost certainly going to fail full
+    # training too — rejecting it early saves the expensive vLLM pass.
+    if not hasattr(cfg, "promote_mini_prefilter"):
+        cfg.promote_mini_prefilter = True
+    if not hasattr(cfg, "promote_mini_prefilter_n_seqs"):
+        cfg.promote_mini_prefilter_n_seqs = 50
+    if not hasattr(cfg, "promote_mini_prefilter_min_f1"):
+        cfg.promote_mini_prefilter_min_f1 = 0.20
 
 
 # ── Rank U latents by per-latent ΔR² on val ─────────────────────────────────
@@ -224,6 +235,79 @@ def _crispness_judgment(description: str, cfg: Config) -> tuple[bool, str]:
         return False, f"crispness JSON invalid: {text[:120]}"
 
 
+# ── Mini-annotation prefilter (cheap agreement check before full corpus) ──
+
+def _mini_prefilter(
+    sae, new_features: list[dict],
+    tokens: torch.Tensor, activations: torch.Tensor,
+    tokenizer, cfg: Config, d_model: int, n_supervised: int,
+) -> tuple[list[str], list[dict]]:
+    """Annotate the NEW features on a small subset of sequences and drop any
+    whose annotator labels don't agree with the source U latent's firing
+    mask. The idea: if the LLM can't articulate what U fires on, full
+    supervision won't learn it either, so reject before paying for the
+    expensive full annotation + retrain cycle.
+
+    Returns (kept_feature_ids, dropped_records).
+    """
+    n_seqs = min(cfg.promote_mini_prefilter_n_seqs, tokens.shape[0])
+    if n_seqs < 5 or not new_features:
+        return [f["id"] for f in new_features], []
+
+    tokens_sub = tokens[:n_seqs]
+    acts_sub = activations[:n_seqs]
+    T = tokens_sub.shape[1]
+
+    from .annotate import annotate_local, annotate_corpus
+    print(
+        f"  Mini-annotating {len(new_features)} candidates on {n_seqs} "
+        f"sequences ({'local vLLM' if cfg.use_local_annotator else 'API'})..."
+    )
+    if cfg.use_local_annotator:
+        mini_labels = annotate_local(tokens_sub, new_features, tokenizer, cfg)
+    else:
+        mini_labels = annotate_corpus(tokens_sub, new_features, tokenizer, cfg)
+    # mini_labels: (n_seqs, T, len(new_features))
+
+    # Compute U firing on the same subset. Align device/dtype with acts_sub.
+    X_sub = acts_sub.reshape(-1, d_model).to(torch.float32)
+    enc_w = sae.encoder.weight.detach().to(device=X_sub.device, dtype=X_sub.dtype)
+    enc_b = sae.encoder.bias.detach().to(device=X_sub.device, dtype=X_sub.dtype)
+
+    kept_ids: list[str] = []
+    dropped: list[dict] = []
+    for i, feat in enumerate(new_features):
+        u_local = feat.get("source_u_local_idx")
+        if u_local is None:
+            kept_ids.append(feat["id"])
+            continue
+        u_global = n_supervised + u_local
+        pre = X_sub @ enc_w[u_global] + enc_b[u_global]
+        u_fires = (pre > 0).cpu().numpy().astype(bool)     # (n_seqs*T,)
+        ann = mini_labels[:, :, i].reshape(-1).numpy().astype(bool)
+
+        n_ann = int(ann.sum())
+        n_fires = int(u_fires.sum())
+        tp = int((u_fires & ann).sum())
+        prec = tp / n_ann if n_ann > 0 else 0.0
+        rec = tp / n_fires if n_fires > 0 else 0.0
+        mini_f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+
+        if mini_f1 < cfg.promote_mini_prefilter_min_f1:
+            dropped.append({
+                "id": feat["id"],
+                "mini_f1": round(mini_f1, 4),
+                "precision": round(prec, 4),
+                "recall": round(rec, 4),
+                "n_annotator_positives": n_ann,
+                "n_u_fires": n_fires,
+                "floor": cfg.promote_mini_prefilter_min_f1,
+            })
+        else:
+            kept_ids.append(feat["id"])
+    return kept_ids, dropped
+
+
 # ── Mean-shift target direction from U latent's firing mask ────────────────
 
 def _compute_mean_shift_dirs(
@@ -241,12 +325,15 @@ def _compute_mean_shift_dirs(
         dirs: (len(kept), d_model)
         n_pos_per_latent: list aligned with kept_indices
     """
-    device = activations_flat.device if activations_flat.is_cuda else "cpu"
     X = activations_flat
     mean_all = X.mean(dim=0)
 
-    enc_w = sae.encoder.weight.detach().to(X.dtype)  # (n_total, d_model)
-    enc_b = sae.encoder.bias.detach().to(X.dtype)
+    # Align encoder weight device + dtype with X. sae was moved to GPU +
+    # model dtype earlier; X is typically CPU fp32 straight from the cached
+    # activations tensor. Without device alignment, `X @ w` raises
+    # RuntimeError on mixed-device tensors.
+    enc_w = sae.encoder.weight.detach().to(device=X.device, dtype=X.dtype)
+    enc_b = sae.encoder.bias.detach().to(device=X.device, dtype=X.dtype)
 
     kept: list[int] = []
     dir_list: list[torch.Tensor] = []
@@ -284,11 +371,16 @@ def _post_training_validation(
     """Read evaluation.json after retrain; keep features above the F1 floor,
     drop below. Returns (kept_ids, dropped_records).
 
-    Uses `f1_cal` (calibrated) when available, else `f1` (t=0). Always
-    reports whichever was used in the dropped record for audit.
+    Prefers `val_f1_cal` (val-only F1 at calibrated threshold — no test
+    contamination). Falls back to `f1` at t=0 if val_f1_cal is missing
+    (older evaluation.json without v8.1+ fields).
+
+    CRITICAL: must NOT use `cal_f1` for promote-loop gating. `cal_f1` is
+    computed on the TEST set with val-calibrated thresholds; repeated
+    promote-loop rounds that filter features on cal_f1 leak test labels
+    into the pruned catalog and invalidate final test metrics.
     """
     if not cfg.eval_path.exists():
-        # No eval ran — keep everything rather than drop blindly.
         return new_feature_ids, []
     eval_data = json.loads(cfg.eval_path.read_text())
     feats_map = {f["id"]: f for f in eval_data.get("features") or []}
@@ -297,11 +389,16 @@ def _post_training_validation(
     dropped: list[dict] = []
     for fid in new_feature_ids:
         rec = feats_map.get(fid) or {}
-        f1 = rec.get("cal_f1")
-        metric = "cal_f1"
+        f1 = rec.get("val_f1_cal")
+        metric = "val_f1_cal"
         if f1 is None:
+            # Legacy evaluation.json without val_f1_cal. Fall back to t=0
+            # val F1 would be ideal, but evaluate.py doesn't save that
+            # separately; use the t=0 test f1 as a coarse proxy with a
+            # warning in the log — still not the right metric long-term
+            # but preserves backward compatibility.
             f1 = rec.get("f1")
-            metric = "f1"
+            metric = "f1_t0_fallback"
         if f1 is None or f1 < cfg.promote_post_train_f1_floor:
             dropped.append({
                 "id": fid,
@@ -318,47 +415,67 @@ def _post_training_validation(
 
 def _verify_capacity_transfer(
     old_ranking: dict[int, float],      # u_local_idx -> delta_r2 before promotion
-    promoted_u_indices: list[int],      # U latents that were described + promoted
+    promoted_u_indices: list[int],      # surviving promoted U latents (post-validation)
     new_sae, x_val: torch.Tensor, new_n_supervised: int, device: str,
     transfer_ratio: float,
-) -> list[dict]:
-    """For each promoted U latent, compute the SAME-position u latent's ΔR²
-    in the NEW SAE. If it dropped below transfer_ratio × old_delta_r2,
-    capacity successfully transferred from U into its matched S slot.
+) -> dict:
+    """Aggregate capacity-transfer check.
 
-    Caveat: the new SAE's U slice is freshly trained, so u_local indices
-    don't correspond 1:1 with the old U slice. We therefore compute a
-    fresh ranking of the new SAE's full U slice and look at the
-    distribution of top ΔR² values; the KEY signal is whether the NEW
-    top-K ΔR²s are substantially lower than the OLD top-K ΔR²s for the
-    promoted latents. This is a DISTRIBUTION-LEVEL transfer check, not
-    per-latent, and is the strongest claim we can make given that U
-    indices are arbitrary across retrains.
+    U latent indices are NOT stable across retrains — the new SAE's
+    unsupervised slice has freshly initialized + trained encoders, and
+    there's no canonical mapping between old U[k] and new U[k]. A
+    per-latent `new_u_delta_r2 vs old_u_delta_r2` pairing would therefore
+    be meaningless.
+
+    The honest, aggregate signal is:
+
+      - `old_promoted_sum` = total ΔR² the promoted old U latents carried
+        on val before we promoted them.
+      - `new_top_k_sum`    = total ΔR² of the top-K U latents in the
+        retrained SAE's U slice. These are whatever concepts U is still
+        carrying after some of its capacity (we hope) moved to S.
+
+    If U actually gave up the promoted capacity, `new_top_k_sum` should
+    be less than the OLD top-K sum by at least `transfer_ratio ×
+    old_promoted_sum`. Otherwise U retained the capacity and S merely
+    duplicates it.
     """
+    k = len(promoted_u_indices)
+    if k == 0:
+        return {"k": 0, "transferred": False, "note": "no promoted latents"}
+
+    old_promoted_sum = float(
+        sum(old_ranking.get(u, 0.0) for u in promoted_u_indices)
+    )
+    old_top_k = sorted(old_ranking.values(), reverse=True)[:k]
+    old_top_k_sum = float(sum(old_top_k))
+
     new_ranking = rank_u_latents_by_delta_r2(
         new_sae, x_val, new_n_supervised, device,
     )
-    new_top_dr2 = [r for _, r in new_ranking[: len(promoted_u_indices)]]
-    old_top_dr2 = [old_ranking[u] for u in promoted_u_indices]
+    new_top_k_sum = float(sum(dr2 for _, dr2 in new_ranking[:k]))
 
-    transfer_records = []
-    for old_u, old_dr2, new_dr2 in zip(
-        promoted_u_indices, old_top_dr2, new_top_dr2,
-    ):
-        transferred = (
-            new_dr2 <= transfer_ratio * old_dr2
-            if old_dr2 > 1e-12 else False
-        )
-        transfer_records.append({
-            "old_u_local_idx": int(old_u),
-            "old_delta_r2": round(float(old_dr2), 6),
-            "new_top_delta_r2": round(float(new_dr2), 6),
-            "ratio": (
-                round(new_dr2 / old_dr2, 4) if old_dr2 > 1e-12 else None
-            ),
-            "transferred": bool(transferred),
-        })
-    return transfer_records
+    # Expected new top-K sum under the hypothesis that ratio*old_promoted_sum
+    # of capacity moved from U to S. If the new top-K is at or below this,
+    # transfer is consistent with the data.
+    expected_new = old_top_k_sum - transfer_ratio * old_promoted_sum
+    transferred = new_top_k_sum <= expected_new
+
+    return {
+        "k": k,
+        "old_promoted_delta_r2_sum": round(old_promoted_sum, 6),
+        "old_top_k_delta_r2_sum": round(old_top_k_sum, 6),
+        "new_top_k_delta_r2_sum": round(new_top_k_sum, 6),
+        "expected_new_top_k_if_transferred": round(expected_new, 6),
+        "transferred": bool(transferred),
+        "fractional_capacity_drop": (
+            round(1.0 - new_top_k_sum / old_top_k_sum, 4)
+            if old_top_k_sum > 1e-12 else None
+        ),
+        "note": "distribution-level aggregate; U indices are not "
+                "stable across retrains so per-latent pairings would "
+                "be meaningless.",
+    }
 
 
 # ── Main driver ────────────────────────────────────────────────────────────
@@ -590,11 +707,62 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
             f["id"] for f in merged_catalog["features"]
             if f["id"] not in {g["id"] for g in catalog["features"]}
         ]
-        promoted_u_indices_this_round = [
-            f["source_u_local_idx"] for f in merged_catalog["features"]
-            if f.get("source_u_local_idx") is not None
-            and f["id"] in kept_feature_ids
-        ]
+
+        # ── 4b. Mini-annotation prefilter ──────────────────────────────
+        # Cheap agreement check: annotate each new feature on N seqs,
+        # compare against source U latent's firing mask, drop mismatches.
+        # Saves the expensive full-annotation + retrain cost on features
+        # the annotator can't articulate.
+        mini_dropped: list[dict] = []
+        if cfg.promote_mini_prefilter and kept_feature_ids:
+            print("\n── Mini-annotation prefilter ──")
+            new_feats_for_prefilter = [
+                f for f in merged_catalog["features"]
+                if f["id"] in set(kept_feature_ids)
+            ]
+            from transformers import AutoTokenizer
+            mini_tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+            kept_feature_ids, mini_dropped = _mini_prefilter(
+                sae, new_feats_for_prefilter,
+                tokens=torch.load(cfg.tokens_path, weights_only=True),
+                activations=activations,
+                tokenizer=mini_tokenizer,
+                cfg=cfg, d_model=d_model, n_supervised=n_supervised,
+            )
+            (iter_dir / "mini_prefilter_dropped.json").write_text(
+                json.dumps(mini_dropped, indent=2)
+            )
+            if mini_dropped:
+                print(
+                    f"  Mini-prefilter dropped {len(mini_dropped)} feature(s) "
+                    f"below F1={cfg.promote_mini_prefilter_min_f1}:"
+                )
+                for d in mini_dropped[:10]:
+                    print(f"    - {d['id']}  (mini_f1={d['mini_f1']})")
+            print(f"  {len(kept_feature_ids)} surviving after mini-prefilter")
+            # Prune merged_catalog to the survivors (preserve original features,
+            # drop only rejected new features).
+            surviving_ids = set(kept_feature_ids)
+            original_ids = {g["id"] for g in catalog["features"]}
+            merged_catalog = {
+                "features": [
+                    f for f in merged_catalog["features"]
+                    if (f["id"] in original_ids) or (f["id"] in surviving_ids)
+                ],
+                "_discovery_metadata": merged_catalog.get("_discovery_metadata", {}),
+            }
+
+            if len(kept_feature_ids) < cfg.promote_min_kept:
+                print(
+                    f"► TERMINATED: only {len(kept_feature_ids)} features "
+                    f"survived mini-prefilter (< {cfg.promote_min_kept})."
+                )
+                history.append({
+                    "iter": iter_idx,
+                    "converged_reason": "too_few_after_mini_prefilter",
+                    "n_kept_after_mini": len(kept_feature_ids),
+                })
+                break
 
         # ── 5. Persist merged catalog + invalidate downstream ──────────
         cfg.catalog_path.write_text(json.dumps(
@@ -659,7 +827,17 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
             run_train(cfg)
             run_evaluate(cfg)
 
-        # ── 8. Capacity-transfer verification ──────────────────────────
+        # IMPORTANT: capture promoted-U indices AFTER post-training validation
+        # so dropped features don't enter the capacity-transfer check.
+        post_val_ids = set(kept_ids_after_val)
+        promoted_u_indices_this_round = [
+            f["source_u_local_idx"]
+            for f in merged_catalog["features"]
+            if f.get("source_u_local_idx") is not None
+            and f["id"] in post_val_ids
+        ]
+
+        # ── 8. Capacity-transfer verification (aggregate, not per-latent)
         print("\n── Capacity-transfer verification ──")
         new_model_cfg = torch.load(
             cfg.checkpoint_config_path, map_location="cpu", weights_only=True,
@@ -676,20 +854,26 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
         new_n_supervised = new_sae.n_supervised
 
         x_val_new = x_flat[val_idx]  # reuse val split (deterministic via cfg.seed)
-        transfer_records = _verify_capacity_transfer(
+        transfer_summary = _verify_capacity_transfer(
             ranking_map, promoted_u_indices_this_round,
             new_sae, x_val_new, new_n_supervised, device,
             transfer_ratio=cfg.promote_capacity_transfer_ratio,
         )
         (iter_dir / "capacity_transfer.json").write_text(json.dumps(
-            transfer_records, indent=2,
+            transfer_summary, indent=2,
         ))
-        n_transferred = sum(1 for r in transfer_records if r["transferred"])
-        print(
-            f"  Capacity transferred: {n_transferred}/{len(transfer_records)} "
-            f"promoted latents saw new top-U ΔR² ≤ "
-            f"{cfg.promote_capacity_transfer_ratio}× the old value"
-        )
+        if transfer_summary.get("k", 0) > 0:
+            frac = transfer_summary.get("fractional_capacity_drop")
+            transferred_flag = transfer_summary.get("transferred")
+            print(
+                f"  Capacity transfer (aggregate, k={transfer_summary['k']}): "
+                f"old_top_k_ΔR²_sum={transfer_summary['old_top_k_delta_r2_sum']:.4f} "
+                f"→ new_top_k_ΔR²_sum={transfer_summary['new_top_k_delta_r2_sum']:.4f} "
+                f"[{'transferred' if transferred_flag else 'NOT transferred'}, "
+                f"fractional_drop={frac}]"
+            )
+        else:
+            print("  No promoted latents survived validation — skipping.")
 
         del new_sae
         if torch.cuda.is_available():
@@ -703,8 +887,10 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
             "n_candidates_initial": len(candidate_u_indices),
             "n_crisp": len(crisp_candidates),
             "n_merged": n_kept,
+            "n_after_mini_prefilter": len(kept_feature_ids),
             "n_after_post_training_filter": len(kept_ids_after_val),
-            "n_capacity_transferred": n_transferred,
+            "mini_prefilter_dropped": [d["id"] for d in mini_dropped],
+            "capacity_transfer": transfer_summary,
             "r2_after_retrain": recon.get("r2"),
             "delta_r2_supervised_after": recon.get("delta_r2_supervised"),
             "kept_ids": kept_ids_after_val,

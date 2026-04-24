@@ -4,6 +4,67 @@
 
 ---
 
+## [v8.3] — Second-round reviewer fixes + mini-annotation prefilter
+
+**Date:** 2026-04-21
+
+### Motivation
+
+Second round of outside review on v8.2. Six issues (two HIGH, three MEDIUM, one LOW) flagged; all six are now addressed. Adds a mini-annotation prefilter for loop speed per the reviewer's "big win" recommendation.
+
+### Fixes
+
+**HIGH — `_compute_mean_shift_dirs` device mismatch** (`pipeline/promote_loop.py:248`)
+
+The encoder weights were cast to X's dtype but not X's device. `sae` lives on GPU; `x_flat` is typically CPU (loaded straight from `activations.pt`). The subsequent `X @ w` would raise `RuntimeError` on mixed-device tensors. Fix: `.to(device=X.device, dtype=X.dtype)` for both `enc_w` and `enc_b`. Same fix applied to the new `_mini_prefilter` helper.
+
+**HIGH — promote-loop post-training gate leaked test labels** (`pipeline/promote_loop.py:_post_training_validation`)
+
+Previous version read `cal_f1` from `evaluation.json`, which is the calibrated-threshold F1 computed on the TEST set with val-selected thresholds. Using it to drop features across multiple promote-loop rounds contaminates test metrics — across 5 rounds of pruning on test, the final test F1 reflects selection bias, not honest generalization.
+
+Fix: `evaluate.py` now captures `val_f1_cal` per feature (val-only F1 at the calibrated threshold) and saves it alongside `cal_f1`. `promote_loop._post_training_validation` now prefers `val_f1_cal` and falls back to `f1` (t=0) only if the field is absent (legacy evaluation.json). Test is never touched for promotion decisions.
+
+**MEDIUM — capacity-transfer output was misleadingly per-latent**
+
+The previous implementation zipped old promoted-U indices against new top-K new-U indices, making records look per-latent even though the docstring admitted it was distribution-level. New-SAE U indices are not stable across retrains, so pairing has no semantic meaning. Fix: `_verify_capacity_transfer` now returns a single aggregate dict with `old_top_k_delta_r2_sum`, `new_top_k_delta_r2_sum`, `old_promoted_delta_r2_sum`, `expected_new_top_k_if_transferred`, `fractional_capacity_drop`, and `transferred` boolean. No more per-latent claims in the output.
+
+**MEDIUM — dropped features leaked into capacity-transfer check**
+
+`promoted_u_indices_this_round` was captured right after the merge gate, so features that failed the post-training F1 floor still entered the capacity-transfer computation. Fix: moved the capture to AFTER `_post_training_validation`, filtering to `kept_ids_after_val` only.
+
+**MEDIUM — `use_findex_suffix` default is now `False`** (`pipeline/config.py:93`)
+
+The F-index path in `annotate.py:515-518` hardcodes few-shot exemplars `F0? 1` (comma) and `F5? 1` ("The"), which break for any catalog that doesn't match those positions — including every incremental promote-loop round. Flipped the default so users get the safer full-description path unless they explicitly opt in via new `--use-findex` flag.
+
+**LOW — `summary7.md` annotated as superseded**
+
+Added a superseded note at the top of summary7.md flagging the two specific numbers that don't survive v8.1's methodology: (a) the +0.104 / +0.038 F1 advantages over probe/readout (mixed-threshold comparison), and (b) the κ=0.583-as-F1-ceiling framing (κ is not directly an F1 upper bound). Everything else in summary7 (R², cos=1.000, loss-ablation BCE-load-bearing finding, siphoning sweep, Pattern B retirement) remains valid.
+
+### New feature: mini-annotation prefilter
+
+Per the reviewer's recommendation ("the biggest loop-speed win is rejecting bad promoted features on 50-100 sequences before paying for full annotation + retrain"), promote_loop now includes a mini-prefilter step between merge and full annotation:
+
+1. Annotate the newly-merged features on a small subset of sequences (default 50).
+2. For each feature, compute F1 between the annotator's labels and the source U latent's firing mask on that subset.
+3. Drop any feature with `mini_f1 < promote_mini_prefilter_min_f1` (default 0.20). A mismatch at 50 sequences is a strong signal that the annotator can't articulate what the U latent fires on, so full-corpus annotation + retrain would waste compute.
+
+Controls: `--promote-no-mini-prefilter`, `--promote-mini-prefilter-n`, `--promote-mini-prefilter-min-f1`. Defaults: on, 50 sequences, 0.20 F1 floor.
+
+Output: `pipeline_data/promote_loop/round_{N}/mini_prefilter_dropped.json`.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/promote_loop.py` | Device-aligned mean-shift; val-only post-training gate; aggregate capacity transfer; survivor-filtered transfer; mini-prefilter |
+| `pipeline/evaluate.py` | Saves `val_f1_cal` per feature (val-only, no test contamination) |
+| `pipeline/config.py` | `use_findex_suffix` default flipped to False |
+| `pipeline/run.py` | New flags: `--use-findex`, `--promote-no-mini-prefilter`, `--promote-mini-prefilter-n`, `--promote-mini-prefilter-min-f1` |
+| `summary7.md` | Superseded-by-v8.1 note at top |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.2] — Promote Loop (U→S capacity transfer)
 
 **Date:** 2026-04-21

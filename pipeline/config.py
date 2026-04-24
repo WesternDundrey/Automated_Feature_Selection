@@ -90,7 +90,13 @@ class Config:
     local_annotator_model: str = "Qwen/Qwen3-4B-Base"  # base model, no thinking, pure transformer
     local_annotation_batch_size: int = 64
     batch_positions: bool = False  # True = full-sequence JSON, False = per-token
-    use_findex_suffix: bool = True  # True = "F3? " (~3 tok), False = full description (~15 tok)
+    # Full description is the safer default: F-index mode ("F3? ") has
+    # hardcoded few-shot exemplars in annotate.py that assume F0=comma and
+    # F5=capitalized, which breaks for any catalog that doesn't match those
+    # positions (in particular, any catalog with fewer than 6 features, or
+    # any incremental discovery round). Flipped to False in v8.3; pass
+    # `--use-findex` to opt back in if you know your catalog matches.
+    use_findex_suffix: bool = False  # True = "F3? " (~3 tok), False = full description (~15 tok)
 
     # ── Feature filtering ──────────────────────────────────────
     min_feature_positive_rate: float = 0.0  # disabled by default (rare features are intentional)

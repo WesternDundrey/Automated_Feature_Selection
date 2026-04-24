@@ -159,12 +159,20 @@ def evaluate(cfg: Config = None):
     val_gt = y_val.numpy().astype(bool)
     val_scores = val_sup_pre.numpy()
     calibrated_thresholds = np.zeros(n_features)
+    # Per-feature F1 on val AT the calibrated threshold. This is val-only —
+    # no test contamination — so it's the correct signal for gating promotion
+    # decisions across multiple rounds of the promote loop. Do NOT use
+    # `cal_f1` (val-calibrated threshold applied on test) for that purpose:
+    # repeating promote-loop rounds that filter on cal_f1 leaks test labels
+    # into the pruned catalog.
+    val_f1_cal = np.zeros(n_features)
     for k in range(n_features):
         n_pos = int(val_gt[:, k].sum())
         if n_pos == 0:
             continue
-        _, _, _, best_t = optimal_threshold_f1(val_gt[:, k], val_scores[:, k])
+        best_f1, _, _, best_t = optimal_threshold_f1(val_gt[:, k], val_scores[:, k])
         calibrated_thresholds[k] = best_t
+        val_f1_cal[k] = best_f1
 
     # ── 1. Reconstruction ────────────────────────────────────────────────
     mse = F.mse_loss(recon, x_test).item()
@@ -304,9 +312,14 @@ def evaluate(cfg: Config = None):
               f"{calibrated_thresholds[k]:>8.3f}{tag}")
         feature_results[k]["cal_f1"] = round(cal_f1, 4)
         feature_results[k]["cal_threshold"] = round(float(calibrated_thresholds[k]), 4)
+        # Val-only F1 (threshold optimized on val, evaluated on val). Safe to
+        # use for multi-round promotion decisions without test leakage.
+        feature_results[k]["val_f1_cal"] = round(float(val_f1_cal[k]), 4)
 
     cal_mean_f1 = float(np.mean(cal_f1_scores)) if cal_f1_scores else 0.0
+    val_mean_f1_cal = float(np.mean(val_f1_cal[val_f1_cal > 0])) if (val_f1_cal > 0).any() else 0.0
     print(f"\n  Mean calibrated F1: {cal_mean_f1:.3f}  (vs t=0: {mean_f1:.3f})")
+    print(f"  Mean val-only F1 (for promote-loop gating, no test contamination): {val_mean_f1_cal:.3f}")
 
     # ── 2b. Oracle-threshold F1 (per-feature optimum on test — reference only)
     print(f"\n  ORACLE F1 (per-feature optimum on test set — NOT honest eval):")
