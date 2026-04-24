@@ -1,6 +1,19 @@
 """Discovery loop — iterative supervised-SAE catalog growth.
 
-Round N of the loop:
+DEPRECATED in v8.1 in favor of `pipeline/promote_loop.py`.
+
+Design flaw: this loop re-trains a fresh unsupervised SAE on the RAW cached
+activations every round with the same `cfg.seed`, so later rounds re-propose
+essentially the same latents. The only thing that changes per round is what
+the merge gate dedups against. `promote_loop.py` instead uses the U slice of
+the ALREADY-TRAINED supervised SAE as the proposal pool, ranks U latents by
+residual contribution (ΔR² under ablation), promotes high-ranked ones to S,
+and verifies capacity transfer after retrain. That is the right design.
+
+This file is retained for reproducibility of earlier runs only — new
+experiments should use `--step promote-loop`.
+
+Round N of the (deprecated) loop:
   1. Load current state (catalog, target_dirs, evaluation)
   2. Train a fresh unsupervised SAE on cached activations
   3. Describe its latents via Sonnet (reuses inventory.explain_features)

@@ -152,6 +152,22 @@ python -m pipeline.run --step composition \
 
 Picks the top-5 causally-relevant features, ablates every `K ∈ {2, 3}` subset individually and jointly, measures `linearity = 1 - |KL_joint - Σ KL_individual| / max(...)`. Reported per pool: supervised, best-match unsupervised, best-match pretrained. For K=2 also logs decoder cosine and reports `corr(decoder_cos, linearity)`. Output: `pipeline_data/composition.json`. ~10-20 min.
 
+### Promote loop (U→S capacity transfer)
+
+Supersedes `--step discover-loop` (deprecated in v8.1). Uses the U slice of the already-trained supervised SAE as the proposal pool rather than training a fresh unsup SAE per round.
+
+```bash
+python -m pipeline.run --step promote-loop \
+    --layer 9 --sae_id "blocks.9.hook_resid_pre" \
+    --local-annotator --full-desc \
+    --n_sequences 1000 --epochs 15 \
+    --promote-top-k 20 --promote-max-iters 5 \
+    --promote-post-train-f1-floor 0.30 \
+    --promote-cos-threshold 0.6
+```
+
+Per round: rank U latents by ΔR² on val → describe top-K via Sonnet → crispness gate → merge (cosine + separability) → annotate → retrain → drop new features below post-training F1 floor → verify capacity transfer (new top-U ΔR² should fall below transfer_ratio × old). Output: `pipeline_data/promote_loop/round_{N}/` with `summary.json`, `dropped.json`, `capacity_transfer.json`, `post_training_dropped.json`, `crispness.json`.
+
 ### Layer sweep (cross-layer orchestrator)
 
 ```bash

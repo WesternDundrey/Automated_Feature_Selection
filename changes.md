@@ -4,6 +4,58 @@
 
 ---
 
+## [v8.2] — Promote Loop (U→S capacity transfer)
+
+**Date:** 2026-04-21
+
+### Motivation
+
+Resolves the remaining deferred item from v8.1's reviewer audit: `discover_loop.py` re-trained a fresh unsupervised SAE on the raw cached activations with the same `cfg.seed` every round, so successive rounds re-proposed essentially the same latents. The loop was "propose-once, re-dedup-many" rather than iterative discovery.
+
+The right design uses the U slice of the ALREADY-TRAINED supervised SAE as the proposal pool — because its latents already captured whatever the supervised slice didn't — and ranks those U latents by their contribution to reconstructing the activation (ΔR² under per-latent ablation). High-ΔR² U latents are the natural promotion candidates: they represent capacity the supervised catalog doesn't yet name. Describe them, gate them, promote survivors into S, retrain, and verify capacity moved from U into its matched S slot.
+
+### New file
+
+**`pipeline/promote_loop.py`** — `--step promote-loop`
+
+Round N:
+
+1. **Rank U latents by ΔR² on val.** For each U latent `u`, compute `ΔR²_u = (||err + a_u·W_u||² − ||err||²) / baseline_mse` averaged over val, where `a_u` is the latent's activation and `W_u` its decoder column. Vectorized via the analytical expansion — one pass over val, no per-u forward passes.
+2. **Describe top-K via Sonnet.** Reuses `inventory.collect_top_activations` + `inventory.explain_features`. The U slice is wrapped as a `PretrainedSAE` object so the existing machinery works unchanged.
+3. **Crispness gate.** Sonnet asks whether each description names a single operationally-testable concept or a grab bag ("fires on X and Y and Z"). Fails closed on LLM error / unparseable response / JSON-decode error — same policy as `merge.py`'s separability gate after v8.1.
+4. **Mean-shift target directions.** For each surviving candidate, compute `d_u = normalize(mean(x | u fires) − mean(x))` — same formula as `train.compute_target_directions` uses for supervised features. Provides apples-to-apples cosine with the existing supervised `target_dirs`.
+5. **Merge.** Reuses `merge.py` — cosine dedup at `promote_cos_threshold` (default 0.6) + Sonnet separability. Same two-gate structure as `discover_loop.py`, but now with a coherent direction proxy.
+6. **Annotate + retrain + evaluate.** Uses v8.1's id-keyed annotation cache so only the newly added feature IDs are labeled.
+7. **Post-training per-feature validation.** Reads `evaluation.json`; drops any new feature whose calibrated F1 is below `promote_post_train_f1_floor` (default 0.30). This rejects unlearnable proposals instead of letting the monotonic-growth guarantee do all the work. Dropped features are physically removed from the catalog, downstream artifacts are invalidated, and the pipeline retrains on the pruned catalog before continuing.
+8. **Capacity-transfer verification.** After retrain, re-rank the NEW SAE's U slice by ΔR². If the new top-K ΔR² values drop below `promote_capacity_transfer_ratio × old_delta_r2` (default 0.5), the promoted capacity successfully migrated from U to S. Distribution-level check because U indices aren't stable across retrains.
+
+Termination: any round that ends with fewer than `promote_min_kept` survivors (post crispness, post merge, post post-training-filter) stops the loop. Maximum rounds: `promote_max_iters` (default 5).
+
+### CLI additions
+
+- `--promote-top-k` — U latents considered per round (default 20)
+- `--promote-max-iters` — maximum rounds (default 5)
+- `--promote-min-kept` — terminate below this many survivors (default 3)
+- `--promote-post-train-f1-floor` — F1 floor for kept features (default 0.30)
+- `--promote-cos-threshold` — merge cosine threshold (default 0.6)
+- `--promote-no-llm-separability` — skip Sonnet separability gate
+
+### Deprecation
+
+`pipeline/discover_loop.py` is flagged `DEPRECATED` in its docstring. The `--step discover-loop` CLI entry is retained for reproducibility of earlier runs but `--step promote-loop` is the recommended path for new experiments.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/promote_loop.py` | **NEW** — U→S promotion loop |
+| `pipeline/run.py` | Added `--step promote-loop` + six `--promote-*` flags |
+| `pipeline/discover_loop.py` | Docstring marks as deprecated |
+| `RUNNING.md` | Promote-loop usage block |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.1] — Reviewer-directed correctness fixes
 
 **Date:** 2026-04-21

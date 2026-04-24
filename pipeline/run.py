@@ -72,9 +72,21 @@ def main():
                  "validate-annotator",
                  "splitting", "circuit", "intervention", "amplify",
                  "weaknesses", "siphoning", "discover", "discover-loop",
-                 "composition", "layer-sweep"],
+                 "composition", "layer-sweep", "promote-loop"],
         help="Run only this step",
     )
+    parser.add_argument("--promote-top-k", type=int, default=None,
+                        help="K U latents considered per promote-loop round (default 20)")
+    parser.add_argument("--promote-max-iters", type=int, default=None,
+                        help="Max promote-loop rounds (default 5)")
+    parser.add_argument("--promote-min-kept", type=int, default=None,
+                        help="Terminate promote-loop if fewer than N survive a round (default 3)")
+    parser.add_argument("--promote-post-train-f1-floor", type=float, default=None,
+                        help="Post-training F1 floor for new features (default 0.30)")
+    parser.add_argument("--promote-cos-threshold", type=float, default=None,
+                        help="Cosine-dedup threshold for merge (default 0.6)")
+    parser.add_argument("--promote-no-llm-separability", action="store_true",
+                        help="Skip LLM separability gate in the merge step")
     parser.add_argument(
         "--layers", default=None,
         help="Comma-separated layer list for --step layer-sweep "
@@ -390,6 +402,28 @@ def main():
         from .composition import run as run_composition
         run_composition(cfg)
         print(f"Composition completed in {time.time() - t0:.1f}s")
+
+    # Promote loop — residual-ranked U→S promotion
+    if args.step == "promote-loop":
+        print("\n" + "=" * 70)
+        print("PROMOTE LOOP — U→S capacity transfer via residual ranking")
+        print("=" * 70)
+        t0 = time.time()
+        from .promote_loop import run as run_promote_loop
+        if args.promote_top_k is not None:
+            cfg.promote_top_k = args.promote_top_k
+        if args.promote_max_iters is not None:
+            cfg.promote_max_iters = args.promote_max_iters
+        if args.promote_min_kept is not None:
+            cfg.promote_min_kept = args.promote_min_kept
+        if args.promote_post_train_f1_floor is not None:
+            cfg.promote_post_train_f1_floor = args.promote_post_train_f1_floor
+        if args.promote_cos_threshold is not None:
+            cfg.promote_cos_threshold = args.promote_cos_threshold
+        if args.promote_no_llm_separability:
+            cfg.promote_use_llm_separability = False
+        run_promote_loop(cfg)
+        print(f"Promote loop completed in {time.time() - t0:.1f}s")
 
     # Layer sweep — cross-layer pipeline orchestrator
     if args.step == "layer-sweep":
