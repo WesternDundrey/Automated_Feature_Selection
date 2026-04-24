@@ -1641,8 +1641,13 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
         recon = eval_data.get("reconstruction") or {}
         record = {
             "iter": iter_idx,
-            "n_candidates_initial": len(candidate_u_indices),
+            # v8.7 switched to adaptive batching; `candidate_u_indices` no
+            # longer exists. `all_candidates` is the full ΔR²-filtered pool;
+            # `spent` is how many we actually processed this round.
+            "n_candidates_initial": len(all_candidates),
+            "n_candidates_spent": spent,
             "n_crisp": len(crisp_candidates),
+            "n_atom_proposals": len(atom_proposals),
             "n_merged": n_kept,
             "n_after_mini_prefilter": len(kept_feature_ids),
             "n_after_post_training_filter": len(kept_ids_after_val),
@@ -1652,6 +1657,7 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
             "r2_after_retrain": recon.get("r2"),
             "delta_r2_supervised_after": recon.get("delta_r2_supervised"),
             "kept_ids": kept_ids_after_val,
+            "crispness_breakdown": cat_counts,
         }
         history.append(record)
         (iter_dir / "summary.json").write_text(json.dumps(record, indent=2))
