@@ -6,19 +6,41 @@ Runs the full pipeline (inventory → annotate → train → evaluate → causal
 artifacts under `pipeline_data/layer_{N}/`, and aggregates the headline
 metrics into a single cross-layer summary.
 
-Purpose: turn the point-result of "supervised SAE beats pretrained by 15.4×
-on targeting ratio at layer 20 of Gemma" (summary5) into a trend — does the
-advantage hold across layers? This is the evidence that makes a one-layer
-causality result generalize.
+Two distinct questions this sweep can answer — pick deliberately:
+
+(A) "What catalog does each layer naturally yield?" — the DEFAULT path.
+    Per-layer `inventory` is re-run, so Sonnet organizes each layer's own
+    pretrained-SAE top activations into a layer-specific catalog. Cross-layer
+    F1/R²/FVE deltas conflate "which layer represents the same concepts best"
+    with "which layer's catalog is more coherent". Useful for scouting which
+    layers the pretrained SAE organizes cleanly.
+
+(B) "Where are the SAME concepts most linearly/causally represented?" — the
+    FIXED-CATALOG path. Pass `--catalog` so every layer uses the identical
+    feature set; only activations and target_dirs differ. This is the fair
+    cross-layer comparison and the right design for a "which layer is best"
+    claim.
+
+Both are legitimate; they answer different questions. The cross-layer R²
+and FVE numbers this sweep prints are meaningful only if you know which
+question you're asking. `layer_sweep_summary.json` records
+`mode: "per_layer_catalog"` or `"fixed_catalog"` so downstream plots don't
+conflate them.
 
 Caching: each expensive artifact (`evaluation.json`, `causal.json`,
 `intervention_precision.json`) is skipped if already present for that
 layer. Delete those files to re-run.
 
-Usage:
-    python -m pipeline.run --step layer-sweep --layers 6,8,9,10,11 \\
+Usage — question (A):
+    python -m pipeline.run --step layer-sweep --layers 4,6,8,9,10,11 \\
         --local-annotator --full-desc \\
         --n_latents 500 --n_sequences 1000 --epochs 15
+
+Usage — question (B):
+    python -m pipeline.run --step layer-sweep --layers 4,6,8,9,10,11 \\
+        --catalog pipeline/gpt2_catalog.json \\
+        --local-annotator --full-desc \\
+        --n_sequences 1000 --epochs 15
 
 The SAE release + sae_id are derived from the current cfg: the `{N}` in
 `sae_id` is substituted with the layer number. For `gpt2-small-res-jb`,
@@ -88,9 +110,11 @@ def _collect_metrics(cfg: Config) -> dict:
 
         probe = eval_data.get("probe_baseline") or {}
         out["linear_probe_f1"] = probe.get("mean_f1")
+        out["linear_probe_f1_cal"] = probe.get("mean_f1_cal")
 
         posttrain = eval_data.get("posttrain_baseline") or {}
         out["pretrained_readout_f1"] = posttrain.get("mean_f1")
+        out["pretrained_readout_f1_cal"] = posttrain.get("mean_f1_cal")
 
         pre_recon = eval_data.get("pretrained_reconstruction") or {}
         out["pretrained_sae_r2"] = pre_recon.get("r2") if pre_recon else None
@@ -171,8 +195,17 @@ def run(
 
     sweep_root = cfg.output_dir / "layer_sweep"
     sweep_root.mkdir(parents=True, exist_ok=True)
+    mode = "fixed_catalog" if cfg.manual_catalog else "per_layer_catalog"
     print(f"Layer sweep root: {sweep_root}")
     print(f"Layers: {list(layers)}")
+    print(f"Mode:   {mode}")
+    if mode == "per_layer_catalog":
+        print(
+            "  NOTE: no --catalog supplied. Each layer will get its own "
+            "Sonnet-organized catalog, so cross-layer F1/R²/FVE numbers "
+            "reflect (layer × catalog) jointly, NOT pure layer effect. "
+            "For 'which layer represents these concepts best' pass --catalog."
+        )
 
     # Defer imports so we pay the cost once per sweep, not per layer.
     from .inventory import run as run_inventory
@@ -240,6 +273,8 @@ def run(
         {
             "model_name": cfg.model_name,
             "sae_release": cfg.sae_release,
+            "mode": mode,
+            "catalog": str(cfg.manual_catalog) if cfg.manual_catalog else None,
             "per_layer": per_layer_metrics,
         },
         indent=2,

@@ -159,6 +159,14 @@ class Config:
         return self.output_dir / "annotations.pt"
 
     @property
+    def annotations_meta_path(self) -> Path:
+        """Sidecar JSON recording the feature-id sequence of annotations.pt's
+        last axis. Used to detect catalog reorderings / partial overlaps so
+        cached labels can be remapped by ID instead of silently misbinding to
+        whatever happens to sit at the same column index."""
+        return self.output_dir / "annotations_meta.json"
+
+    @property
     def checkpoint_path(self) -> Path:
         return self.output_dir / "supervised_sae.pt"
 

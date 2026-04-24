@@ -80,13 +80,28 @@ def run(cfg: Config = None):
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
 
-    # Run annotation multiple times independently (leaf features only)
+    # Run annotation multiple times independently (leaf features only).
+    # IMPORTANT: the agreement run must use the SAME annotator backend that
+    # produced the training labels. Previous versions hard-coded the API
+    # (annotate_corpus_async) even when the main pipeline ran with
+    # --local-annotator, so the reported κ was inter-rater for a DIFFERENT
+    # annotator than the one whose noise actually bounds F1 on the trained
+    # SAE. Dispatch on cfg.use_local_annotator to match.
     annotation_runs = []
     for run_idx in range(cfg.agreement_n_reruns):
-        print(f"\nAnnotation run {run_idx + 1}/{cfg.agreement_n_reruns}...")
-        leaf_labels = asyncio.run(
-            annotate_corpus_async(subset_tokens, leaf_features, tokenizer, cfg)
+        print(
+            f"\nAnnotation run {run_idx + 1}/{cfg.agreement_n_reruns} "
+            f"(backend: {'local vLLM' if cfg.use_local_annotator else 'API'})..."
         )
+        if cfg.use_local_annotator:
+            from .annotate import annotate_local
+            leaf_labels = annotate_local(
+                subset_tokens, leaf_features, tokenizer, cfg,
+            )
+        else:
+            leaf_labels = asyncio.run(
+                annotate_corpus_async(subset_tokens, leaf_features, tokenizer, cfg)
+            )
         # Expand leaf annotations to full feature tensor
         full_labels = torch.zeros(subset_tokens.shape[0], subset_tokens.shape[1], len(features))
         for li, fi in enumerate(leaf_indices):
@@ -94,16 +109,29 @@ def run(cfg: Config = None):
         full_labels = propagate_group_labels(full_labels, features)
         annotation_runs.append(full_labels)
 
-    # Compute pairwise Cohen's kappa for each feature
+    # Compute pairwise agreement metrics for each feature.
+    #
+    # We report two numbers per feature:
+    #   - Cohen's κ: agreement beyond chance, the classical inter-rater metric.
+    #   - Annotator-vs-annotator F1: a direct ceiling on the F1 a classifier
+    #     can achieve against either annotator. Treat run 0 as the "reference"
+    #     and run 1 as "predictions" (a symmetric swap gives the same F1 in
+    #     expectation); any classifier will have F1 bounded above by this value
+    #     because the labels it's trained against disagree at exactly this rate.
+    # κ does NOT directly bound F1 — they measure different things. The F1
+    # ceiling is the more defensible "how high can our supervised SAE go on
+    # this feature" claim.
     n_features = len(features)
     kappa_results = []
 
     print("\n" + "=" * 70)
-    print("INTER-ANNOTATOR AGREEMENT (Cohen's Kappa)")
-    print(f"  {'Feature':<40} {'Kappa':>8} {'Agree%':>8} {'Pos1':>6} {'Pos2':>6}")
-    print("  " + "-" * 70)
+    print("INTER-ANNOTATOR AGREEMENT (κ + F1 ceiling)")
+    print(f"  {'Feature':<36} {'Kappa':>8} {'F1':>7} {'Agree%':>8} "
+          f"{'Pos1':>6} {'Pos2':>6}")
+    print("  " + "-" * 75)
 
     kappa_values = []
+    f1_ceiling_values = []
 
     for k, feat in enumerate(features):
         # Compare first two runs (flatten to 1D)
@@ -117,14 +145,25 @@ def run(cfg: Config = None):
             kappa_results.append({
                 "id": feat["id"], "type": feat["type"],
                 "kappa": None, "agreement": None,
+                "f1_ceiling": None,
                 "n_pos_run1": 0, "n_pos_run2": 0,
                 "quality": "no_data",
             })
-            print(f"  {feat['id']:<40} {'--':>8} {'--':>8} {0:>6} {0:>6}")
+            print(f"  {feat['id']:<36} {'--':>8} {'--':>7} {'--':>8} "
+                  f"{0:>6} {0:>6}")
             continue
 
         kappa = cohens_kappa(y1, y2)
         agreement = float((y1 == y2).mean())
+
+        # Annotator-vs-annotator F1 (run 0 = truth, run 1 = predictions).
+        # tp = both True; precision = tp / pred+; recall = tp / truth+.
+        tp = int((y1 & y2).sum())
+        prec = tp / n_pos_2 if n_pos_2 > 0 else 0.0
+        rec = tp / n_pos_1 if n_pos_1 > 0 else 0.0
+        f1_ceiling = (
+            2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        )
 
         # Classify quality
         if np.isnan(kappa):
@@ -137,15 +176,17 @@ def run(cfg: Config = None):
             quality = "poor"
 
         kappa_values.append(kappa)
+        f1_ceiling_values.append(f1_ceiling)
         tag = " [group]" if feat["type"] == "group" else ""
         k_str = f"{kappa:.4f}" if not np.isnan(kappa) else "--"
-        print(f"  {feat['id']:<40} {k_str:>8} {agreement:>7.1%} "
-              f"{n_pos_1:>6} {n_pos_2:>6}{tag}")
+        print(f"  {feat['id']:<36} {k_str:>8} {f1_ceiling:>7.3f} "
+              f"{agreement:>7.1%} {n_pos_1:>6} {n_pos_2:>6}{tag}")
 
         kappa_results.append({
             "id": feat["id"], "type": feat["type"],
             "kappa": round(kappa, 4) if not np.isnan(kappa) else None,
             "agreement": round(agreement, 4),
+            "f1_ceiling": round(f1_ceiling, 4),
             "n_pos_run1": n_pos_1, "n_pos_run2": n_pos_2,
             "quality": quality,
         })
@@ -159,14 +200,20 @@ def run(cfg: Config = None):
     else:
         mean_kappa = 0.0
         n_good = n_moderate = n_poor = 0
+    mean_f1_ceiling = float(np.mean(f1_ceiling_values)) if f1_ceiling_values else 0.0
 
-    print(f"\n  Mean kappa: {mean_kappa:.3f}")
-    print(f"  Good (>=0.6): {n_good}  Moderate (0.3-0.6): {n_moderate}  Poor (<0.3): {n_poor}")
+    print(f"\n  Mean κ:           {mean_kappa:.3f}")
+    print(f"  Mean F1 ceiling:  {mean_f1_ceiling:.3f}  "
+          f"(direct upper bound on any classifier's F1)")
+    print(f"  κ bands: good (>=0.6): {n_good}  moderate (0.3-0.6): {n_moderate}  "
+          f"poor (<0.3): {n_poor}")
 
     results = {
         "n_sequences": n_agree,
         "n_reruns": cfg.agreement_n_reruns,
+        "annotator_backend": "local_vllm" if cfg.use_local_annotator else "api",
         "mean_kappa": round(mean_kappa, 4),
+        "mean_f1_ceiling": round(mean_f1_ceiling, 4),
         "n_good": n_good,
         "n_moderate": n_moderate,
         "n_poor": n_poor,

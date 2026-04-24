@@ -150,19 +150,25 @@ def _sonnet_separability_judgment(
     try:
         text = chat(client, cfg.organization_model, prompt, max_tokens=200)
     except Exception as e:
-        # Fail open: if the LLM call fails, don't block the merge on this check.
-        return True, f"separability LLM unreachable ({type(e).__name__}: {e})"
+        # FAIL CLOSED: if the LLM call fails, reject the proposal rather than
+        # promote it. The gate's job is to catch rediscoveries; defaulting to
+        # "separable" on error makes outages or rate-limits auto-accept
+        # everything. Previous fail-open behavior let a single Sonnet outage
+        # promote hundreds of bogus proposals.
+        return False, f"separability LLM unreachable ({type(e).__name__}: {e})"
 
     # Parse the JSON response
     import re
     m = re.search(r"\{.*?\}", text, re.DOTALL)
     if not m:
-        return True, f"separability response unparseable: {text[:120]}"
+        return False, f"separability response unparseable: {text[:120]}"
     try:
         obj = json.loads(m.group(0))
-        return bool(obj.get("separable", True)), str(obj.get("reason", ""))
+        # The prompt explicitly defaults to SAME (separable=False); we mirror
+        # that default when the key is missing.
+        return bool(obj.get("separable", False)), str(obj.get("reason", ""))
     except json.JSONDecodeError:
-        return True, f"separability JSON invalid: {text[:120]}"
+        return False, f"separability JSON invalid: {text[:120]}"
 
 
 def merge_catalogs_by_direction(

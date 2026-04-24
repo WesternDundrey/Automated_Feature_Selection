@@ -4,6 +4,72 @@
 
 ---
 
+## [v8.1] — Reviewer-directed correctness fixes
+
+**Date:** 2026-04-21
+
+### Motivation
+
+Outside review raised eight concrete issues with the v7/v8 code. Five are addressed in this commit (all methodology-affecting); two (F-index hardcoded exemplars; annotation throughput tuning) are deferred because `--full-desc` is the default path and the listed tuning items are runtime sweeps, not code changes; one (residual-based discovery-loop redesign) is substantial enough to live in a separate commit.
+
+### Fixes
+
+**1. Separability LLM gate fails CLOSED** (`pipeline/merge.py:150-166`)
+
+Previous behavior on LLM exception / unparseable response / invalid JSON: return `separable=True` (= keep). A single Sonnet outage could silently promote every candidate in a round. Flipped to `separable=False` on all three error paths. The parsed default when `separable` is missing from the response was also `True`; matched the prompt's stated default ("DEFAULT ANSWER IS SAME") by flipping that to `False`.
+
+**2. Feature-ID-keyed annotation cache** (`pipeline/annotate.py`, `pipeline/config.py`)
+
+Previous behavior: `annotations.pt` columns were assumed to match the catalog by position. Any reorder or mid-catalog insert silently re-bound labels to the wrong features. Fix: every save writes a sidecar `annotations_meta.json` (new `Config.annotations_meta_path` property) recording the `feature_ids` sequence. On load:
+
+- Sidecar present + ids available → remap each current feature's column from the cache by ID. Features absent from the cache are scheduled for (re-)annotation; extra cached features are dropped. Safe under any catalog reorder / insert / delete.
+- Sidecar absent (legacy cache) → fall back to positional reuse with an explicit warning recommending deletion for safety.
+- Sidecar malformed or shape mismatch on (N, T) → full re-annotation.
+
+Group labels are always re-derived from their leaves (cheap) so a freshly remapped tensor doesn't carry stale OR values.
+
+**3. Agreement dispatches on annotator backend + F1 ceiling reported alongside κ** (`pipeline/agreement.py`)
+
+Previous behavior: `annotate_corpus_async` (the API path) was called unconditionally, so `--local-annotator` runs reported inter-rater agreement for a backend that never labeled the training data. Fix: dispatch on `cfg.use_local_annotator` — local runs now route through `annotate_local`. The `annotator_backend` field is written to `agreement.json` for audit.
+
+Separately: κ is not directly an F1 ceiling (it measures agreement beyond chance, not retrieval). Added an annotator-vs-annotator F1 computation per feature — treats one annotation run as the reference, the other as predictions; the resulting F1 is a direct upper bound on the F1 any classifier can achieve against either run. Reported as `f1_ceiling` per feature and `mean_f1_ceiling` in aggregate. κ is retained for band classification (good/moderate/poor) but the F1-ceiling is the defensible "how high can our SAE go on this feature" number.
+
+**4. Calibrated F1 for linear probe and post-training readout** (`pipeline/evaluate.py`)
+
+Previous behavior: supervised SAE reported per-feature `cal_mean_f1` (thresholds optimized on val, evaluated on test). Linear probe and post-training readout reported F1 at raw `logits > 0`. Summary7's headline comparison table labeled all three as "Calibrated F1", which was apples-to-oranges — the SAE's +0.104 F1 advantage over the probe was partially attributable to calibration, not to the representation.
+
+Fix: both baselines now compute logits on val and test, fit per-feature thresholds on val via `optimal_threshold_f1`, apply on test. Reported as `mean_f1_cal` alongside the existing `mean_f1` (t=0) for each baseline. The `evaluation.json` schema gains `probe_baseline.mean_f1_cal`, `posttrain_baseline.mean_f1_cal`, and `per_feature[*].f1_cal` / `cal_threshold` entries. Future cross-baseline comparisons should use the calibrated numbers. Existing `mean_f1` (t=0) columns retained for backward compatibility.
+
+**5. Layer sweep: docstring + mode tagging** (`pipeline/layer_sweep.py`)
+
+The sweep runs inventory per-layer unless `--catalog` is supplied, so each layer gets a different Sonnet-organized catalog. Cross-layer F1/R²/FVE deltas conflate layer with catalog. That's a legitimate question ("what catalog does each layer naturally yield?") but not the same as "where are the same concepts best represented?" — which requires a fixed catalog across layers.
+
+Fix: docstring now explicitly states both questions and which flag selects each mode. At runtime, the sweep prints `Mode: per_layer_catalog` or `Mode: fixed_catalog` and emits a warning when running without `--catalog`. The output `layer_sweep_summary.json` records the `mode` and `catalog` fields so downstream plots don't conflate the two.
+
+### Deferred
+
+- **F-index annotator exemplars hardcode F0=comma, F5=capitalized** (`annotate.py:515-518`). Real bug, but `--full-desc` is the default path in RUNNING.md and in every current run command. Fix tracked but not a blocker.
+- **Annotation throughput tuning** (`seq_chunk` sweep, prefix cache to disk, max_model_len, multi-GPU sharding). These are runtime/infra optimizations, not correctness bugs. Not addressed in this commit.
+- **Residual-based discovery loop (`promote_loop.py`)**. The current `discover_loop.py` re-trains an unsup SAE on raw activations with the same seed every round, so later rounds re-propose the same latents. The right design is `r_S = x − recon_supervised_only(x)` → rank U latents by their contribution to residual / causal effect → describe → validate → promote to S → retrain → verify capacity shifted from U to S. Substantial redesign; deferred to a follow-up commit so this fix batch can land independently.
+
+### Methodology framing (not code)
+
+**BCE is the differentiable gate/selectivity loss; reconstruction learns magnitude.** The ablation matrix in summary7 is consistent with this framing: drop BCE and F1 collapses to 0.09 (no selectivity signal), drop reconstruction and magnitude supervision fails (F1=0.093 for `frozen_recon_only`). The pos-weight concern for imbalanced features is addressable with feature-balanced BCE + gradient-norm logging, not by abandoning BCE. Future BCE variants should be evaluated in ablation.py against this baseline.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/config.py` | `annotations_meta_path` property |
+| `pipeline/annotate.py` | ID-keyed cache load/save with legacy fallback |
+| `pipeline/merge.py` | Separability gate fails closed |
+| `pipeline/agreement.py` | Dispatch on `use_local_annotator`; add F1-ceiling metric |
+| `pipeline/evaluate.py` | Calibrated F1 for probe + post-training readout |
+| `pipeline/layer_sweep.py` | Docstring clarification; `mode` tagging |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.0] — Publication-track Experiments: Composition + Layer Sweep
 
 **Date:** 2026-04-20

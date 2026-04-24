@@ -558,36 +558,71 @@ def evaluate(cfg: Config = None):
 
     probe.eval()
     with torch.no_grad():
+        probe_val_logits_list = []
+        for i in range(0, x_val.shape[0], cfg.batch_size):
+            probe_val_logits_list.append(probe(x_val[i : i + cfg.batch_size]))
+        probe_val_logits = torch.cat(probe_val_logits_list).numpy()
+
         probe_logits_list = []
         for i in range(0, x_test.shape[0], cfg.batch_size):
             probe_logits_list.append(probe(x_test[i : i + cfg.batch_size]))
         probe_logits = torch.cat(probe_logits_list).numpy()
 
+    val_gt_np = y_val.numpy().astype(bool)
+
+    # Per-feature calibrated threshold, optimized on val, applied on test.
+    # This matches the protocol used for the supervised SAE at line 161-167;
+    # reporting probe F1 at t=0 against the supervised SAE at calibrated
+    # thresholds is an apples-to-oranges comparison that inflates the
+    # supervised advantage.
+    probe_cal_thresholds = np.zeros(n_features)
+    for k in range(n_features):
+        if int(val_gt_np[:, k].sum()) == 0:
+            continue
+        _, _, _, best_t = optimal_threshold_f1(val_gt_np[:, k], probe_val_logits[:, k])
+        probe_cal_thresholds[k] = best_t
+    probe_cal_preds = probe_logits > probe_cal_thresholds[None, :]
+
     probe_preds = probe_logits > 0
     probe_f1_scores = []
+    probe_cal_f1_scores = []
     probe_auroc_scores = []
     probe_results = []
 
     for k, feat in enumerate(features):
         n_pos = int(gt[:, k].sum())
         if n_pos == 0:
-            probe_results.append({"id": feat["id"], "f1": None, "auroc": None})
+            probe_results.append({
+                "id": feat["id"], "f1": None, "f1_cal": None, "auroc": None,
+            })
             continue
         pp, pr, pf1 = precision_recall_f1(gt[:, k], probe_preds[:, k])
+        _, _, pf1_cal = precision_recall_f1(gt[:, k], probe_cal_preds[:, k])
         pauc = auroc(gt[:, k], probe_logits[:, k])
         probe_f1_scores.append(pf1)
+        probe_cal_f1_scores.append(pf1_cal)
         if not np.isnan(pauc):
             probe_auroc_scores.append(pauc)
         probe_results.append({
-            "id": feat["id"], "f1": round(pf1, 4),
+            "id": feat["id"],
+            "f1": round(pf1, 4),
+            "f1_cal": round(pf1_cal, 4),
             "auroc": round(pauc, 4) if not np.isnan(pauc) else None,
+            "cal_threshold": round(float(probe_cal_thresholds[k]), 4),
         })
 
     probe_mean_f1 = float(np.mean(probe_f1_scores)) if probe_f1_scores else 0.0
+    probe_cal_mean_f1 = (
+        float(np.mean(probe_cal_f1_scores)) if probe_cal_f1_scores else 0.0
+    )
     probe_mean_auroc = float(np.mean(probe_auroc_scores)) if probe_auroc_scores else 0.0
 
-    print(f"  Probe Mean F1:    {probe_mean_f1:.3f}  (supervised SAE: {mean_f1:.3f})")
-    print(f"  Probe Mean AUROC: {probe_mean_auroc:.3f}  (supervised SAE: {mean_auroc:.3f})")
+    print(f"  Probe Mean F1:       {probe_mean_f1:.3f}  "
+          f"(supervised SAE t=0: {mean_f1:.3f})")
+    print(f"  Probe Calibrated F1: {probe_cal_mean_f1:.3f}  "
+          f"(supervised SAE calibrated: {cal_mean_f1:.3f})")
+    print(f"  Probe Mean AUROC:    {probe_mean_auroc:.3f}  "
+          f"(supervised SAE: {mean_auroc:.3f})")
 
     del probe  # free memory (keep x_train, y_train for section 7)
 
@@ -595,6 +630,7 @@ def evaluate(cfg: Config = None):
     pretrained_mse = None
     pretrained_r2 = None
     posttrain_mean_f1 = 0.0
+    posttrain_cal_mean_f1 = 0.0
     posttrain_mean_auroc = 0.0
     posttrain_results = []
 
@@ -687,6 +723,15 @@ def evaluate(cfg: Config = None):
 
         readout.eval()
         with torch.no_grad():
+            # Compute readout logits on BOTH val (for calibration) and test.
+            rt_val_logits_list = []
+            for i in range(0, x_val.shape[0], cfg.batch_size):
+                z_b = wrapped_sae.encode(
+                    x_val[i : i + cfg.batch_size].to(cfg.device)
+                ).cpu()
+                rt_val_logits_list.append(readout(z_b))
+            rt_val_logits = torch.cat(rt_val_logits_list).numpy()
+
             rt_logits_list = []
             for i in range(0, x_test.shape[0], cfg.batch_size):
                 z_b = wrapped_sae.encode(
@@ -695,33 +740,55 @@ def evaluate(cfg: Config = None):
                 rt_logits_list.append(readout(z_b))
             rt_logits = torch.cat(rt_logits_list).numpy()
 
+        # Calibrated thresholds for the post-training readout, same protocol
+        # as the supervised SAE: pick best per-feature t on val, evaluate on
+        # test. Without this the readout is under-scored at the t=0 default.
+        rt_cal_thresholds = np.zeros(n_features)
+        for k in range(n_features):
+            if int(val_gt_np[:, k].sum()) == 0:
+                continue
+            _, _, _, best_t = optimal_threshold_f1(val_gt_np[:, k], rt_val_logits[:, k])
+            rt_cal_thresholds[k] = best_t
+        rt_cal_preds = rt_logits > rt_cal_thresholds[None, :]
+
         rt_preds = rt_logits > 0
         pt_f1_scores = []
+        pt_cal_f1_scores = []
         pt_auroc_scores = []
 
         for k, feat in enumerate(features):
             n_pos = int(gt[:, k].sum())
             if n_pos == 0:
                 posttrain_results.append({
-                    "id": feat["id"], "f1": None, "auroc": None,
+                    "id": feat["id"], "f1": None, "f1_cal": None, "auroc": None,
                 })
                 continue
             pp, pr, pf1 = precision_recall_f1(gt[:, k], rt_preds[:, k])
+            _, _, pf1_cal = precision_recall_f1(gt[:, k], rt_cal_preds[:, k])
             pauc = auroc(gt[:, k], rt_logits[:, k])
             pt_f1_scores.append(pf1)
+            pt_cal_f1_scores.append(pf1_cal)
             if not np.isnan(pauc):
                 pt_auroc_scores.append(pauc)
             posttrain_results.append({
-                "id": feat["id"], "f1": round(pf1, 4),
+                "id": feat["id"],
+                "f1": round(pf1, 4),
+                "f1_cal": round(pf1_cal, 4),
                 "auroc": round(pauc, 4) if not np.isnan(pauc) else None,
+                "cal_threshold": round(float(rt_cal_thresholds[k]), 4),
             })
 
         posttrain_mean_f1 = float(np.mean(pt_f1_scores)) if pt_f1_scores else 0.0
+        posttrain_cal_mean_f1 = (
+            float(np.mean(pt_cal_f1_scores)) if pt_cal_f1_scores else 0.0
+        )
         posttrain_mean_auroc = float(np.mean(pt_auroc_scores)) if pt_auroc_scores else 0.0
 
-        print(f"  Post-train Mean F1:    {posttrain_mean_f1:.3f}  "
-              f"(supervised SAE: {mean_f1:.3f}, probe: {probe_mean_f1:.3f})")
-        print(f"  Post-train Mean AUROC: {posttrain_mean_auroc:.3f}  "
+        print(f"  Post-train Mean F1:       {posttrain_mean_f1:.3f}  "
+              f"(supervised SAE t=0: {mean_f1:.3f}, probe t=0: {probe_mean_f1:.3f})")
+        print(f"  Post-train Calibrated F1: {posttrain_cal_mean_f1:.3f}  "
+              f"(supervised SAE calibrated: {cal_mean_f1:.3f}, probe cal: {probe_cal_mean_f1:.3f})")
+        print(f"  Post-train Mean AUROC:    {posttrain_mean_auroc:.3f}  "
               f"(supervised SAE: {mean_auroc:.3f}, probe: {probe_mean_auroc:.3f})")
 
         del wrapped_sae, readout
@@ -767,11 +834,13 @@ def evaluate(cfg: Config = None):
         } if use_mse else None,
         "probe_baseline": {
             "mean_f1": probe_mean_f1,
+            "mean_f1_cal": probe_cal_mean_f1,
             "mean_auroc": probe_mean_auroc,
             "per_feature": probe_results,
         },
         "posttrain_baseline": {
             "mean_f1": posttrain_mean_f1,
+            "mean_f1_cal": posttrain_cal_mean_f1,
             "mean_auroc": posttrain_mean_auroc,
             "per_feature": posttrain_results,
         },

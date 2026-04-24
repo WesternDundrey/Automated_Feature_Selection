@@ -1065,109 +1065,168 @@ if not cfg.activations_path.exists():
     from transformers import AutoTokenizer
     tokenizer_ref = AutoTokenizer.from_pretrained(cfg.model_name)
 
-    # Annotate (or load cached). Supports incremental annotation for the
-    # discovery loop: if the cached annotations tensor has fewer features than
-    # the current catalog, we annotate ONLY the new ones and concat along
-    # the feature dimension — rather than re-annotating the entire catalog.
-    # Logic:
-    #   - Cache exists AND catalog grew: annotate new leaves only, concat.
-    #   - Cache exists AND catalog shrank/reordered: discard cache, full re-run.
-    #   - Cache exists AND catalog matches: load cache.
-    #   - No cache: full annotation.
+    # Annotate (or load cached). The cache is validated against the current
+    # catalog by FEATURE ID via the `annotations_meta.json` sidecar — this
+    # prevents silent misbinding when the catalog is reordered or features
+    # are removed. A tensor without a sidecar is treated as "legacy positional"
+    # and accepted only when shape matches exactly; any mismatch triggers a
+    # warning and a full re-annotation because we can't recover the ID
+    # sequence after the fact.
     N_tok, T_tok = tokens.shape
     n_features = len(features)
+    current_ids = [f["id"] for f in features]
 
-    cached_ok = False
-    partial_existing = None
-    n_cached_features = 0
+    annotations = None
+    new_feature_indices: list[int] = []
+
     if cfg.annotations_path.exists():
         cached = torch.load(cfg.annotations_path, weights_only=True)
-        n_cached_features = cached.shape[-1]
-        if cached.shape[:2] == (N_tok, T_tok) and n_cached_features == n_features:
-            print(f"Loading cached annotations: {cfg.annotations_path}")
-            annotations = cached
-            cached_ok = True
-        elif cached.shape[:2] == (N_tok, T_tok) and n_cached_features < n_features:
-            # Catalog grew — incremental annotation of the new tail.
-            n_new = n_features - n_cached_features
-            print(
-                f"Incremental annotation: cached tensor has {n_cached_features} "
-                f"features, catalog has {n_features}. Annotating {n_new} new "
-                f"features and concatenating."
-            )
-            partial_existing = cached
-        else:
-            print(
-                f"Cached annotations shape {tuple(cached.shape)} incompatible "
-                f"with (N={N_tok}, T={T_tok}, n_features={n_features}). "
-                f"Discarding cache and re-annotating from scratch."
-            )
-
-    if not cached_ok:
-        if partial_existing is not None:
-            # Only annotate the tail of the leaf list that corresponds to new features.
-            # leaf_features/leaf_indices are constructed in catalog order; new
-            # leaves are always appended to the end in the discovery loop.
-            # Figure out which leaves need new annotations: any leaf_idx >=
-            # n_cached_features is new.
-            new_leaf_positions = [
-                (li, fi) for li, fi in enumerate(leaf_indices)
-                if fi >= n_cached_features
-            ]
-            new_leaf_features = [leaf_features[li] for li, _ in new_leaf_positions]
-            print(f"  {len(new_leaf_features)} new leaves to annotate "
-                  f"(out of {len(leaf_features)} total leaves)")
-
-            if new_leaf_features:
-                if cfg.use_local_annotator:
-                    new_leaf_annotations = annotate_local(
-                        tokens, new_leaf_features, tokenizer_ref, cfg,
+        cached_shape_ok = (cached.shape[:2] == (N_tok, T_tok))
+        cached_ids: list[str] | None = None
+        if cfg.annotations_meta_path.exists():
+            try:
+                meta = json.loads(cfg.annotations_meta_path.read_text())
+                cached_ids = meta.get("feature_ids")
+                if not isinstance(cached_ids, list) or len(cached_ids) != cached.shape[-1]:
+                    print(
+                        f"  annotations_meta.json is malformed (ids "
+                        f"{len(cached_ids) if isinstance(cached_ids, list) else 'n/a'} "
+                        f"vs tensor last-dim {cached.shape[-1]}). Discarding cache."
                     )
+                    cached_ids = None
+                    cached_shape_ok = False
+            except json.JSONDecodeError:
+                print("  annotations_meta.json is not valid JSON. Discarding cache.")
+                cached_shape_ok = False
+                cached_ids = None
+
+        if not cached_shape_ok:
+            print(
+                f"  Cached annotations shape {tuple(cached.shape)} incompatible "
+                f"with (N={N_tok}, T={T_tok}). Re-annotating from scratch."
+            )
+        elif cached_ids is not None:
+            # ID-based remap: each current feature pulls its column from the
+            # cache by ID. Missing IDs → all-zero placeholder + schedule for
+            # re-annotation. Extra cached IDs (features no longer in catalog)
+            # are silently dropped. Safe under any catalog reorder / insert /
+            # delete.
+            cached_by_id: dict[str, int] = {}
+            for i, fid in enumerate(cached_ids):
+                # If the same id appears twice (shouldn't happen, but guard),
+                # the first occurrence wins.
+                cached_by_id.setdefault(fid, i)
+
+            annotations = torch.zeros(N_tok, T_tok, n_features)
+            hit_count = 0
+            for ki, fid in enumerate(current_ids):
+                src = cached_by_id.get(fid)
+                if src is not None:
+                    annotations[:, :, ki] = cached[:, :, src]
+                    hit_count += 1
                 else:
-                    new_leaf_annotations = annotate_corpus(
-                        tokens, new_leaf_features, tokenizer_ref, cfg,
-                    )
-            else:
-                new_leaf_annotations = torch.zeros(N_tok, T_tok, 0)
+                    new_feature_indices.append(ki)
 
-            # Start with cached annotations extended with zeros for new features.
-            annotations = torch.zeros(N_tok, T_tok, n_features)
-            annotations[:, :, :n_cached_features] = partial_existing
-
-            # Write the new leaves into their correct positions.
-            for (li, fi), k in zip(new_leaf_positions, range(len(new_leaf_positions))):
-                annotations[:, :, fi] = new_leaf_annotations[:, :, k]
-        else:
-            # Fresh run: annotate all leaves.
-            if cfg.use_local_annotator:
-                leaf_annotations = annotate_local(tokens, leaf_features, tokenizer_ref, cfg)
-            else:
-                leaf_annotations = annotate_corpus(tokens, leaf_features, tokenizer_ref, cfg)
-            annotations = torch.zeros(N_tok, T_tok, n_features)
-            for li, fi in enumerate(leaf_indices):
-                annotations[:, :, fi] = leaf_annotations[:, :, li]
-
-        # Propagate group labels (OR of children) — done for BOTH fresh and
-        # incremental paths so new groups pick up their children's labels.
-        annotations = propagate_group_labels(annotations, features)
-
-        # Filter out features with very low positive rate
-        if cfg.min_feature_positive_rate > 0:
-            features, annotations, removed = filter_sparse_features(
-                features, annotations, cfg.min_feature_positive_rate
+            n_new = len(new_feature_indices)
+            n_dropped = len(cached_ids) - hit_count
+            print(
+                f"ID-keyed cache reuse: {hit_count}/{n_features} features matched "
+                f"by id, {n_new} new features scheduled for annotation"
+                + (f", {n_dropped} cached-only features dropped" if n_dropped else "")
+                + "."
             )
-            if removed:
-                print(f"\n  Filtered {len(removed)} sparse features "
-                      f"(rate < {cfg.min_feature_positive_rate:.2%}):")
-                for fid in removed:
-                    print(f"    - {fid}")
-                # Update catalog on disk to match filtered annotations
-                catalog["features"] = features
-                cfg.catalog_path.write_text(json.dumps(catalog, indent=2))
-                print(f"  Updated catalog: {len(features)} features remain")
+        else:
+            # Legacy positional cache: no sidecar. Warn and fall back to the
+            # old "catalog-grew-at-the-tail" behavior only when the shape is
+            # consistent; otherwise discard.
+            if cached.shape[-1] == n_features:
+                print(
+                    "  WARNING: cached annotations lack an id sidecar. "
+                    "Assuming positional alignment; delete annotations.pt to "
+                    "regenerate safely."
+                )
+                annotations = cached.clone()
+            elif cached.shape[-1] < n_features:
+                n_cached_features = cached.shape[-1]
+                print(
+                    f"  WARNING: cached annotations (n_features={n_cached_features}) "
+                    f"lack an id sidecar. Falling back to legacy tail-append "
+                    f"assumption; delete annotations.pt to regenerate safely."
+                )
+                annotations = torch.zeros(N_tok, T_tok, n_features)
+                annotations[:, :, :n_cached_features] = cached
+                new_feature_indices = list(range(n_cached_features, n_features))
+            else:
+                print(
+                    f"  Cached annotations have more columns ({cached.shape[-1]}) "
+                    f"than current catalog ({n_features}) and no id sidecar. "
+                    f"Discarding cache."
+                )
 
-        torch.save(annotations, cfg.annotations_path)
-        print(f"Saved annotations: {cfg.annotations_path}")
+    if annotations is None:
+        annotations = torch.zeros(N_tok, T_tok, n_features)
+        new_feature_indices = list(range(n_features))
+
+    # Narrow the annotation pass to leaves only (groups are derived via OR).
+    new_leaf_features: list[dict] = []
+    new_leaf_feat_indices: list[int] = []  # index into `features`
+    for fi in new_feature_indices:
+        feat = features[fi]
+        if feat.get("type") == "leaf":
+            new_leaf_features.append(feat)
+            new_leaf_feat_indices.append(fi)
+
+    if new_leaf_features:
+        print(
+            f"  Annotating {len(new_leaf_features)} new leaves "
+            f"(out of {len(leaf_features)} total leaves in current catalog)"
+        )
+        if cfg.use_local_annotator:
+            new_leaf_annotations = annotate_local(
+                tokens, new_leaf_features, tokenizer_ref, cfg,
+            )
+        else:
+            new_leaf_annotations = annotate_corpus(
+                tokens, new_leaf_features, tokenizer_ref, cfg,
+            )
+        for k, fi in enumerate(new_leaf_feat_indices):
+            annotations[:, :, fi] = new_leaf_annotations[:, :, k]
+
+    # Group labels are always re-derived from their (possibly freshly
+    # annotated) leaves — cheap and handles the reorder/remap case.
+    annotations = propagate_group_labels(annotations, features)
+
+    # Filter out features with very low positive rate
+    if cfg.min_feature_positive_rate > 0:
+        features, annotations, removed = filter_sparse_features(
+            features, annotations, cfg.min_feature_positive_rate
+        )
+        if removed:
+            print(f"\n  Filtered {len(removed)} sparse features "
+                  f"(rate < {cfg.min_feature_positive_rate:.2%}):")
+            for fid in removed:
+                print(f"    - {fid}")
+            # Update catalog on disk to match filtered annotations
+            catalog["features"] = features
+            cfg.catalog_path.write_text(json.dumps(catalog, indent=2))
+            print(f"  Updated catalog: {len(features)} features remain")
+            current_ids = [f["id"] for f in features]
+
+    # Always (re)write the sidecar alongside the tensor so future runs can
+    # re-align by id.
+    torch.save(annotations, cfg.annotations_path)
+    cfg.annotations_meta_path.write_text(json.dumps(
+        {
+            "feature_ids": current_ids,
+            "shape": list(annotations.shape),
+            "version": 1,
+        },
+        indent=2,
+    ))
+    print(
+        f"Saved annotations: {cfg.annotations_path} "
+        f"(+ sidecar {cfg.annotations_meta_path.name})"
+    )
 
     return tokens, activations, annotations
 
