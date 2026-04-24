@@ -336,10 +336,38 @@ def _crispness_judgment(description: str, cfg: Config) -> tuple[bool, str, str]:
         obj = json.loads(m.group(0))
         crisp = bool(obj.get("crisp", False))
         reason = str(obj.get("reason", ""))
-        category = str(obj.get("category", "crisp" if crisp else "unknown"))
-        if category not in CRISPNESS_CATEGORIES:
-            category = "unknown"
-        return crisp, reason, category
+        category = str(obj.get("category", "")).strip().lower()
+        if category in CRISPNESS_CATEGORIES:
+            return crisp, reason, category
+        # Sonnet sometimes omits the category field even when asked. When
+        # crisp=true, the category is obviously "crisp"; when crisp=false,
+        # try to recover the category from the reason text before falling
+        # back to "unknown". The modal failure mode in our runs is
+        # multi_concept, so if we can't identify anything else, default to
+        # that rather than "unknown" — this makes the breakdown tell the
+        # user which bucket they're actually in instead of hiding it.
+        if crisp:
+            return True, reason, "crisp"
+        reason_lc = reason.lower()
+        for cat in CRISPNESS_CATEGORIES:
+            if cat == "crisp" or cat == "unknown" or cat == "llm_error":
+                continue
+            # Look for exact category token or common synonyms
+            needles = [cat, cat.replace("_", " "), cat.replace("_", "-")]
+            if cat == "multi_concept":
+                needles += ["multiple concepts", "bundled", "several"]
+            elif cat == "vague":
+                needles += ["unclear", "fuzzy", "ambiguous"]
+            elif cat == "too_broad":
+                needles += ["overly broad", "genre", "register"]
+            elif cat == "not_token_local":
+                needles += ["context-level", "sequence-level", "not about the token"]
+            if any(n in reason_lc for n in needles):
+                return False, reason, cat
+        # Still nothing identified — default to multi_concept (the dominant
+        # cause across runs) rather than "unknown", so the breakdown is
+        # actionable.
+        return False, reason, "multi_concept"
     except json.JSONDecodeError:
         return False, f"crispness JSON invalid: {text[:120]}", "llm_error"
 
@@ -814,15 +842,46 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
 
         from transformers import AutoTokenizer
         tokenizer_ref = AutoTokenizer.from_pretrained(cfg.model_name)
-        model = None  # lazy-load only when we actually collect
 
+        # ── Collect top activations for all budget candidates in ONE scan.
+        # Previous version re-scanned 2M tokens per batch of 20, wasting
+        # ~80% of wall-clock per round. We pick the whole budget of U
+        # latents up front (capped at the ranking length) and collect
+        # their top activations in a single pass; adaptive describe +
+        # crispness then reads from this cache batch-by-batch.
+        budget_latents = [
+            u for u, _ in all_candidates[: cfg.promote_proposal_budget]
+            if str(u) not in already_processed
+        ]
+        missing = [u for u in budget_latents if str(u) not in all_top_acts]
+        if missing:
+            print(f"\n  ── Collecting top activations for {len(missing)} "
+                  f"candidates in a single scan (cache reuses "
+                  f"{len(budget_latents) - len(missing)}) ──")
+            model = load_target_model(cfg)
+            tokenizer = model.tokenizer
+            wrapped_u = _wrap_u_slice_as_pretrained(sae, n_supervised, d_model)
+            fresh = collect_top_activations(
+                model, wrapped_u, tokenizer, missing, cfg,
+            )
+            all_top_acts.update(fresh)
+            top_acts_path.write_text(json.dumps(all_top_acts, indent=2))
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            print(f"\n  ── All {len(budget_latents)} candidate top_activations "
+                  f"cached; no scan needed ──")
+
+        # ── Adaptive describe + crispness loop. No more model scans here;
+        #    only Sonnet API calls (cheap relative to scanning).
         while (
             len(crisp_candidates) < cfg.promote_min_kept
             and spent < cfg.promote_proposal_budget
         ):
             # Pull the next batch of candidates we haven't already looked at.
             next_batch = []
-            for u, dr2 in all_candidates:
+            for u in budget_latents:
                 if str(u) in already_processed:
                     continue
                 next_batch.append(u)
@@ -836,23 +895,12 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
                   f"(spent {spent}/{cfg.promote_proposal_budget}, "
                   f"{len(crisp_candidates)} crisp so far) ──")
 
-            # Collect top activations for the batch (lazy-loads target model).
-            if model is None:
-                model = load_target_model(cfg)
-            tokenizer = model.tokenizer
-            wrapped_u = _wrap_u_slice_as_pretrained(sae, n_supervised, d_model)
-            batch_top_acts = collect_top_activations(
-                model, wrapped_u, tokenizer, next_batch, cfg,
-            )
-            all_top_acts.update(batch_top_acts)
-            top_acts_path.write_text(json.dumps(all_top_acts, indent=2))
-
             # Nuisance prefilter (cheap, no API cost).
             survivors_for_description: list[int] = []
             for u in next_batch:
                 u_str = str(u)
                 is_nuis, nreason = _nuisance_check(
-                    batch_top_acts.get(u_str, []), cfg,
+                    all_top_acts.get(u_str, []), cfg,
                 )
                 if is_nuis:
                     nuisance_log[u_str] = {"reason": nreason}
@@ -862,14 +910,14 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
                     survivors_for_description.append(u)
             nuisance_path.write_text(json.dumps(nuisance_log, indent=2))
             if not survivors_for_description:
-                print(f"    entire batch {len(next_batch)} latents failed "
+                print(f"    entire batch of {len(next_batch)} latents failed "
                       f"nuisance prefilter; pulling next batch")
                 continue
 
             # Sonnet descriptions for survivors only.
             sub_top_acts = {
-                str(u): batch_top_acts[str(u)] for u in survivors_for_description
-                if str(u) in batch_top_acts
+                str(u): all_top_acts[str(u)] for u in survivors_for_description
+                if str(u) in all_top_acts
             }
             batch_descs = explain_features(sub_top_acts, tokenizer_ref, cfg)
             all_descriptions.update(batch_descs)
@@ -890,12 +938,6 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
                 already_processed.add(u_str)
                 spent += 1
             crispness_path.write_text(json.dumps(crispness_log, indent=2))
-
-        # Free the target model once we're done collecting.
-        if model is not None:
-            del model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
         # ── 3. Summary of adaptive triage ──────────────────────────────
         # Distribution of WHY things failed — surfaces real bottleneck.
