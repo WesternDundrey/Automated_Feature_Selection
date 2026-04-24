@@ -106,6 +106,15 @@ class HingeSAE(nn.Module):
         else:
             self.decoder.weight.data = F.normalize(self.decoder.weight.data, dim=0)
 
+    def unsup_encoder_weight(self) -> torch.Tensor:
+        """(n_unsupervised, d_model). Rows are the reading directions of
+        the unsupervised latents. Used by promote_loop to rank U latents
+        by ΔR² / compute firing masks / mean-shift directions."""
+        return self.encoder.weight[self.n_supervised:]
+
+    def unsup_encoder_bias(self) -> torch.Tensor:
+        return self.encoder.bias[self.n_supervised:]
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Formulation 2: JumpReLU + hinge
@@ -141,8 +150,14 @@ class JumpReLUHingeSAE(nn.Module):
 
         self.encoder = nn.Linear(d_model, self.n_total, bias=True)
         self.decoder = nn.Linear(self.n_total, d_model, bias=True)
-        # Per-feature learnable threshold on the supervised slice.
-        self.theta = nn.Parameter(torch.full((n_supervised,), float(theta_init)))
+        # θ parameterized as softplus(theta_raw) so it's always ≥ 0. Keeps
+        # SAE latents nonnegative (a negative threshold would allow
+        # negative sup_pre values to pass through the gate). Gradient
+        # flows through softplus to theta_raw via the hinge term — no
+        # STE, no detach hacks.
+        import math
+        inv = math.log(math.exp(float(theta_init)) - 1.0) if theta_init > 0 else -3.0
+        self.theta_raw = nn.Parameter(torch.full((n_supervised,), inv))
 
         nn.init.kaiming_uniform_(self.encoder.weight)
         nn.init.zeros_(self.encoder.bias)
@@ -151,14 +166,23 @@ class JumpReLUHingeSAE(nn.Module):
             self.decoder.weight.data = F.normalize(self.decoder.weight.data, dim=0)
         nn.init.zeros_(self.decoder.bias)
 
+    @property
+    def theta(self) -> torch.Tensor:
+        """Effective threshold, always nonneg. Gradient flows through
+        softplus to theta_raw. Exposed as a property so callers of the
+        hinge loss (and the forward pass) uniformly see a positive
+        threshold without needing to think about clamping."""
+        return F.softplus(self.theta_raw)
+
     def forward(self, x):
         z = self.encoder(x)                                # (batch, n_total)
         sup_pre = z[..., : self.n_supervised]
-        # JumpReLU for supervised slice: z * H(z - θ). H's derivative is a
-        # Dirac autograd treats as zero, so gradient to θ through MSE is 0.
-        # Hinge term (outside) gives θ its gradient.
-        gate = (sup_pre > self.theta).to(sup_pre.dtype)
-        sup_acts = sup_pre * gate
+        t = self.theta                                     # ≥ 0 by construction
+        # Gate: H(sup_pre - t). Non-differentiable; autograd zero gradient
+        # through the comparison is the intended STE-free behavior.
+        # Magnitude: ReLU(sup_pre) · gate, nonnegative by construction.
+        gate = (sup_pre > t).to(sup_pre.dtype)
+        sup_acts = F.relu(sup_pre) * gate
 
         if self.n_unsupervised > 0:
             unsup_acts = F.relu(z[..., self.n_supervised:])
@@ -177,6 +201,12 @@ class JumpReLUHingeSAE(nn.Module):
             )
         else:
             self.decoder.weight.data = F.normalize(self.decoder.weight.data, dim=0)
+
+    def unsup_encoder_weight(self) -> torch.Tensor:
+        return self.encoder.weight[self.n_supervised:]
+
+    def unsup_encoder_bias(self) -> torch.Tensor:
+        return self.encoder.bias[self.n_supervised:]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -280,6 +310,27 @@ class GatedBCESAE(nn.Module):
             )
         else:
             self.decoder.weight.data = F.normalize(self.decoder.weight.data, dim=0)
+
+    def unsup_encoder_weight(self) -> torch.Tensor:
+        """Gated has a dedicated unsup encoder; return its weight matrix
+        in (n_unsupervised, d_model) layout for parity with HingeSAE /
+        JumpReLUHingeSAE / legacy SupervisedSAE."""
+        if self.n_unsupervised == 0:
+            return torch.zeros(
+                0, self.d_model,
+                device=self.gate_encoder.weight.device,
+                dtype=self.gate_encoder.weight.dtype,
+            )
+        return self.unsup_encoder.weight
+
+    def unsup_encoder_bias(self) -> torch.Tensor:
+        if self.n_unsupervised == 0:
+            return torch.zeros(
+                0,
+                device=self.gate_encoder.bias.device,
+                dtype=self.gate_encoder.bias.dtype,
+            )
+        return self.unsup_encoder.bias
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -495,15 +546,33 @@ def train_hinge_sae(
         theta_init=getattr(cfg, "jumprelu_theta_init", 0.1),
     ).to(cfg.device)
 
-    optimizer = torch.optim.AdamW(sae.parameters(), lr=cfg.lr)
+    # weight_decay=0: the doc's "no shrinkage bias" rests on MSE alone
+    # shaping magnitude. Default AdamW weight_decay=0.01 would impose
+    # L2 shrinkage on encoder + decoder weights — that's a different
+    # shrinkage signal than what the hinge argument rules out, but it's
+    # in the same spirit and contaminates hinge-vs-BCE comparisons.
+    # Legacy trainer doesn't set this either but uses Adam (no wd);
+    # we use AdamW explicitly to make the zero-weight-decay intent
+    # visible in the code.
+    optimizer = torch.optim.AdamW(sae.parameters(), lr=cfg.lr, weight_decay=0.0)
+
+    # Scheduler T_max covers total optimizer steps. Use ceil for the
+    # per-epoch step count so we include the partial final batch.
+    import math
+    steps_per_epoch = math.ceil(x_train.shape[0] / cfg.batch_size)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.epochs * (x_train.shape[0] // cfg.batch_size),
+        optimizer, T_max=cfg.epochs * steps_per_epoch,
     )
 
     x_train_dev = x_train.to(cfg.device)
     y_train_dev = y_train.to(cfg.device)
-    x_test_dev = x_test.to(cfg.device)
-    y_test_dev = y_test.to(cfg.device)
+    # Validation tensors stay on CPU; we batch-move to device in the val
+    # pass to avoid OOM on large n_sequences. Baseline MSE is computed
+    # on the TEST split (not the train mean), so R² numbers compare
+    # apples-to-apples with evaluate.py's test-side reports.
+    test_baseline_mse = F.mse_loss(
+        x_test.mean(0, keepdim=True).expand_as(x_test), x_test,
+    ).item()
 
     print(f"\nTraining: {cfg.epochs} epochs, "
           f"{x_train.shape[0] // cfg.batch_size} steps/epoch")
@@ -572,6 +641,10 @@ def train_hinge_sae(
 
             optimizer.zero_grad()
             loss.backward()
+            # Grad clipping: large pos_weight (up to 100 on rare features)
+            # can blow up encoder gradients; matching the legacy trainer's
+            # safety.
+            torch.nn.utils.clip_grad_norm_(sae.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
 
@@ -586,22 +659,36 @@ def train_hinge_sae(
             n_batches += 1
             step += 1
 
-        # Val pass
+        # Val pass — batched to keep peak VRAM low on large n_sequences.
+        # R² uses test_baseline_mse (computed on the test split itself),
+        # not the train-split baseline, so the reported number is
+        # comparable to evaluate.py's test-side R².
         sae.eval()
+        val_recon_sum = 0.0
+        val_sup_sum = 0.0
+        val_n_vectors = 0
+        val_n_sup_batches = 0
         with torch.no_grad():
-            vrec, vsp, vsa, vaa = sae(x_test_dev)
-            val_recon = F.mse_loss(vrec, x_test_dev).item()
-            val_r2 = 1.0 - val_recon / baseline_mse
-            if cfg.supervision_mode == "hinge":
-                val_sup = hinge_supervision_loss(vsp, y_test_dev, pos_weight).item()
-            elif cfg.supervision_mode == "hinge_jumprelu":
-                val_sup = jumprelu_hinge_supervision_loss(
-                    vsp, sae.theta, y_test_dev, pos_weight,
-                ).item()
-            else:
-                val_sup = gated_bce_supervision_loss(
-                    vsp, y_test_dev, pos_weight,
-                ).item()
+            for vi in range(0, x_test.shape[0], cfg.batch_size):
+                xv = x_test[vi : vi + cfg.batch_size].to(cfg.device)
+                yv = y_test[vi : vi + cfg.batch_size].to(cfg.device)
+                vrec, vsp, _, _ = sae(xv)
+                val_recon_sum += F.mse_loss(vrec, xv, reduction="sum").item()
+                val_n_vectors += xv.numel()
+                if cfg.supervision_mode == "hinge":
+                    val_sup_sum += hinge_supervision_loss(vsp, yv, pos_weight).item()
+                elif cfg.supervision_mode == "hinge_jumprelu":
+                    val_sup_sum += jumprelu_hinge_supervision_loss(
+                        vsp, sae.theta, yv, pos_weight,
+                    ).item()
+                else:
+                    val_sup_sum += gated_bce_supervision_loss(
+                        vsp, yv, pos_weight,
+                    ).item()
+                val_n_sup_batches += 1
+        val_recon = val_recon_sum / max(1, val_n_vectors)
+        val_r2 = 1.0 - val_recon / test_baseline_mse
+        val_sup = val_sup_sum / max(1, val_n_sup_batches)
 
         train_r2 = 1.0 - (recon_sum / max(1, n_batches)) / baseline_mse
         print(

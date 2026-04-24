@@ -213,6 +213,15 @@ class SupervisedSAE(nn.Module):
         else:
             self.decoder.weight.data = F.normalize(self.decoder.weight.data, dim=0)
 
+    def unsup_encoder_weight(self) -> torch.Tensor:
+        """(n_unsupervised, d_model). Rows are reading directions of the
+        unsupervised latents. Uniform API with HingeSAE / GatedBCESAE so
+        promote_loop can read U-encoder rows without branching on SAE class."""
+        return self.encoder.weight[self.n_supervised:]
+
+    def unsup_encoder_bias(self) -> torch.Tensor:
+        return self.encoder.bias[self.n_supervised:]
+
 
 # ── Hierarchy loss ──────────────────────────────────────────────────────────
 

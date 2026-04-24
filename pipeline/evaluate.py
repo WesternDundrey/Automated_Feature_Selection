@@ -268,9 +268,11 @@ def evaluate(cfg: Config = None):
     # Magnitude correlation: at positive positions, does sup_acts[k] correlate
     # with x @ target_dir[k]? High correlation = reconstruction already
     # supervises activation magnitude without an explicit loss term.
-    use_mse = model_cfg.get("use_mse_supervision", False)
+    # Compute whenever target_dirs are on disk, regardless of supervision
+    # mode — the hinge/gated path writes them for diagnostic purposes even
+    # though they aren't used in the loss.
     mag_corr = None
-    if use_mse and cfg.target_dirs_path.exists():
+    if cfg.target_dirs_path.exists():
         target_dirs_q4 = torch.load(cfg.target_dirs_path, weights_only=True)
         projections = x_test @ target_dirs_q4.T  # (n_test, n_features)
         gt_bool = y_test.bool()
@@ -554,17 +556,33 @@ def evaluate(cfg: Config = None):
                 "consistency": round(consistent, 4),
             })
 
-    # ── 4b. MSE supervision metrics (v2) ─────────────────────────────
-    use_mse = model_cfg.get("use_mse_supervision", False)
+    # ── 4b. Decoder-vs-target_dir diagnostics ────────────────────────
+    # Compute whenever target_dirs are on disk, regardless of supervision
+    # mode. For frozen-decoder modes (hybrid/mse) the cosine should be
+    # 1.000 by construction. For the new hinge-family modes (v8.11+) the
+    # cosine is a LEARNED value — the central tradeoff the new formulation
+    # makes, and the number that should be reported in the paper's methods
+    # section instead of being invisible.
+    supervision_mode = model_cfg.get("supervision_mode", "unknown")
+    has_target_dirs = cfg.target_dirs_path.exists()
     cosine_results = []
     fve_results = []
     mean_cosine = None
     mean_fve = None
     mean_fvu = None
 
-    if use_mse:
+    if has_target_dirs:
         print("\n" + "=" * 70)
-        print("MSE FEATURE DICTIONARY METRICS (v2)")
+        print(f"DECODER ↔ TARGET-DIR DIAGNOSTICS  "
+              f"(supervision_mode={supervision_mode})")
+        if supervision_mode in ("hinge", "hinge_jumprelu", "gated_bce"):
+            print("  Decoder was trained END-TO-END (not frozen). Cosine "
+                  "below is the LEARNED alignment between each decoder "
+                  "column and the analytical mean-shift target direction "
+                  "for its feature.")
+        elif supervision_mode in ("hybrid", "mse"):
+            print("  Decoder was FROZEN to target_dirs during training. "
+                  "Cosine = 1.0 by construction.")
 
         # Load or recompute target directions
         if cfg.target_dirs_path.exists():

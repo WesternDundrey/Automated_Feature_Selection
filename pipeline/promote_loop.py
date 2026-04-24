@@ -240,16 +240,18 @@ def _wrap_u_slice_as_pretrained(sae, n_supervised: int, d_model: int):
     Build one from the U slice of the supervised SAE so we can reuse the
     top-activation collection machinery without duplicating it."""
     from .inventory import PretrainedSAE
-    enc_w = sae.encoder.weight.detach()   # (n_total, d_model)
-    enc_b = sae.encoder.bias.detach()     # (n_total,)
-    dec_w = sae.decoder.weight.detach()   # (d_model, n_total)
+    # Use the uniform unsup_encoder_* API so this works for HingeSAE /
+    # JumpReLUHingeSAE / GatedBCESAE / legacy SupervisedSAE alike.
+    enc_w_unsup = sae.unsup_encoder_weight().detach()  # (n_unsup, d_model)
+    enc_b_unsup = sae.unsup_encoder_bias().detach()    # (n_unsup,)
+    dec_w = sae.decoder.weight.detach()                # (d_model, n_total)
 
     # PretrainedSAE stores W_enc as (d_model, d_sae) and W_dec as (d_sae, d_model).
     return PretrainedSAE(
-        W_enc=enc_w[n_supervised:, :].T.contiguous(),
+        W_enc=enc_w_unsup.T.contiguous(),
         W_dec=dec_w[:, n_supervised:].T.contiguous(),
-        b_enc=enc_b[n_supervised:].clone(),
-        b_dec=torch.zeros(d_model),   # SupervisedSAE has no decoder bias
+        b_enc=enc_b_unsup.clone(),
+        b_dec=torch.zeros(d_model),   # none of our supervised SAE classes have decoder bias here
         threshold=None,
     )
 
@@ -659,10 +661,16 @@ def _mini_prefilter(
         mini_labels = annotate_corpus(tokens_sub, new_features, tokenizer, cfg)
     # mini_labels: (n_seqs, T, len(new_features))
 
-    # U activation on the same subset. Align device/dtype.
+    # U activation on the same subset. Align device/dtype. Use the
+    # uniform unsup_encoder_* API so this works for all SAE variants
+    # (HingeSAE / JumpReLUHingeSAE / GatedBCESAE / legacy SupervisedSAE).
     X_sub = acts_sub.reshape(-1, d_model).to(torch.float32)
-    enc_w = sae.encoder.weight.detach().to(device=X_sub.device, dtype=X_sub.dtype)
-    enc_b = sae.encoder.bias.detach().to(device=X_sub.device, dtype=X_sub.dtype)
+    enc_w = sae.unsup_encoder_weight().detach().to(
+        device=X_sub.device, dtype=X_sub.dtype,
+    )  # (n_unsup, d_model) — indexed by u_local, NOT u_global
+    enc_b = sae.unsup_encoder_bias().detach().to(
+        device=X_sub.device, dtype=X_sub.dtype,
+    )
 
     # Local copy of the AUROC function from evaluate.py to avoid a circular
     # import on the test path.
@@ -691,8 +699,8 @@ def _mini_prefilter(
         if u_local is None:
             kept_ids.append(feat["id"])
             continue
-        u_global = n_supervised + u_local
-        pre = (X_sub @ enc_w[u_global] + enc_b[u_global]).cpu().numpy()  # float
+        # enc_w / enc_b are already the UNSUP slice, indexed by u_local.
+        pre = (X_sub @ enc_w[u_local] + enc_b[u_local]).cpu().numpy()
         ann = mini_labels[:, :, i].reshape(-1).numpy().astype(bool)
         u_fires_mask = pre > 0
 
@@ -764,18 +772,19 @@ def _compute_mean_shift_dirs(
     # Align encoder weight device + dtype with X. sae was moved to GPU +
     # model dtype earlier; X is typically CPU fp32 straight from the cached
     # activations tensor. Without device alignment, `X @ w` raises
-    # RuntimeError on mixed-device tensors.
-    enc_w = sae.encoder.weight.detach().to(device=X.device, dtype=X.dtype)
-    enc_b = sae.encoder.bias.detach().to(device=X.device, dtype=X.dtype)
+    # RuntimeError on mixed-device tensors. Use the uniform
+    # unsup_encoder_* API so this works for all SAE variants.
+    enc_w = sae.unsup_encoder_weight().detach().to(device=X.device, dtype=X.dtype)
+    enc_b = sae.unsup_encoder_bias().detach().to(device=X.device, dtype=X.dtype)
 
     kept: list[int] = []
     dir_list: list[torch.Tensor] = []
     n_pos_list: list[int] = []
 
     for u_local in u_local_indices:
-        u_global = n_supervised + u_local
-        w = enc_w[u_global]  # (d_model,)
-        b = enc_b[u_global]
+        # enc_w / enc_b are the UNSUP slice, indexed by u_local.
+        w = enc_w[u_local]
+        b = enc_b[u_local]
         # ReLU pre-activation > 0 defines firing mask.
         pre = X @ w + b
         mask = pre > 0

@@ -4,6 +4,64 @@
 
 ---
 
+## [v8.11.1] — Reviewer fixes on the hinge/free-decoder batch
+
+**Date:** 2026-04-25
+
+Six issues from reviewer on the v8.11 drop, all addressed in this patch.
+
+### HIGH — decoder-vs-target diagnostics now run regardless of supervision mode
+
+`evaluate.py` gated its cosine / FVE / magnitude-correlation block on `model_cfg["use_mse_supervision"]`, which hinge checkpoints don't save. The central v8.11 trade ("free decoder learns cos ≈ X instead of frozen cos = 1.0") was therefore invisible in the logs. Fix: gate on the existence of `target_directions.pt` instead — which the hinge trainer writes post-hoc — and report `supervision_mode` alongside so readers know whether cos = 1.0 is by construction (frozen modes) or a learned value (hinge-family modes). The magnitude-correlation block is unblocked the same way.
+
+### HIGH — `gated_bce` now compatible with promote-loop
+
+`GatedBCESAE` has `gate_encoder`, `mag_encoder`, `unsup_encoder` — no single `.encoder` attribute. Promote-loop's four sites that read `sae.encoder.weight[n_supervised + u_local]` would have crashed. Fix: added a uniform API on all four SAE classes (HingeSAE, JumpReLUHingeSAE, GatedBCESAE, legacy SupervisedSAE):
+
+```
+sae.unsup_encoder_weight() -> (n_unsupervised, d_model)
+sae.unsup_encoder_bias()   -> (n_unsupervised,)
+```
+
+Rows are indexed by `u_local` (not `u_global`). Each SAE class returns the right tensor for its architecture. All four promote-loop sites (proposal scan, mini-prefilter, mean-shift direction computation, PretrainedSAE wrapping for `collect_top_activations`) now use this API. Gated/JumpReLU/Hinge all run through the same code path.
+
+### MEDIUM-HIGH — `weight_decay=0` on the hinge trainer's AdamW
+
+Default AdamW weight_decay is 0.01. That imposes L2 shrinkage on encoder and decoder weights — a different shrinkage signal than what the hinge-vs-BCE argument rules out, but contaminates the comparison. Fixed to `weight_decay=0.0` explicitly so hinge's "no shrinkage bias" motivation actually holds.
+
+### MEDIUM — `hinge_jumprelu` θ parameterization (no unconstrained negatives)
+
+Previous θ was a plain `nn.Parameter`. Hinge's loss can drive θ arbitrarily, including negative — and a negative θ would let negative `sup_pre` pass the `sup_pre > θ` gate, yielding negative `sup_acts` (SAE latents are supposed to be nonnegative). Fixed two ways:
+
+1. `θ` is now parameterized as `softplus(theta_raw)` where `theta_raw` is the nn.Parameter. θ is always ≥ 0 by construction. Gradient from the hinge term flows through softplus to `theta_raw` without any clamping hacks or detach tricks.
+2. Magnitude is now `F.relu(sup_pre) * gate` (not `sup_pre * gate`), belt-and-suspenders: even if anything slips past the softplus, the output is never negative.
+
+θ is exposed as a `@property` on `JumpReLUHingeSAE` so callers (training loop, hinge loss helper) uniformly see the softplussed value.
+
+### MEDIUM — grad clipping + batched validation in hinge trainer
+
+Legacy trainer had `torch.nn.utils.clip_grad_norm_(..., max_norm=1.0)`; hinge trainer didn't. With `pos_weight` capped at 100 for rare features, encoder gradients can blow up. Added clipping at `max_norm=1.0` to match the legacy path.
+
+Validation was moving the full test tensor to GPU in one shot (`sae(x_test_dev)`). Fine for 1k sequences; OOM risk for larger corpora. Batched val over `cfg.batch_size`-sized chunks with a running sum; same R² + val_sup numbers, no VRAM spike.
+
+### LOW-MEDIUM — scheduler math + val baseline_mse
+
+Scheduler `T_max` was `epochs * (N // batch_size)` (floor), but the training loop iterates with ceil semantics (the final partial batch is included). Fixed to `math.ceil(N / batch_size)` so the cosine schedule actually covers all optimizer steps.
+
+Val R² was computed against the train-split baseline_mse. Fixed to use a test-split `test_baseline_mse = F.mse_loss(x_test.mean(0)..., x_test)` so val R² compares apples-to-apples with `evaluate.py`'s test-side R² line.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/evaluate.py` | Decoder-vs-target + magnitude-correlation diagnostics gated on target_directions.pt, not use_mse_supervision |
+| `pipeline/supervised_hinge.py` | softplus-parameterized θ in JumpReLU; `weight_decay=0`; grad clipping; batched val; ceil scheduler math; `unsup_encoder_*` helpers on all three classes |
+| `pipeline/train.py` | `unsup_encoder_*` helpers on legacy `SupervisedSAE` for API parity |
+| `pipeline/promote_loop.py` | Four call sites use `sae.unsup_encoder_weight()` / `sae.unsup_encoder_bias()` — Gated/JumpReLU/Hinge now all work end-to-end |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.11] — Hinge / JumpReLU / Gated-BCE supervision modes (per mentor's methodology note)
 
 **Date:** 2026-04-25
