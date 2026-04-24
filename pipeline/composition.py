@@ -323,6 +323,13 @@ def run(cfg: Config = None):
     tokens = torch.load(cfg.tokens_path, weights_only=True)
     activations = torch.load(cfg.activations_path, weights_only=True)
     annotations = torch.load(cfg.annotations_path, weights_only=True)
+
+    # Mask position 0 so K-way joint ablation positions don't include BOS.
+    from .position_mask import mask_leading
+    tokens, activations, annotations = mask_leading(
+        tokens, activations, annotations, cfg=cfg,
+    )
+
     catalog = json.loads(cfg.catalog_path.read_text())
     features = catalog["features"]
     n_features = annotations.shape[-1]

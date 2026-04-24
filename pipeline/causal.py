@@ -442,6 +442,12 @@ def test_feature_necessity(model, sae, cfg):
 
     tokens = torch.load(cfg.tokens_path, weights_only=True)
     annotations = torch.load(cfg.annotations_path, weights_only=True)
+
+    # Mask position 0 (BOS/degenerate attention) so causal KL isn't
+    # inflated by position-0 artifacts.
+    from .position_mask import mask_leading
+    tokens, annotations = mask_leading(tokens, annotations, cfg=cfg)
+
     catalog = json.loads(cfg.catalog_path.read_text())
     features = catalog["features"]
     n_sup = min(sae.n_supervised, len(features), annotations.shape[-1])

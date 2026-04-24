@@ -257,6 +257,15 @@ def run(cfg: Config = None):
     tokens = torch.load(cfg.tokens_path, weights_only=True)
     activations = torch.load(cfg.activations_path, weights_only=True)
     annotations = torch.load(cfg.annotations_path, weights_only=True)
+
+    # Mask position 0 — same masking as train + eval, so positive/negative
+    # position sets exclude BOS-artifact positions that would dominate
+    # targeting_ratio numerator.
+    from .position_mask import mask_leading
+    tokens, activations, annotations = mask_leading(
+        tokens, activations, annotations, cfg=cfg,
+    )
+
     catalog = json.loads(cfg.catalog_path.read_text())
     features = catalog["features"]
 

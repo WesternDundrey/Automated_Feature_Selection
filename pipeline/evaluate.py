@@ -98,6 +98,13 @@ def evaluate(cfg: Config = None):
 
     activations = torch.load(cfg.activations_path, weights_only=True)
     annotations = torch.load(cfg.annotations_path, weights_only=True)
+
+    # Mask position 0 (BOS/degenerate) before analysis. Must match the
+    # same masking applied at train time so the SAE is evaluated on the
+    # distribution it was trained on.
+    from .position_mask import mask_leading
+    activations, annotations = mask_leading(activations, annotations, cfg=cfg)
+
     catalog = json.loads(cfg.catalog_path.read_text())
     features = catalog["features"]
 

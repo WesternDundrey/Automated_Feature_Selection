@@ -106,6 +106,22 @@ class Config:
     # max_num_seqs` budget in vLLM); too low underfeeds the engine.
     local_annotation_seq_chunk: int = 2
 
+    # Positions to mask out at analysis time (starting from position 0).
+    # Position 0 in a transformer has degenerate attention (only self), no
+    # prior context, anomalous residual-stream magnitude/direction, and
+    # acts as an attention sink. Including it in supervised SAE analysis
+    # corrupts:
+    #   - target_dirs: sequence-level features collapse to the same
+    #     "position-0 vs rest" direction if many positives fall at pos 0.
+    #   - reconstruction + R²: dominated by the easy-to-reconstruct BOS
+    #     direction rather than the semantic content.
+    #   - promote-loop: the top-ΔR² U latents are often BOS detectors,
+    #     wasting a round on a causally-useless token.
+    # Standard mech-interp practice: mask position 0 from all analysis.
+    # Applied at load time (activations = activations[:, n:]); cached
+    # tensors don't need re-extraction.
+    mask_first_n_positions: int = 1
+
     # Maximum fraction of annotation chunks that may end up zero-labeled
     # (after max retries) before the run aborts. A few stragglers are
     # tolerable; >10% means the prompt or the annotator is broken, and

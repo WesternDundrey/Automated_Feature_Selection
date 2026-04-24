@@ -429,6 +429,13 @@ def collect_top_activations(
         sel_acts = acts[:, :, sel_tensor].float().cpu()  # (batch, seq, n_selected)
         ids_cpu = input_ids.cpu()
 
+        # Mask first N positions (BOS / degenerate attention) so top
+        # activating examples come from real context positions, not from
+        # position-0 artifacts that produce "BOS detector" descriptions.
+        _mask_n = int(getattr(cfg, "mask_first_n_positions", 0))
+        if _mask_n > 0 and sel_acts.shape[1] > _mask_n:
+            sel_acts[:, :_mask_n, :] = float("-inf")
+
         # Vectorized top-k extraction: for each latent, find the top-k
         # activations in this batch in one pass instead of triple-nested loop
         ids_list = ids_cpu.tolist()

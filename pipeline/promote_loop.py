@@ -633,6 +633,12 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
 
         # ── 1. Load val activations and rank U latents by ΔR² ──────────
         activations = torch.load(cfg.activations_path, weights_only=True)
+        # Mask BOS/position-0 — otherwise the top-ΔR² U latents are dominated
+        # by BOS-detector latents (position 0 has degenerate attention and
+        # anomalous residual magnitude, so any latent that fires there wins
+        # the ΔR² ranking). Must match the masking used in train+eval.
+        from .position_mask import mask_leading
+        activations = mask_leading(activations, cfg=cfg)
         N, T, d_model = activations.shape
         x_flat = activations.reshape(-1, d_model).to(model_dtype)
         n_total_vecs = x_flat.shape[0]
@@ -808,9 +814,13 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
             ]
             from transformers import AutoTokenizer
             mini_tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+            # tokens + activations are masked here so the prefilter
+            # AUROC lines up with the masked training distribution.
+            mp_tokens = torch.load(cfg.tokens_path, weights_only=True)
+            mp_tokens = mask_leading(mp_tokens, cfg=cfg)
             kept_feature_ids, mini_dropped, mini_audit = _mini_prefilter(
                 sae, new_feats_for_prefilter,
-                tokens=torch.load(cfg.tokens_path, weights_only=True),
+                tokens=mp_tokens,
                 activations=activations,
                 tokenizer=mini_tokenizer,
                 cfg=cfg, d_model=d_model, n_supervised=n_supervised,

@@ -572,7 +572,14 @@ def run(cfg: Config = None):
     activations = torch.load(cfg.activations_path, weights_only=True)
     annotations = torch.load(cfg.annotations_path, weights_only=True)
 
-    print(f"Activations: {activations.shape}")
+    # Mask leading positions (e.g., BOS/position-0) before analysis.
+    # Position 0 has degenerate attention and dominant residual-stream
+    # directions that collapse target_dirs for sequence-level features.
+    from .position_mask import mask_leading
+    activations, annotations = mask_leading(activations, annotations, cfg=cfg)
+
+    print(f"Activations: {activations.shape} (masked first "
+          f"{cfg.mask_first_n_positions} positions)")
     print(f"Annotations: {annotations.shape}")
     print(f"Features: {len(features)}")
 

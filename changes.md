@@ -4,6 +4,83 @@
 
 ---
 
+## [v8.6] — Mask BOS / position-0 everywhere + IOI scoping + cache-meta false-positive fix
+
+**Date:** 2026-04-21
+
+### Motivation
+
+The v8.5 promote-loop found a real missing feature — the `<|endoftext|>` / document-boundary token — but promoted it 9 times (unsup feature-splitting) and rejected every copy via the cosine gate. Diagnosis revealed two underlying issues:
+
+1. **Position 0 / BOS is a known transformer artifact** (degenerate attention — attends only to self — no prior context, anomalous residual magnitude, acts as an attention sink). Standard mech-interp practice is to mask it out of all analysis; the pipeline never did. Every target_dir computation, R² metric, causal KL, and targeting_ratio was contaminated by position-0 data. Worse, features with heavy position-0 positive sets (`syntactic_position.sentence_initial`, `punctuation.quotation_mark`, sequence-level `text_register.*`, `semantic_domain.*`) had target_dirs dominated by the shared "position 0 vs rest" direction, collapsing 329 of 2701 feature pairs to cos > 0.8 and making the promote-loop cosine gate geometrically meaningless.
+
+2. **IOI scoping wasn't applied yet** from v8.5's plan. Running `--step ioi` clobbered `pipeline_data/supervised_sae.pt` (7-feature IOI SAE written over the 74-feature main SAE), `split_indices.pt` (500-seq vs 1000-seq), and `target_directions.pt`. Downstream steps crashed with empty-test-slice errors.
+
+### Fixes
+
+**1. `pipeline/position_mask.py` (NEW) — `mask_leading` helper**
+
+Small utility that slices `tensor[:, cfg.mask_first_n_positions:]` for any number of (N, T, ...) tensors. Applied uniformly at analysis-load time so cached `tokens.pt` / `activations.pt` / `annotations.pt` don't need re-extraction — they're just sliced shorter on the fly.
+
+Wired at: `train.py`, `evaluate.py`, `intervention.py`, `composition.py`, `causal.py`, `promote_loop.py` (both the main data load and the mini-prefilter tokens load), and `inventory.collect_top_activations` (sets `sel_acts[:, :mask, :] = -inf` before the top-k heap scan so the Sonnet-described top-activating contexts never come from position 0).
+
+Default `cfg.mask_first_n_positions = 1`. Set to 0 to restore pre-v8.6 behavior.
+
+**2. `pipeline/ioi.py` — scope artifacts under `pipeline_data/ioi/`**
+
+`run()` now redirects `cfg.output_dir` to a subdir for the duration of the IOI diagnostic and restores it on exit. Every `cfg.*_path` property (catalog, tokens, activations, annotations, checkpoint, split_indices, target_dirs, eval) routes into that subdir, so IOI's 7-feature synthetic-IOI SAE never overwrites the main catalog-trained SAE.
+
+**3. `pipeline/cache_meta.py` — skip verification of non-Config fields**
+
+`verify_cache_meta` iterated `CACHE_FIELDS` and compared each against `getattr(cfg, field, None)`. Non-Config fields (e.g., `n_features`, which is caller-derived at write time) always returned None, producing a spurious "stale cache" warning on every fresh load. Fix: skip fields that aren't Config attributes; callers still force-check via `extra_required={...}`.
+
+### Recovery after running pre-v8.6 steps
+
+Existing `supervised_sae.pt`, `target_directions.pt`, `split_indices.pt`, and `evaluation.json` were trained / computed against position-0-contaminated activations. They need to be regenerated against the masked distribution:
+
+```
+rm pipeline_data/supervised_sae.pt pipeline_data/supervised_sae.pt.meta.json
+rm pipeline_data/supervised_sae_config.pt
+rm pipeline_data/target_directions.pt pipeline_data/split_indices.pt
+rm -f pipeline_data/evaluation.json pipeline_data/evaluation.json.meta.json
+
+python -m pipeline.run --step train    <flags>
+python -m pipeline.run --step evaluate <flags>
+```
+
+`tokens.pt` / `activations.pt` / `annotations.pt` are reused (the mask is applied at load, not at save).
+
+### Expected effect on the pairwise-cosine collapse
+
+Before v8.6 (diagnostic output):
+
+- mean off-diag cos: 0.065 (fine)
+- median off-diag cos: 0.308 (moderate)
+- pairs > 0.8: 329 out of 2701
+- pairs > 0.95: 170 out of 2701
+- max: 0.9997 between `quotation_mark` ↔ `sentence_initial`
+
+Hypothesis: the 170+ high-cos pairs are driven by features whose positive sets over-represent position 0. Masking position 0 should decorrelate them. If it doesn't, there's a second bias worth residualizing against (top PC of the raw `directions` matrix). `diagnose_promote_round.py` reports this distribution for every new round.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/position_mask.py` | **NEW** — `mask_leading` helper |
+| `pipeline/config.py` | `mask_first_n_positions: int = 1` |
+| `pipeline/train.py` | mask activations + annotations at load |
+| `pipeline/evaluate.py` | mask activations + annotations at load |
+| `pipeline/intervention.py` | mask tokens/activations/annotations at load |
+| `pipeline/composition.py` | mask tokens/activations/annotations at load |
+| `pipeline/causal.py` | mask tokens + annotations at load |
+| `pipeline/promote_loop.py` | mask activations for ΔR² ranking + mean-shift; mask tokens for mini-prefilter |
+| `pipeline/inventory.py` | `sel_acts[:, :mask, :] = -inf` in collect_top_activations so Sonnet-described examples never come from position 0 |
+| `pipeline/ioi.py` | scope artifacts under `pipeline_data/ioi/` so IOI can't clobber the main SAE |
+| `pipeline/cache_meta.py` | skip verification of fields not on Config |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.5] — Fourth-round reviewer fixes: target_dir validity, case-preservation, cache sidecars, silent-zero fix
 
 **Date:** 2026-04-21
