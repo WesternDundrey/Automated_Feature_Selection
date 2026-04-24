@@ -119,6 +119,29 @@ def _attach_defaults(cfg: Config) -> None:
     if not hasattr(cfg, "promote_mini_prefilter_min_f1"):
         cfg.promote_mini_prefilter_min_f1 = 0.20
 
+    # Adaptive proposal budget. Instead of "describe top-20, stop if fewer
+    # than min_kept crisp", we pull the next batch of top-ΔR² U latents
+    # until either min_kept crisp descriptions accumulate or the total
+    # describe count hits the budget. The top few ΔR² latents tend to be
+    # high-variance artifacts (position-anomalies, token-surface
+    # detectors); genuine crisp features often live further down the
+    # ranking.
+    if not hasattr(cfg, "promote_proposal_budget"):
+        cfg.promote_proposal_budget = 100
+    if not hasattr(cfg, "promote_batch_size"):
+        cfg.promote_batch_size = 20  # describe this many at a time
+
+    # Nuisance prefilter: reject U latents whose top activations are
+    # token-degenerate (all firing on the same 1-2 token IDs, or
+    # dominated by whitespace / EOT / repeated separators) BEFORE spending
+    # Sonnet on a description. Cheap defensive check — complements the
+    # position-0 mask already applied upstream at
+    # inventory.collect_top_activations.
+    if not hasattr(cfg, "promote_nuisance_token_diversity"):
+        # Min fraction of DISTINCT token IDs among top-K activating tokens.
+        # 0.3 = at least 30% of top-K tokens are different tokens.
+        cfg.promote_nuisance_token_diversity = 0.30
+
 
 # ── Rank U latents by per-latent ΔR² on val ─────────────────────────────────
 
@@ -201,17 +224,76 @@ def _wrap_u_slice_as_pretrained(sae, n_supervised: int, d_model: int):
     )
 
 
+# ── Nuisance prefilter: reject degenerate U latents before LLM description ──
+
+NUISANCE_REASONS = {
+    "single_token_dominant",  # top-k all fire on 1-2 distinct token ids
+    "no_examples",            # collect_top_activations returned nothing
+}
+
+
+def _nuisance_check(
+    top_activations_for_latent: list[dict], cfg: Config,
+) -> tuple[bool, str]:
+    """Cheap triage on top-k activating contexts for a U latent. Returns
+    (is_nuisance, reason_if_nuisance).
+
+    Dropping nuisances here saves the Sonnet description call and the
+    crispness call for latents whose top activations are obviously
+    degenerate. Complements the position-0 mask at collect time.
+    """
+    if not top_activations_for_latent:
+        return True, "no_examples"
+
+    # Token-diversity: if all top-k examples activate on the same 1-2
+    # token IDs, the latent is a token-surface detector rather than a
+    # contextual feature. 74-feature catalogs already name a lot of
+    # surface features (punctuation.*, token_form.*, part_of_speech.*),
+    # so these are usually rediscoveries.
+    tokens = [ex.get("context_ids", [])[ex.get("pos", 0)]
+              for ex in top_activations_for_latent
+              if ex.get("context_ids") and ex.get("pos") is not None]
+    if tokens:
+        diversity = len(set(tokens)) / len(tokens)
+        if diversity < cfg.promote_nuisance_token_diversity:
+            return True, (
+                f"single_token_dominant "
+                f"(unique={len(set(tokens))}/{len(tokens)}, "
+                f"threshold={cfg.promote_nuisance_token_diversity})"
+            )
+
+    return False, ""
+
+
 # ── Crispness gate (is this a single nameable concept?) ────────────────────
 
-def _crispness_judgment(description: str, cfg: Config) -> tuple[bool, str]:
+# Fixed taxonomy for crispness rejections so the per-round summary can
+# surface what's actually failing (vague, multi-concept, nuisance, too-broad,
+# not-token-local) instead of an opaque "19/20 rejected".
+CRISPNESS_CATEGORIES = (
+    "crisp",              # kept
+    "multi_concept",      # description names >1 concept
+    "vague",              # fuzzy / doesn't operationalize firing condition
+    "too_broad",          # describes a whole register/genre, not a token-local property
+    "not_token_local",    # about context / sequence, not the specific token
+    "uninterpretable",    # description itself is incoherent
+    "nuisance",           # catches what nuisance_check missed
+    "unknown",            # LLM didn't categorize
+    "llm_error",          # unreachable / unparseable — fails closed
+)
+
+
+def _crispness_judgment(description: str, cfg: Config) -> tuple[bool, str, str]:
     """Ask Sonnet whether a description is a single operationally-testable
-    concept vs a grab-bag. Returns (is_crisp, reason).
+    concept vs a grab-bag. Returns (is_crisp, reason, category).
 
     Fails CLOSED: any LLM error / unparseable response rejects the proposal
     rather than accepting it, matching merge.py's gate policy.
     """
     from .llm import get_client, chat
     client = get_client()
+
+    categories_list = ", ".join(f'"{c}"' for c in CRISPNESS_CATEGORIES if c != "crisp")
 
     prompt = textwrap.dedent(f"""\
         You are a strict auditor deciding whether a candidate feature
@@ -222,10 +304,14 @@ def _crispness_judgment(description: str, cfg: Config) -> tuple[bool, str]:
         reader should be able to look at a single token in context and
         answer yes/no without ambiguity.
 
-        A non-crisp description names multiple concepts, is fuzzy about
-        when it fires, describes a "context" rather than a token-level
-        property, or mentions alternatives ("or", "and/or", "sometimes",
-        "various"). Reject those.
+        A non-crisp description fails for one of these specific reasons:
+          - multi_concept   : names 2+ concepts joined by "or"/"and"/"sometimes"
+          - vague           : doesn't specify WHEN the latent fires
+          - too_broad       : describes a genre/register/domain, not a token
+          - not_token_local : about surrounding context, not the specific token
+          - uninterpretable : description itself is incoherent
+          - nuisance        : describes degenerate patterns (whitespace,
+                              padding, single-token artifacts, boilerplate)
 
         CANDIDATE description:
           {description}
@@ -233,23 +319,29 @@ def _crispness_judgment(description: str, cfg: Config) -> tuple[bool, str]:
         Reply with EXACTLY one JSON object, no other text:
         {{
           "crisp": <true or false>,
+          "category": <one of: "crisp", {categories_list}>,
           "reason": "<one short sentence>"
         }}
     """)
 
     try:
-        text = chat(client, cfg.organization_model, prompt, max_tokens=150)
+        text = chat(client, cfg.organization_model, prompt, max_tokens=200)
     except Exception as e:
-        return False, f"crispness LLM unreachable ({type(e).__name__}: {e})"
+        return False, f"crispness LLM unreachable ({type(e).__name__}: {e})", "llm_error"
 
     m = re.search(r"\{.*?\}", text, re.DOTALL)
     if not m:
-        return False, f"crispness response unparseable: {text[:120]}"
+        return False, f"crispness response unparseable: {text[:120]}", "llm_error"
     try:
         obj = json.loads(m.group(0))
-        return bool(obj.get("crisp", False)), str(obj.get("reason", ""))
+        crisp = bool(obj.get("crisp", False))
+        reason = str(obj.get("reason", ""))
+        category = str(obj.get("category", "crisp" if crisp else "unknown"))
+        if category not in CRISPNESS_CATEGORIES:
+            category = "unknown"
+        return crisp, reason, category
     except json.JSONDecodeError:
-        return False, f"crispness JSON invalid: {text[:120]}"
+        return False, f"crispness JSON invalid: {text[:120]}", "llm_error"
 
 
 # ── Mini-annotation prefilter (cheap agreement check before full corpus) ──
@@ -657,83 +749,196 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
             print("  No ranking possible (val baseline MSE too small). Aborting.")
             break
         ranking_map = dict(ranking)
-        top_k = ranking[: cfg.promote_top_k]
-        top_k_filtered = [
-            (u, dr2) for u, dr2 in top_k if dr2 >= cfg.promote_min_delta_r2_u
+        # Full filtered ranking — we'll pull from it adaptively.
+        all_candidates = [
+            (u, dr2) for u, dr2 in ranking
+            if dr2 >= cfg.promote_min_delta_r2_u
         ]
         print(
-            f"  Top-{cfg.promote_top_k} U latents by ΔR²: "
-            f"{len(top_k_filtered)} above threshold "
-            f"{cfg.promote_min_delta_r2_u}"
+            f"  {len(all_candidates)} U latents above ΔR² threshold "
+            f"{cfg.promote_min_delta_r2_u} "
+            f"(budget: {cfg.promote_proposal_budget}, "
+            f"batch: {cfg.promote_batch_size})"
         )
-        for u, dr2 in top_k_filtered[:10]:
+        for u, dr2 in all_candidates[:10]:
             print(f"    U[{u}]  ΔR² = {dr2:+.5f}")
-        if len(top_k_filtered) < cfg.promote_min_kept:
+        if len(all_candidates) < cfg.promote_min_kept:
             print(
-                f"► TERMINATED: only {len(top_k_filtered)} candidates above "
+                f"► TERMINATED: only {len(all_candidates)} candidates above "
                 f"ΔR² threshold (< {cfg.promote_min_kept})."
             )
             history.append({
                 "iter": iter_idx,
                 "converged_reason": "too_few_candidates",
-                "n_candidates": len(top_k_filtered),
+                "n_candidates": len(all_candidates),
             })
             break
-        candidate_u_indices = [u for u, _ in top_k_filtered]
 
-        # ── 2. Describe candidates via Sonnet ──────────────────────────
-        print("\n── Extracting top activations for candidate U latents ──")
+        # ── 2. Adaptive describe + triage ──────────────────────────────
+        # Pull top-ΔR² U latents in batches of `promote_batch_size`,
+        # describe + triage each batch, stop once we have >= min_kept
+        # crisp candidates or we've spent the proposal budget. This
+        # prevents the single-shot top-20 pattern from terminating the
+        # loop when the top few latents happen to be high-variance
+        # artifacts (token-surface detectors, position anomalies).
         top_acts_path = iter_dir / "top_activations.json"
         descriptions_path = iter_dir / "descriptions.json"
-        if descriptions_path.exists():
-            descriptions = json.loads(descriptions_path.read_text())
-            print(f"  Loaded cached descriptions: {descriptions_path}")
-        else:
-            # collect_top_activations needs a model + PretrainedSAE-like wrapper
-            model = load_target_model(cfg)
+        nuisance_path = iter_dir / "ignored_nuisance.json"
+        crispness_path = iter_dir / "crispness.json"
+
+        # Resume state: if any of these files exist, reuse them.
+        all_top_acts: dict = (
+            json.loads(top_acts_path.read_text()) if top_acts_path.exists() else {}
+        )
+        all_descriptions: dict = (
+            json.loads(descriptions_path.read_text())
+            if descriptions_path.exists() else {}
+        )
+        nuisance_log: dict = (
+            json.loads(nuisance_path.read_text()) if nuisance_path.exists() else {}
+        )
+        crispness_log: dict = (
+            json.loads(crispness_path.read_text()) if crispness_path.exists() else {}
+        )
+
+        crisp_candidates: list[tuple[int, str]] = [
+            (int(u), rec["description"])
+            for u, rec in crispness_log.items() if rec.get("crisp")
+        ]
+        spent = len(all_descriptions) + len(nuisance_log)
+        already_processed = set(
+            list(all_descriptions.keys())
+            + list(nuisance_log.keys())
+            + list(crispness_log.keys())
+        )
+
+        from transformers import AutoTokenizer
+        tokenizer_ref = AutoTokenizer.from_pretrained(cfg.model_name)
+        model = None  # lazy-load only when we actually collect
+
+        while (
+            len(crisp_candidates) < cfg.promote_min_kept
+            and spent < cfg.promote_proposal_budget
+        ):
+            # Pull the next batch of candidates we haven't already looked at.
+            next_batch = []
+            for u, dr2 in all_candidates:
+                if str(u) in already_processed:
+                    continue
+                next_batch.append(u)
+                if len(next_batch) >= cfg.promote_batch_size:
+                    break
+            if not next_batch:
+                print("  exhausted ΔR² candidate ranking")
+                break
+
+            print(f"\n  ── Batch: {len(next_batch)} new candidates "
+                  f"(spent {spent}/{cfg.promote_proposal_budget}, "
+                  f"{len(crisp_candidates)} crisp so far) ──")
+
+            # Collect top activations for the batch (lazy-loads target model).
+            if model is None:
+                model = load_target_model(cfg)
             tokenizer = model.tokenizer
             wrapped_u = _wrap_u_slice_as_pretrained(sae, n_supervised, d_model)
-            top_acts = collect_top_activations(
-                model, wrapped_u, tokenizer, candidate_u_indices, cfg,
+            batch_top_acts = collect_top_activations(
+                model, wrapped_u, tokenizer, next_batch, cfg,
             )
-            top_acts_path.write_text(json.dumps(top_acts, indent=2))
+            all_top_acts.update(batch_top_acts)
+            top_acts_path.write_text(json.dumps(all_top_acts, indent=2))
+
+            # Nuisance prefilter (cheap, no API cost).
+            survivors_for_description: list[int] = []
+            for u in next_batch:
+                u_str = str(u)
+                is_nuis, nreason = _nuisance_check(
+                    batch_top_acts.get(u_str, []), cfg,
+                )
+                if is_nuis:
+                    nuisance_log[u_str] = {"reason": nreason}
+                    already_processed.add(u_str)
+                    spent += 1
+                else:
+                    survivors_for_description.append(u)
+            nuisance_path.write_text(json.dumps(nuisance_log, indent=2))
+            if not survivors_for_description:
+                print(f"    entire batch {len(next_batch)} latents failed "
+                      f"nuisance prefilter; pulling next batch")
+                continue
+
+            # Sonnet descriptions for survivors only.
+            sub_top_acts = {
+                str(u): batch_top_acts[str(u)] for u in survivors_for_description
+                if str(u) in batch_top_acts
+            }
+            batch_descs = explain_features(sub_top_acts, tokenizer_ref, cfg)
+            all_descriptions.update(batch_descs)
+            descriptions_path.write_text(json.dumps(all_descriptions, indent=2))
+
+            # Crispness gate with rejection taxonomy.
+            for u_str, desc in batch_descs.items():
+                u_local = int(u_str)
+                is_crisp, reason, category = _crispness_judgment(desc, cfg)
+                crispness_log[u_str] = {
+                    "crisp": is_crisp,
+                    "category": category,
+                    "reason": reason,
+                    "description": desc,
+                }
+                if is_crisp:
+                    crisp_candidates.append((u_local, desc))
+                already_processed.add(u_str)
+                spent += 1
+            crispness_path.write_text(json.dumps(crispness_log, indent=2))
+
+        # Free the target model once we're done collecting.
+        if model is not None:
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            from transformers import AutoTokenizer
-            tokenizer_ref = AutoTokenizer.from_pretrained(cfg.model_name)
-            descriptions = explain_features(top_acts, tokenizer_ref, cfg)
-            descriptions_path.write_text(json.dumps(descriptions, indent=2))
-
-        # ── 3a. Crispness gate ──────────────────────────────────────────
-        print("\n── Crispness gate ──")
-        crispness_log: dict[str, dict] = {}
-        crisp_candidates: list[tuple[int, str]] = []
-        for u_str, desc in descriptions.items():
-            u_local = int(u_str)
-            is_crisp, reason = _crispness_judgment(desc, cfg)
-            crispness_log[u_str] = {
-                "crisp": is_crisp, "reason": reason, "description": desc,
-            }
-            if is_crisp:
-                crisp_candidates.append((u_local, desc))
-        (iter_dir / "crispness.json").write_text(json.dumps(crispness_log, indent=2))
+        # ── 3. Summary of adaptive triage ──────────────────────────────
+        # Distribution of WHY things failed — surfaces real bottleneck.
+        cat_counts: dict[str, int] = {}
+        for rec in crispness_log.values():
+            cat = rec.get("category", "unknown")
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        n_nuisance = len(nuisance_log)
+        n_described = len(all_descriptions)
+        n_crisp = len(crisp_candidates)
         print(
-            f"  {len(crisp_candidates)}/{len(descriptions)} descriptions "
-            f"passed the crispness gate"
+            f"\n  Adaptive triage: spent={spent}/{cfg.promote_proposal_budget}  "
+            f"nuisance-dropped={n_nuisance}  described={n_described}  "
+            f"crisp={n_crisp}"
         )
-        if len(crisp_candidates) < cfg.promote_min_kept:
+        if cat_counts:
+            print("  crispness breakdown:")
+            for cat in ("crisp", "multi_concept", "vague", "too_broad",
+                        "not_token_local", "uninterpretable", "nuisance",
+                        "unknown", "llm_error"):
+                if cat in cat_counts:
+                    print(f"    {cat:<18} {cat_counts[cat]}")
+
+        if n_crisp < cfg.promote_min_kept:
             print(
-                f"► TERMINATED: only {len(crisp_candidates)} crisp candidates "
-                f"(< {cfg.promote_min_kept})."
+                f"► TERMINATED: only {n_crisp} crisp candidates after "
+                f"spending {spent} proposals (< {cfg.promote_min_kept})."
             )
             history.append({
                 "iter": iter_idx,
                 "converged_reason": "too_few_crisp",
-                "n_crisp": len(crisp_candidates),
+                "n_crisp": n_crisp,
+                "spent": spent,
+                "n_nuisance_dropped": n_nuisance,
+                "crispness_breakdown": cat_counts,
             })
             break
+
+        # Downstream steps expect `descriptions` dict (u_str -> desc) for
+        # the crisp set. Build it from all_descriptions filtered to crisp.
+        descriptions = {
+            str(u): desc for u, desc in crisp_candidates
+        }
 
         # ── 3b. Compute mean-shift directions for the crisp candidates ──
         crisp_u_indices = [u for u, _ in crisp_candidates]

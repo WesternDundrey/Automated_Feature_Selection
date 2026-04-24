@@ -4,6 +4,36 @@
 
 ---
 
+## [v8.7] — Adaptive promote-loop triage: nuisance prefilter, rejection taxonomy, proposal budget
+
+**Date:** 2026-04-21
+
+### Motivation
+
+v8.6's BOS masking worked, but the promote-loop round-0 under v8.6 terminated at "1/20 crisp" anyway: the top-20 U latents by ΔR² were still mostly high-variance artifacts (token-surface detectors, position anomalies), not genuine novel features. The review observation: the loop's real bottleneck is not post-training validation, it's candidate *triage* — we spend an API budget on 20 arbitrary latents regardless of whether they're even plausible.
+
+### Fixes
+
+**1. Adaptive proposal pulling.** Instead of "describe top-20, stop if fewer than min_kept crisp", pull batches from the ΔR² ranking until either `promote_min_kept` crisp candidates accumulate OR `promote_proposal_budget` (default 100) proposals have been processed. Good crisp features often sit in the middle of the ΔR² distribution — the top few latents capture variance-dominant artifacts. Two new config knobs: `promote_proposal_budget` (default 100), `promote_batch_size` (default 20). CLI: `--promote-proposal-budget`, `--promote-batch-size`.
+
+**2. Nuisance prefilter.** Before spending Sonnet descriptions on a candidate, check whether its top-K activating tokens are degenerate (fire on 1–2 unique token IDs, i.e. a token-surface detector). Such latents are typically rediscoveries of existing `punctuation.*` / `token_form.*` / `part_of_speech.*` features, not novel concepts worth a full description. Rejected candidates go to `ignored_nuisance.json` rather than the promotion path. Threshold: `promote_nuisance_token_diversity = 0.30` (unique / total).
+
+**3. Rejection taxonomy on crispness.** The crispness gate now returns a category alongside the boolean: `crisp`, `multi_concept`, `vague`, `too_broad`, `not_token_local`, `uninterpretable`, `nuisance`, `llm_error`. Each round's summary prints a breakdown so the bottleneck is explicit — e.g., "16 too_broad, 3 multi_concept, 1 crisp" tells us the U slice is dominated by register-level features that Sonnet can't articulate atomically, rather than "19/20 rejected for opaque reasons".
+
+### Design note
+
+This does NOT weaken the crispness gate. 1/20 passing under v8.6 was a real signal: those latents mostly aren't discovery targets. Lowering the gate would just admit junk. The adaptive path lets us keep the gate strict while giving genuine candidates (which may live deeper in the ΔR² ranking) a chance.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/promote_loop.py` | adaptive batching loop with nuisance prefilter + crispness taxonomy + resumability per artifact |
+| `pipeline/run.py` | `--promote-proposal-budget`, `--promote-batch-size` CLI flags |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.6] — Mask BOS / position-0 everywhere + IOI scoping + cache-meta false-positive fix
 
 **Date:** 2026-04-21

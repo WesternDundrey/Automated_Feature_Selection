@@ -87,6 +87,11 @@ def main():
                         help="Cosine-dedup threshold for merge (default 0.6)")
     parser.add_argument("--promote-no-llm-separability", action="store_true",
                         help="Skip LLM separability gate in the merge step")
+    parser.add_argument("--promote-proposal-budget", type=int, default=None,
+                        help="Max U latents to describe per round (default 100). "
+                             "Adaptive batching pulls batches until budget or min_kept crisp.")
+    parser.add_argument("--promote-batch-size", type=int, default=None,
+                        help="Candidates per adaptive batch (default 20)")
     parser.add_argument("--promote-no-mini-prefilter", action="store_true",
                         help="Skip mini-annotation prefilter (always do full annotation)")
     parser.add_argument("--promote-mini-prefilter-n", type=int, default=None,
@@ -435,6 +440,10 @@ def main():
             cfg.promote_cos_threshold = args.promote_cos_threshold
         if args.promote_no_llm_separability:
             cfg.promote_use_llm_separability = False
+        if args.promote_proposal_budget is not None:
+            cfg.promote_proposal_budget = args.promote_proposal_budget
+        if args.promote_batch_size is not None:
+            cfg.promote_batch_size = args.promote_batch_size
         if args.promote_no_mini_prefilter:
             cfg.promote_mini_prefilter = False
         if args.promote_mini_prefilter_n is not None:
