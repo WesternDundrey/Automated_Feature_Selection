@@ -164,6 +164,14 @@ def _attach_defaults(cfg: Config) -> None:
         # just surfaces when the U slice is dominated by bundles.
         cfg.promote_multi_concept_warn_rate = 0.70
 
+    # Triage-only: run the adaptive describe + crispness loop, optionally
+    # decomposition, then STOP before merge/annotate/retrain. Used by the
+    # n_unsupervised sweep orchestrator to measure candidate quality
+    # cheaply across different U widths without paying for the full
+    # retraining cycle each time.
+    if not hasattr(cfg, "promote_triage_only"):
+        cfg.promote_triage_only = False
+
 
 # ── Rank U latents by per-latent ΔR² on val ─────────────────────────────────
 
@@ -1356,6 +1364,28 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
                 if atom_proposals:
                     proposals.extend(atom_proposals)
                     proposal_dirs_list.extend(atom_dirs_list)
+
+        # Triage-only: bail before merge so the sweep orchestrator can
+        # measure candidate quality without paying for annotate+retrain.
+        if cfg.promote_triage_only:
+            print(
+                f"\n► triage-only mode: stopping after triage "
+                f"(crisp={n_crisp}, atom_proposals={len(atom_proposals)}, "
+                f"spent={spent})."
+            )
+            history.append({
+                "iter": iter_idx,
+                "converged_reason": "triage_only",
+                "n_crisp": n_crisp,
+                "n_atom_proposals": len(atom_proposals),
+                "spent": spent,
+                "n_nuisance_dropped": n_nuisance,
+                "crispness_breakdown": cat_counts,
+                "multi_concept_rate": (
+                    cat_counts.get("multi_concept", 0) / max(n_described, 1)
+                ),
+            })
+            break
 
         # Combined proposal set: source-U crisp + decomposed atoms.
         if not proposals:

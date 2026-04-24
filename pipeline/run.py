@@ -72,9 +72,12 @@ def main():
                  "validate-annotator",
                  "splitting", "circuit", "intervention", "amplify",
                  "weaknesses", "siphoning", "discover", "discover-loop",
-                 "composition", "layer-sweep", "promote-loop"],
+                 "composition", "layer-sweep", "promote-loop", "usweep"],
         help="Run only this step",
     )
+    parser.add_argument("--widths", default=None,
+                        help="Comma-separated n_unsupervised values for "
+                             "--step usweep (default: 256,512,1024)")
     parser.add_argument("--promote-top-k", type=int, default=None,
                         help="K U latents considered per promote-loop round (default 20)")
     parser.add_argument("--promote-max-iters", type=int, default=None,
@@ -427,6 +430,20 @@ def main():
         from .composition import run as run_composition
         run_composition(cfg)
         print(f"Composition completed in {time.time() - t0:.1f}s")
+
+    # U-width sweep — measure n_unsupervised effect on proposal quality
+    if args.step == "usweep":
+        print("\n" + "=" * 70)
+        print("U-WIDTH SWEEP — n_unsupervised capacity diagnostic")
+        print("=" * 70)
+        t0 = time.time()
+        from .usweep import run as run_usweep
+        if args.widths:
+            widths = tuple(int(x.strip()) for x in args.widths.split(",") if x.strip())
+        else:
+            widths = (256, 512, 1024)
+        run_usweep(cfg, widths=widths)
+        print(f"U-width sweep completed in {time.time() - t0:.1f}s")
 
     # Promote loop — residual-ranked U→S promotion
     if args.step == "promote-loop":

@@ -4,6 +4,54 @@
 
 ---
 
+## [v8.9] — U-width sweep (`--step usweep`) + triage-only mode for promote-loop
+
+**Date:** 2026-04-21
+
+### Motivation
+
+Reviewer question: is the 85% multi_concept rate at `n_unsupervised=256` a capacity bottleneck (U too narrow to split bundles) or a methodology bottleneck (proposal method wrong)? Only empirical sweep answers this. Feature-splitting in unsup SAEs is primarily a width problem per Bricken 2023; wider U slices produce more specialized, less bundled latents. Running the sweep is cheaper than iterating on decomposition/clustering machinery.
+
+### New
+
+**`pipeline/usweep.py` — `--step usweep --widths 256,512,1024`**
+
+For each width:
+1. Create `pipeline_data/usweep/u{N}/` and symlink shared artifacts (`tokens.pt`, `activations.pt`, `annotations.pt` + sidecars, `feature_catalog.json`) — only the SAE + targets + split + eval + promote-loop artifacts are regenerated per width.
+2. Train supervised SAE with `n_unsupervised = N`.
+3. Evaluate (so R², FVE, val_promo_f1 are recorded per width).
+4. Run promote-loop in **triage-only mode** (no decomposition, no merge, no annotate/retrain). Just the adaptive describe + crispness loop, producing `crispness_breakdown` and `multi_concept_rate` per width.
+
+Output: `pipeline_data/usweep/summary.json` + formatted stdout table with columns `n_unsup`, `R²`, `R²(P)`, `FVE`, `val_F1`, `spent`, `crisp`, `crisp%`, `mcRate`, `nuisRate`.
+
+**`cfg.promote_triage_only`** — new config flag. When True, promote-loop runs adaptive triage + optional decomposition then breaks BEFORE the merge/annotate/retrain cycle. Used by the sweep to avoid paying the annotation cost on every width.
+
+CLI additions:
+- `--step usweep` + `--widths 256,512,1024`
+
+### How to read the output
+
+Three signal-to-interpretation maps:
+
+1. **`mcRate` falls monotonically with width (85% → 60% → 40%)**: the 256 slice was capacity-starved; wider U is the correct fix. Train the main pipeline at whichever width flattens the curve.
+2. **`mcRate` stays flat or only drops slightly**: bundles aren't a width problem; U is producing polysemantic latents regardless. Decomposition / cluster-U remain the correct path.
+3. **`crisp%` rises sharply but `mcRate` only drops a bit**: wider U is splitting some bundles cleanly and others not; you want *both* wider U AND decomposition.
+
+### Cost
+
+~20-30 min per width (train ~2 min + evaluate ~3 min + triage-only round 0 ~15 min for 2M-token scan + ~100 Sonnet crispness calls). 3 widths = ~75 min. No annotation regen (cached). No decomposition cost (off in sweep mode).
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/usweep.py` | **NEW** — U-width sweep orchestrator |
+| `pipeline/promote_loop.py` | `promote_triage_only` flag — break after triage before merge |
+| `pipeline/run.py` | `--step usweep`, `--widths` CLI flag |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.8] — Multi-concept decomposition with atom-specific target_dirs
 
 **Date:** 2026-04-21
