@@ -53,13 +53,13 @@ Sonnet explains 100 pretrained SAE latents â†’ organizes into feature catalog â†
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--model` | gpt2 | Target model (TransformerLens name) |
-| `--layer` | 8 | Target layer |
+| `--layer` | 9 | Target layer (set to GPT-2 Small's densest semantic band per summary7) |
 | `--n_latents` | 500 | Latents to explain from pretrained SAE |
 | `--n_sequences` | 5000 | Corpus sequences |
 | `--epochs` | 15 | Training epochs |
 | `--local-annotator` | off | Use local model via vLLM |
 | `--annotator-model` | Qwen/Qwen3-4B-Base | HuggingFace model ID |
-| `--full-desc` | off | Full description suffix (~10 tok, more accurate) |
+| `--full-desc` | **on (default since v8.3)** | Full description suffix (~10 tok, more accurate). Now the default; flag is a no-op left in for backward compat. To opt back into F-index mode, pass `--use-findex`. |
 | `--catalog` | (auto) | Manual feature catalog JSON path |
 | `--supervision` | hybrid | Loss mode: hybrid, mse, bce |
 | `--no-mse` | off | Shortcut for `--supervision bce` |

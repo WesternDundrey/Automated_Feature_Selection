@@ -4,6 +4,55 @@
 
 ---
 
+## [v8.4] — Third-round reviewer fixes: honest gating metrics + AUROC prefilter
+
+**Date:** 2026-04-21
+
+### Motivation
+
+Third review of the promote-loop called out four more issues: (a) the v8.3 mini-prefilter used F1 against `pre > 0`, which is a brittle proxy; (b) `val_f1_cal` is still threshold-optimized and scored on the same val set; (c) mini-prefilter used the first N sequences (non-random, biased by ingest order); (d) RUNNING.md + CLI help drifted from the code after v8.0-v8.3's default changes. All four fixed.
+
+### Fixes
+
+**HIGH — Mini-prefilter now uses AUROC, not F1 against `pre > 0`** (`pipeline/promote_loop.py:_mini_prefilter`)
+
+The previous F1-against-firing-mask metric treats every weak U activation as a positive prediction. Polysemantic or leaky U latents fire at low magnitude on a huge fraction of positions, so F1 collapses — the annotator's clean positive set becomes a strict subset of U's wide "active" set, and feature rejection depends on noise rather than signal. The fix is to use the continuous `pre` score directly: `AUROC(pre, annotator_labels)` is scale-free, threshold-free, and measures the ranking agreement between U's activation and the annotator's positive set.
+
+Default threshold: `promote_mini_prefilter_min_auroc = 0.70`. A feature with AUROC ≥ 0.7 on the subset has U activations meaningfully correlated with the annotator's positives; anything near 0.5 is random noise. The legacy F1 metric is retained as `mini_f1_legacy` in the per-feature record for cross-run comparison but is no longer used to decide drops.
+
+Features with fewer than `promote_mini_prefilter_min_support` (default 5) annotator positives OR U-fires on the subset are routed to an AUDIT bucket rather than dropped. A sparse mini-sample can't distinguish a rare-but-real feature from a broken one. Audit records are saved to `mini_prefilter_audit.json` per round.
+
+Audit-only mode via `--promote-no-mini-prefilter` is preserved; a new `promote_mini_prefilter_audit_only` config knob (no CLI flag yet — set it programmatically) enables "compute scores but don't drop" for runs where the team wants to calibrate the AUROC threshold before committing to drops.
+
+**HIGH — Val split for honest post-training gating** (`pipeline/evaluate.py`)
+
+`val_f1_cal` (v8.3) optimized per-feature thresholds on val AND scored F1 on val. That's selection bias on each feature: by construction the reported F1 is above what generalization-to-fresh-data would give. Across 5 promote-loop rounds of dropping on this metric, the pruned catalog is biased toward features that happened to overfit their val-calib thresholds.
+
+Fix: split val 50/50 into `val_calib` (first half, threshold search) and `val_promo` (second half, scored at the val_calib threshold). The new `val_promo_f1` per feature is an honest generalization metric within val; test remains untouched. The overfit `val_f1_cal` is kept for backward compat and used only as a fallback when the feature has 0 positives in val_promo. `_post_training_validation` now prefers `val_promo_f1`.
+
+Trade-off: halving val halves the effective sample per split. For rare features (n_pos < 10 in full val), val_promo may have 0-2 positives and the F1 estimate is noisy. The automatic fallback to `val_f1_cal` handles zero-positive cases; low-but-nonzero cases are logged via `val_promo_n_pos` so promote-loop can be made more conservative in a future iteration.
+
+**MEDIUM — Mini-prefilter samples randomly from the full corpus**
+
+Previous version took `tokens[:n_seqs]`, which under openwebtext's ingest order isn't uniform across content types. Fix: deterministic random subset using `RandomState(cfg.seed + 7919)` over all `tokens.shape[0]` sequences. Same seed offset across runs → reproducible, but not biased by corpus position. Also eliminates a subtle bug where the same early sequences were inspected every promote-loop round.
+
+**LOW — Documentation drift**
+
+- `RUNNING.md`: `--layer` default now reads 9 (was 8). `--full-desc` row now notes it's the default since v8.3 and the flag is a no-op; documents `--use-findex` as the opt-in.
+- `run.py`: `--annotator-model` help text now reads `Qwen/Qwen3-4B-Base` (was `Qwen/Qwen3.5-9B`, never existed).
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/promote_loop.py` | AUROC-based mini-prefilter; random subset; min-support audit routing; reads val_promo_f1 |
+| `pipeline/evaluate.py` | Val split into calib/promo halves; saves `val_promo_f1`, `val_promo_n_pos` per feature |
+| `pipeline/run.py` | Corrected --annotator-model help text |
+| `RUNNING.md` | `--layer` 8→9, `--full-desc` documented as default |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.3] — Second-round reviewer fixes + mini-annotation prefilter
 
 **Date:** 2026-04-21

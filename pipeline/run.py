@@ -46,7 +46,7 @@ def main():
     parser.add_argument("--local-annotator", action="store_true",
                         help="Use local model for annotation (vLLM)")
     parser.add_argument("--annotator-model", default=None,
-                        help="Local annotator HF model ID (default: Qwen/Qwen3.5-9B)")
+                        help="Local annotator HF model ID (default: Qwen/Qwen3-4B-Base)")
     parser.add_argument("--batch-positions", action="store_true",
                         help="Full-sequence JSON output (vs per-token)")
     parser.add_argument("--catalog", default=None,

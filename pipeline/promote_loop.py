@@ -90,15 +90,32 @@ def _attach_defaults(cfg: Config) -> None:
         cfg.promote_cos_threshold = 0.6
     if not hasattr(cfg, "promote_use_llm_separability"):
         cfg.promote_use_llm_separability = True
-    # Mini-prefilter: cheap annotator-vs-U-firing agreement check on a small
-    # subset of sequences before paying for full-corpus annotation + retrain.
-    # A feature whose annotator labels don't overlap with the U latent's
-    # firing mask on 50 sequences is almost certainly going to fail full
-    # training too — rejecting it early saves the expensive vLLM pass.
+    # Mini-prefilter: cheap annotator-vs-U-activation agreement check on a
+    # small subset of sequences. We use AUROC of U's pre-activation score
+    # against the annotator's binary labels — NOT F1 against the (pre > 0)
+    # firing mask. The `pre > 0` mask treats every weak firing as positive,
+    # which polysemantic/leaky U latents produce in bulk; F1 against that
+    # then collapses to "the annotator agrees U fires everywhere". AUROC
+    # uses the continuous activation ranking and is scale/threshold free.
+    # Features with too few positives (annotator or U) on the subset are
+    # routed to "audit" rather than dropped — a sparse mini-sample can't
+    # distinguish a rare-but-real feature from a broken one.
     if not hasattr(cfg, "promote_mini_prefilter"):
         cfg.promote_mini_prefilter = True
     if not hasattr(cfg, "promote_mini_prefilter_n_seqs"):
         cfg.promote_mini_prefilter_n_seqs = 50
+    if not hasattr(cfg, "promote_mini_prefilter_min_auroc"):
+        cfg.promote_mini_prefilter_min_auroc = 0.70
+    if not hasattr(cfg, "promote_mini_prefilter_min_support"):
+        # minimum positives on BOTH sides (annotator AND U) for the feature
+        # to be eligible for dropping; below this, route to audit.
+        cfg.promote_mini_prefilter_min_support = 5
+    if not hasattr(cfg, "promote_mini_prefilter_audit_only"):
+        # audit-only mode: compute the score but don't drop. Recommended
+        # for first few runs to calibrate the AUROC threshold.
+        cfg.promote_mini_prefilter_audit_only = False
+    # Legacy knob, retained so CLI flag --promote-mini-prefilter-min-f1
+    # still sets something harmless if someone passes it.
     if not hasattr(cfg, "promote_mini_prefilter_min_f1"):
         cfg.promote_mini_prefilter_min_f1 = 0.20
 
@@ -241,27 +258,44 @@ def _mini_prefilter(
     sae, new_features: list[dict],
     tokens: torch.Tensor, activations: torch.Tensor,
     tokenizer, cfg: Config, d_model: int, n_supervised: int,
-) -> tuple[list[str], list[dict]]:
-    """Annotate the NEW features on a small subset of sequences and drop any
-    whose annotator labels don't agree with the source U latent's firing
-    mask. The idea: if the LLM can't articulate what U fires on, full
-    supervision won't learn it either, so reject before paying for the
-    expensive full annotation + retrain cycle.
+) -> tuple[list[str], list[dict], list[dict]]:
+    """Rank-based agreement check between annotator labels and the source U
+    latent's continuous activation score. AUROC(pre, ann) is scale-free and
+    doesn't punish polysemantic U latents for firing weakly everywhere.
 
-    Returns (kept_feature_ids, dropped_records).
+    Drops are conservative:
+      - Features with too few positives (annotator or U-fires) on the subset
+        land in an AUDIT bucket (kept + logged, not dropped).
+      - Features with AUROC below `promote_mini_prefilter_min_auroc` AND
+        enough support are dropped.
+      - In audit-only mode (`promote_mini_prefilter_audit_only=True`),
+        nothing is dropped — scores are only logged for threshold
+        calibration across runs.
+
+    Subset is drawn DETERMINISTICALLY at random from the full corpus using
+    `cfg.seed + 7919` so results are reproducible but not biased by whatever
+    documents happen to sit at the start of the ingest order.
+
+    Returns (kept_feature_ids, dropped_records, audit_records).
     """
-    n_seqs = min(cfg.promote_mini_prefilter_n_seqs, tokens.shape[0])
+    n_total = int(tokens.shape[0])
+    n_seqs = min(cfg.promote_mini_prefilter_n_seqs, n_total)
     if n_seqs < 5 or not new_features:
-        return [f["id"] for f in new_features], []
+        return [f["id"] for f in new_features], [], []
 
-    tokens_sub = tokens[:n_seqs]
-    acts_sub = activations[:n_seqs]
-    T = tokens_sub.shape[1]
+    # Deterministic random subset (not the first N — openwebtext's ingest
+    # ordering is not uniform across content types).
+    rng = np.random.RandomState(cfg.seed + 7919)
+    sampled = np.sort(rng.choice(n_total, size=n_seqs, replace=False))
+    sampled_t = torch.from_numpy(sampled).long()
+    tokens_sub = tokens[sampled_t]
+    acts_sub = activations[sampled_t]
 
     from .annotate import annotate_local, annotate_corpus
     print(
         f"  Mini-annotating {len(new_features)} candidates on {n_seqs} "
-        f"sequences ({'local vLLM' if cfg.use_local_annotator else 'API'})..."
+        f"randomly-sampled sequences "
+        f"({'local vLLM' if cfg.use_local_annotator else 'API'})..."
     )
     if cfg.use_local_annotator:
         mini_labels = annotate_local(tokens_sub, new_features, tokenizer, cfg)
@@ -269,43 +303,86 @@ def _mini_prefilter(
         mini_labels = annotate_corpus(tokens_sub, new_features, tokenizer, cfg)
     # mini_labels: (n_seqs, T, len(new_features))
 
-    # Compute U firing on the same subset. Align device/dtype with acts_sub.
+    # U activation on the same subset. Align device/dtype.
     X_sub = acts_sub.reshape(-1, d_model).to(torch.float32)
     enc_w = sae.encoder.weight.detach().to(device=X_sub.device, dtype=X_sub.dtype)
     enc_b = sae.encoder.bias.detach().to(device=X_sub.device, dtype=X_sub.dtype)
 
+    # Local copy of the AUROC function from evaluate.py to avoid a circular
+    # import on the test path.
+    def _auroc(y_true: np.ndarray, scores: np.ndarray) -> float:
+        n_pos = int(y_true.sum())
+        n_neg = int(len(y_true) - n_pos)
+        if n_pos == 0 or n_neg == 0:
+            return float("nan")
+        order = np.argsort(-scores)
+        y_sorted = y_true[order]
+        tps = np.cumsum(y_sorted)
+        fps = np.cumsum(~y_sorted)
+        tpr = tps / n_pos
+        fpr = fps / n_neg
+        tpr = np.concatenate([[0.0], tpr])
+        fpr = np.concatenate([[0.0], fpr])
+        return float(np.trapz(tpr, fpr))
+
     kept_ids: list[str] = []
     dropped: list[dict] = []
+    audit: list[dict] = []
+    min_support = cfg.promote_mini_prefilter_min_support
+
     for i, feat in enumerate(new_features):
         u_local = feat.get("source_u_local_idx")
         if u_local is None:
             kept_ids.append(feat["id"])
             continue
         u_global = n_supervised + u_local
-        pre = X_sub @ enc_w[u_global] + enc_b[u_global]
-        u_fires = (pre > 0).cpu().numpy().astype(bool)     # (n_seqs*T,)
+        pre = (X_sub @ enc_w[u_global] + enc_b[u_global]).cpu().numpy()  # float
         ann = mini_labels[:, :, i].reshape(-1).numpy().astype(bool)
+        u_fires_mask = pre > 0
 
         n_ann = int(ann.sum())
-        n_fires = int(u_fires.sum())
-        tp = int((u_fires & ann).sum())
+        n_fires = int(u_fires_mask.sum())
+        # Legacy F1 retained as a secondary diagnostic (easy to compare
+        # against the v8.3 gate), but no longer used for the drop decision.
+        tp = int((u_fires_mask & ann).sum())
         prec = tp / n_ann if n_ann > 0 else 0.0
         rec = tp / n_fires if n_fires > 0 else 0.0
         mini_f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
 
-        if mini_f1 < cfg.promote_mini_prefilter_min_f1:
-            dropped.append({
-                "id": feat["id"],
-                "mini_f1": round(mini_f1, 4),
-                "precision": round(prec, 4),
-                "recall": round(rec, 4),
-                "n_annotator_positives": n_ann,
-                "n_u_fires": n_fires,
-                "floor": cfg.promote_mini_prefilter_min_f1,
-            })
+        auroc_val = _auroc(ann, pre)
+        record = {
+            "id": feat["id"],
+            "auroc": (
+                round(float(auroc_val), 4)
+                if not np.isnan(auroc_val) else None
+            ),
+            "mini_f1_legacy": round(mini_f1, 4),
+            "n_annotator_positives": n_ann,
+            "n_u_fires": n_fires,
+            "n_subset_positions": int(len(ann)),
+            "floor": cfg.promote_mini_prefilter_min_auroc,
+        }
+
+        # Audit path: not enough support, OR audit-only mode is on.
+        low_support = (
+            n_ann < min_support or n_fires < min_support
+            or np.isnan(auroc_val)
+        )
+        if cfg.promote_mini_prefilter_audit_only or low_support:
+            reason = (
+                "audit_only_mode"
+                if cfg.promote_mini_prefilter_audit_only
+                else f"low_support (n_ann={n_ann}, n_fires={n_fires})"
+            )
+            audit.append({**record, "reason": reason})
+            kept_ids.append(feat["id"])
+            continue
+
+        if auroc_val < cfg.promote_mini_prefilter_min_auroc:
+            dropped.append(record)
         else:
             kept_ids.append(feat["id"])
-    return kept_ids, dropped
+    return kept_ids, dropped, audit
 
 
 # ── Mean-shift target direction from U latent's firing mask ────────────────
@@ -371,14 +448,21 @@ def _post_training_validation(
     """Read evaluation.json after retrain; keep features above the F1 floor,
     drop below. Returns (kept_ids, dropped_records).
 
-    Prefers `val_f1_cal` (val-only F1 at calibrated threshold — no test
-    contamination). Falls back to `f1` at t=0 if val_f1_cal is missing
-    (older evaluation.json without v8.1+ fields).
+    Metric preference, best → worst:
+      1. `val_promo_f1` (v8.4+): F1 on the held-out half of val at the
+         threshold picked on the other half. Honest generalization within
+         val — the only metric that neither contaminates test nor is
+         fit-and-scored on the same data.
+      2. `val_f1_cal` (v8.3): F1 on val at threshold fit on val. Overfit
+         to val by construction; retained only as a fallback when val-
+         promo n_pos is 0 (rare features with no positives in the second
+         half).
+      3. `f1` (t=0): legacy fallback for evaluation.json files written
+         before v8.3 had any val-side metrics.
 
-    CRITICAL: must NOT use `cal_f1` for promote-loop gating. `cal_f1` is
-    computed on the TEST set with val-calibrated thresholds; repeated
-    promote-loop rounds that filter features on cal_f1 leak test labels
-    into the pruned catalog and invalidate final test metrics.
+    CRITICAL: must NEVER read `cal_f1` — that's test-set F1 at val-
+    calibrated thresholds, and using it for multi-round promotion filtering
+    leaks test labels into the pruned catalog.
     """
     if not cfg.eval_path.exists():
         return new_feature_ids, []
@@ -389,16 +473,17 @@ def _post_training_validation(
     dropped: list[dict] = []
     for fid in new_feature_ids:
         rec = feats_map.get(fid) or {}
-        f1 = rec.get("val_f1_cal")
-        metric = "val_f1_cal"
+        f1 = rec.get("val_promo_f1")
+        metric = "val_promo_f1"
+        # If val_promo has no positives for this feature (rare or newly
+        # added with unlucky split), fall back to val_f1_cal.
+        if f1 is None or rec.get("val_promo_n_pos", 0) == 0:
+            f1 = rec.get("val_f1_cal")
+            metric = "val_f1_cal_fallback"
         if f1 is None:
-            # Legacy evaluation.json without val_f1_cal. Fall back to t=0
-            # val F1 would be ideal, but evaluate.py doesn't save that
-            # separately; use the t=0 test f1 as a coarse proxy with a
-            # warning in the log — still not the right metric long-term
-            # but preserves backward compatibility.
+            # Pre-v8.3 evaluation.json without any val-side metrics.
             f1 = rec.get("f1")
-            metric = "f1_t0_fallback"
+            metric = "f1_t0_legacy_fallback"
         if f1 is None or f1 < cfg.promote_post_train_f1_floor:
             dropped.append({
                 "id": fid,
@@ -714,15 +799,16 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
         # Saves the expensive full-annotation + retrain cost on features
         # the annotator can't articulate.
         mini_dropped: list[dict] = []
+        mini_audit: list[dict] = []
         if cfg.promote_mini_prefilter and kept_feature_ids:
-            print("\n── Mini-annotation prefilter ──")
+            print("\n── Mini-annotation prefilter (AUROC-based) ──")
             new_feats_for_prefilter = [
                 f for f in merged_catalog["features"]
                 if f["id"] in set(kept_feature_ids)
             ]
             from transformers import AutoTokenizer
             mini_tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-            kept_feature_ids, mini_dropped = _mini_prefilter(
+            kept_feature_ids, mini_dropped, mini_audit = _mini_prefilter(
                 sae, new_feats_for_prefilter,
                 tokens=torch.load(cfg.tokens_path, weights_only=True),
                 activations=activations,
@@ -732,13 +818,23 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
             (iter_dir / "mini_prefilter_dropped.json").write_text(
                 json.dumps(mini_dropped, indent=2)
             )
+            (iter_dir / "mini_prefilter_audit.json").write_text(
+                json.dumps(mini_audit, indent=2)
+            )
             if mini_dropped:
                 print(
                     f"  Mini-prefilter dropped {len(mini_dropped)} feature(s) "
-                    f"below F1={cfg.promote_mini_prefilter_min_f1}:"
+                    f"below AUROC={cfg.promote_mini_prefilter_min_auroc}:"
                 )
                 for d in mini_dropped[:10]:
-                    print(f"    - {d['id']}  (mini_f1={d['mini_f1']})")
+                    print(f"    - {d['id']}  AUROC={d['auroc']}  "
+                          f"(n_ann={d['n_annotator_positives']}, "
+                          f"n_fires={d['n_u_fires']})")
+            if mini_audit:
+                print(
+                    f"  Mini-prefilter routed {len(mini_audit)} to audit "
+                    f"(low support or audit-only mode); kept in catalog."
+                )
             print(f"  {len(kept_feature_ids)} surviving after mini-prefilter")
             # Prune merged_catalog to the survivors (preserve original features,
             # drop only rejected new features).
@@ -890,6 +986,7 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
             "n_after_mini_prefilter": len(kept_feature_ids),
             "n_after_post_training_filter": len(kept_ids_after_val),
             "mini_prefilter_dropped": [d["id"] for d in mini_dropped],
+            "mini_prefilter_audited": [a["id"] for a in mini_audit],
             "capacity_transfer": transfer_summary,
             "r2_after_retrain": recon.get("r2"),
             "delta_r2_supervised_after": recon.get("delta_r2_supervised"),

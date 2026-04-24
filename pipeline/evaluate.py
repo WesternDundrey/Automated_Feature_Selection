@@ -158,21 +158,57 @@ def evaluate(cfg: Config = None):
 
     val_gt = y_val.numpy().astype(bool)
     val_scores = val_sup_pre.numpy()
+    n_val = val_gt.shape[0]
+
+    # Split val into two halves to remove the "fit threshold on val, score on
+    # val" selection bias:
+    #   val_calib — used to pick per-feature calibrated thresholds
+    #   val_promo — used to score F1 at those thresholds (honest metric)
+    # `val_f1_cal` (F1 on val at thresholds fit on val) is retained for
+    # backward compat but now clearly labeled as overfit.
+    # `val_promo_f1` is the metric promote_loop should gate on.
+    half = n_val // 2
+    val_calib_slice = slice(0, half)
+    val_promo_slice = slice(half, n_val)
+
     calibrated_thresholds = np.zeros(n_features)
-    # Per-feature F1 on val AT the calibrated threshold. This is val-only —
-    # no test contamination — so it's the correct signal for gating promotion
-    # decisions across multiple rounds of the promote loop. Do NOT use
-    # `cal_f1` (val-calibrated threshold applied on test) for that purpose:
-    # repeating promote-loop rounds that filter on cal_f1 leaks test labels
-    # into the pruned catalog.
-    val_f1_cal = np.zeros(n_features)
+    val_f1_cal = np.zeros(n_features)     # overfit: val-calib F1 at val-calib threshold
+    val_promo_f1 = np.zeros(n_features)    # honest: val-promo F1 at val-calib threshold
+    val_promo_n_pos = np.zeros(n_features, dtype=np.int64)
+
     for k in range(n_features):
-        n_pos = int(val_gt[:, k].sum())
-        if n_pos == 0:
+        calib_labels = val_gt[val_calib_slice, k]
+        calib_scores = val_scores[val_calib_slice, k]
+        promo_labels = val_gt[val_promo_slice, k]
+        promo_scores = val_scores[val_promo_slice, k]
+
+        n_pos_calib = int(calib_labels.sum())
+        val_promo_n_pos[k] = int(promo_labels.sum())
+
+        if n_pos_calib == 0:
+            # Can't fit a threshold on calib for this feature. Fall back to
+            # the full-val threshold (existing behavior) so downstream steps
+            # that rely on calibrated_thresholds still work; record NaN for
+            # the honest F1 so promote_loop knows to skip it.
+            full_n_pos = int(val_gt[:, k].sum())
+            if full_n_pos > 0:
+                best_f1_full, _, _, best_t_full = optimal_threshold_f1(
+                    val_gt[:, k], val_scores[:, k],
+                )
+                calibrated_thresholds[k] = best_t_full
+                val_f1_cal[k] = best_f1_full
             continue
-        best_f1, _, _, best_t = optimal_threshold_f1(val_gt[:, k], val_scores[:, k])
+
+        best_f1_calib, _, _, best_t = optimal_threshold_f1(
+            calib_labels, calib_scores,
+        )
         calibrated_thresholds[k] = best_t
-        val_f1_cal[k] = best_f1
+        val_f1_cal[k] = best_f1_calib
+
+        if val_promo_n_pos[k] > 0:
+            promo_pred = promo_scores > best_t
+            _, _, pf1 = precision_recall_f1(promo_labels, promo_pred)
+            val_promo_f1[k] = pf1
 
     # ── 1. Reconstruction ────────────────────────────────────────────────
     mse = F.mse_loss(recon, x_test).item()
@@ -312,14 +348,25 @@ def evaluate(cfg: Config = None):
               f"{calibrated_thresholds[k]:>8.3f}{tag}")
         feature_results[k]["cal_f1"] = round(cal_f1, 4)
         feature_results[k]["cal_threshold"] = round(float(calibrated_thresholds[k]), 4)
-        # Val-only F1 (threshold optimized on val, evaluated on val). Safe to
-        # use for multi-round promotion decisions without test leakage.
+        # Val-only F1 metrics for promote-loop gating (no test contamination):
+        #   val_f1_cal   — F1 on val-calib at the threshold fit on val-calib
+        #                  (overfit by construction; retained for backward
+        #                  compat with v8.3 promote-loop fallback).
+        #   val_promo_f1 — F1 on val-promo (held out during threshold fitting)
+        #                  at the threshold from val-calib. This is the honest
+        #                  "can this feature generalize within val" metric
+        #                  and is what promote_loop should gate on.
         feature_results[k]["val_f1_cal"] = round(float(val_f1_cal[k]), 4)
+        feature_results[k]["val_promo_f1"] = round(float(val_promo_f1[k]), 4)
+        feature_results[k]["val_promo_n_pos"] = int(val_promo_n_pos[k])
 
     cal_mean_f1 = float(np.mean(cal_f1_scores)) if cal_f1_scores else 0.0
     val_mean_f1_cal = float(np.mean(val_f1_cal[val_f1_cal > 0])) if (val_f1_cal > 0).any() else 0.0
-    print(f"\n  Mean calibrated F1: {cal_mean_f1:.3f}  (vs t=0: {mean_f1:.3f})")
-    print(f"  Mean val-only F1 (for promote-loop gating, no test contamination): {val_mean_f1_cal:.3f}")
+    promo_nonzero = val_promo_f1[val_promo_n_pos > 0]
+    val_mean_promo_f1 = float(np.mean(promo_nonzero)) if promo_nonzero.size else 0.0
+    print(f"\n  Mean calibrated F1 (on test):             {cal_mean_f1:.3f}  (vs t=0: {mean_f1:.3f})")
+    print(f"  Mean val-calib F1 (overfit, fit=score on val-calib): {val_mean_f1_cal:.3f}")
+    print(f"  Mean val-promo F1 (HONEST, held-out val half):       {val_mean_promo_f1:.3f}  ← use this for promote-loop gating")
 
     # ── 2b. Oracle-threshold F1 (per-feature optimum on test — reference only)
     print(f"\n  ORACLE F1 (per-feature optimum on test set — NOT honest eval):")
