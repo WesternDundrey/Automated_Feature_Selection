@@ -977,12 +977,24 @@ def evaluate(cfg: Config = None):
         "n_discovery_features": len(disc_ids),
         "n_total_features": len(features),
         "n_val_vectors": int(x_val.shape[0]),
+        # Renamed from "mse_supervision_metrics" in v8.11.1 — the block now
+        # runs whenever target_directions.pt exists, not just for MSE-
+        # supervision modes. `supervision_mode` is recorded so readers know
+        # whether cos=1.0 is by construction (frozen) or learned.
+        "decoder_target_dir_metrics": {
+            "supervision_mode": supervision_mode,
+            "mean_cosine_to_target": mean_cosine,
+            "mean_fve": mean_fve,
+            "mean_fvu": mean_fvu,
+            "per_feature": cosine_results,
+        } if has_target_dirs else None,
+        # Keep the legacy key so pre-v8.11.1 tooling can still read it.
         "mse_supervision_metrics": {
             "mean_cosine_to_target": mean_cosine,
             "mean_fve": mean_fve,
             "mean_fvu": mean_fvu,
             "per_feature": cosine_results,
-        } if use_mse else None,
+        } if has_target_dirs else None,
         "probe_baseline": {
             "mean_f1": probe_mean_f1,
             "mean_f1_cal": probe_cal_mean_f1,
