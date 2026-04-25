@@ -4,6 +4,58 @@
 
 ---
 
+## [v8.11.2] — Revert default supervision_mode back to "hybrid"
+
+**Date:** 2026-04-25
+
+### What happened
+
+v8.11 flipped the default `supervision_mode` from `"hybrid"` (frozen-decoder, summary6/7 numbers) to `"hinge"` (free-decoder, mentor's methodology note). User ran the full end-to-end pipeline under the new default on a fresh vast.ai instance. Result: R²=0.696 (vs 0.97 under hybrid), cal_F1=0.583 (vs 0.612), mean cosine to target = 0.27 (vs 1.0 by construction), supervised-only R² = −0.76 (vs +0.83). Pretrained-SAE gap grew from −0.014 to −0.148 R². The linear probe now beats the SAE on calibrated F1 (0.646 vs 0.583).
+
+This is a meaningful regression on every downstream metric the paper cares about. Flipping the default without A/B validation was wrong. The legacy hybrid pipeline is what's been validated; it stays as the default.
+
+### Fix
+
+`cfg.supervision_mode` default: `"hinge"` → `"hybrid"`. The three new hinge-family modes (`hinge`, `hinge_jumprelu`, `gated_bce`) remain available as opt-in via `--supervision <mode>`. Their implementation (v8.11) and subsequent fixes (v8.11.1) stay in tree so a disciplined A/B comparison can be run later.
+
+### Why hinge underperformed — current hypotheses
+
+(Speculative — needs investigation, not paper-worthy claims.)
+
+1. **Under-trained.** 15 epochs from random-init decoder is harder than 15 epochs with decoder pre-locked to target_dirs. The hybrid path gets "where the decoder should point" for free; hinge has to learn it.
+2. **lambda_sup miscalibrated.** `lambda_sup=2.0` was tuned for BCE loss magnitudes. Hinge and BCE have different scales; a sweep is needed before claiming hinge works.
+3. **Data regime the doc didn't assume.** Mentor's doc says ReLU+hinge works "as long as ground-truth features have reasonable magnitudes relative to noise." Our catalog has features with n_pos ranging 45-11,819 — signal varies by >2 orders of magnitude. Frozen decoder absorbs this heterogeneity by not needing per-feature signal to learn direction; free decoder has to.
+
+### If you want to continue the hinge experiment
+
+Start from the validated frozen-decoder checkpoint and fine-tune with hinge, rather than training from scratch:
+
+```
+# 1. Train frozen-hybrid baseline.
+python -m pipeline.run \
+--step train \
+--supervision hybrid \
+--layer 9 \
+--sae_id blocks.9.hook_resid_pre \
+--local-annotator \
+--n_sequences 1000 \
+--epochs 15
+
+# 2. (Future work — not implemented) warm-start hinge from that checkpoint
+#    with decoder unfrozen, short fine-tune. Preserves direction alignment
+#    from the frozen starting point while testing hinge's selectivity
+#    behavior. This is probably the correct pragmatic A/B.
+```
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/config.py` | `supervision_mode` default flipped `"hinge"` → `"hybrid"`; docstring explains the trade |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.11.1] — Reviewer fixes on the hinge/free-decoder batch
 
 **Date:** 2026-04-25

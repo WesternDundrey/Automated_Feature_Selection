@@ -67,20 +67,32 @@ class Config:
     n_lista_steps: int = 0  # LISTA refinement iterations (0 = disabled)
 
     # ── Supervision mode ───────────────────────────────────────────
-    # "hinge"           = ReLU + hinge on pre-activations (NEW DEFAULT, v8.11).
-    #                     End-to-end training, no frozen decoder, no
-    #                     pre-computed target_dirs in loss. See
-    #                     `supervised_saes_hinge_loss.md`.
-    # "hinge_jumprelu"  = JumpReLU + hinge on (z - θ), per-feature θ
-    #                     learnable. Use when a minimum firing magnitude
-    #                     is useful for interpretability.
-    # "gated_bce"       = Two-path encoder (gate + magnitude), BCE on
-    #                     gate logit. Fully decouples gate from magnitude.
-    # --- Legacy modes (frozen-decoder pipeline, summary6/7 numbers) ---
-    # "hybrid"          = BCE selectivity + cosine direction alignment.
+    # DEFAULT: "hybrid" (restored in v8.11.2). This is the frozen-decoder
+    # pipeline that gave the validated summary7 numbers (R²=0.971,
+    # cal_F1=0.612, mean cos=1.000 by construction). Every downstream
+    # paper claim (composition linearity, intervention targeting ratio,
+    # 75x-fewer-latents reconstruction parity) was measured under this
+    # mode.
+    #
+    # The v8.11 hinge-family modes are EXPERIMENTAL. In user's first
+    # end-to-end test on the catalog, hinge trained to R²=0.70 (vs
+    # hybrid's 0.97) and cal_F1=0.583 (vs hybrid's 0.612), with
+    # supervised-only R² going NEGATIVE (-0.76). Whether this is a
+    # lambda_sup miscalibration, an under-training issue, or a
+    # structural regression on this data is unresolved. Do NOT adopt
+    # hinge as the default paper setup until there's A/B evidence it
+    # matches or beats hybrid on R² AND cal_F1.
+    #
+    # Frozen-decoder family (production):
+    # "hybrid"          = BCE selectivity + cosine direction alignment (default).
     # "mse"             = MSE magnitude + cosine direction (Makelov-inspired).
     # "bce"             = legacy BCE only, no decoder alignment.
-    supervision_mode: str = "hinge"
+    #
+    # Experimental hinge-family (opt-in via --supervision <mode>):
+    # "hinge"           = ReLU + hinge on pre-activations, free decoder.
+    # "hinge_jumprelu"  = JumpReLU + hinge on (z - θ), per-feature θ learnable.
+    # "gated_bce"       = Two-path encoder (gate + magnitude), BCE on gate.
+    supervision_mode: str = "hybrid"
     use_mse_supervision: bool = True    # DEPRECATED: use supervision_mode instead
     direction_loss_weight: float = 1.0  # α: decoder direction alignment (hybrid/mse)
     magnitude_loss_weight: float = 0.5  # β: activation magnitude alignment (mse only)
