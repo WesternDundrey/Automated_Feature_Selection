@@ -88,8 +88,27 @@ def main():
                  "validate-annotator",
                  "splitting", "circuit", "intervention", "amplify",
                  "weaknesses", "siphoning", "discover", "discover-loop",
-                 "composition", "layer-sweep", "promote-loop", "usweep"],
+                 "composition", "layer-sweep", "promote-loop", "usweep",
+                 "hinge-ablation"],
         help="Run only this step",
+    )
+    parser.add_argument(
+        "--hinge-ablation-variants", default=None,
+        help="Comma-separated variants to run under --step hinge-ablation "
+             "(default: all). Available: hybrid_bce, hybrid_hinge, "
+             "hinge_free_zero, hinge_free_margin1, hinge_free_margin1_sq, "
+             "hinge_free_margin1_lam10, hinge_free_margin1_30ep, gated_bce.",
+    )
+    parser.add_argument(
+        "--hinge-margin", type=float, default=None,
+        help="Margin for hinge supervision (default 1.0 legacy, 0.0 for "
+             "mentor's zero-margin formulation). Applies to --supervision "
+             "hinge / hinge_jumprelu and to the legacy --selectivity hinge path.",
+    )
+    parser.add_argument(
+        "--hinge-squared", action="store_true",
+        help="Use squared hinge: violation² / 2 instead of violation. "
+             "Smoother gradient, more push on large violations.",
     )
     parser.add_argument("--widths", default=None,
                         help="Comma-separated n_unsupervised values for "
@@ -211,6 +230,10 @@ def main():
         overrides["gated_tie_weights"] = True
     if args.jumprelu_theta_init is not None:
         overrides["jumprelu_theta_init"] = args.jumprelu_theta_init
+    if args.hinge_margin is not None:
+        overrides["hinge_margin"] = args.hinge_margin
+    if args.hinge_squared:
+        overrides["hinge_squared"] = True
     if args.no_mse:
         overrides["supervision_mode"] = "bce"
     if args.full_desc:
@@ -464,6 +487,22 @@ def main():
         from .composition import run as run_composition
         run_composition(cfg)
         print(f"Composition completed in {time.time() - t0:.1f}s")
+
+    # Hinge-family ablation — margin / squared / frozen-vs-free / λ / epochs
+    if args.step == "hinge-ablation":
+        print("\n" + "=" * 70)
+        print("HINGE-FAMILY ABLATION — margin/squared/frozen/λ/epochs sweep")
+        print("=" * 70)
+        t0 = time.time()
+        from .hinge_ablation import run as run_hinge_ablation
+        if args.hinge_ablation_variants:
+            variants = tuple(
+                v.strip() for v in args.hinge_ablation_variants.split(",") if v.strip()
+            )
+        else:
+            variants = None
+        run_hinge_ablation(cfg, variant_names=variants)
+        print(f"Hinge ablation completed in {time.time() - t0:.1f}s")
 
     # U-width sweep — measure n_unsupervised effect on proposal quality
     if args.step == "usweep":

@@ -342,26 +342,38 @@ def hinge_supervision_loss(
     sup_pre: torch.Tensor,
     labels: torch.Tensor,
     pos_weight: torch.Tensor | None = None,
+    margin: float = 0.0,
+    squared: bool = False,
 ) -> torch.Tensor:
     """Per-feature hinge on pre-activations.
 
-    For each feature i, violation = max(0, -(2·y_i - 1)·z_i):
-      - y_i=1, z_i<0 → violation = -z_i (pushes z_i up)
-      - y_i=0, z_i>0 → violation = z_i (pushes z_i down)
-      - correct-side → zero gradient (the whole point)
+    Unified signature covering three variants reviewer-approved for ablation:
 
-    When `pos_weight` is supplied, positive-label violations are scaled by
-    pos_weight[i]; negatives are at weight 1. Matches the class-balanced
-    BCE policy (`BCEWithLogitsLoss(pos_weight=...)`) so the comparison
-    between BCE and hinge isn't confounded by imbalance handling.
+      - margin=0, squared=False  → classic zero-margin hinge. Zero gradient
+        the moment sign is correct. Mentor's doc default, but may
+        under-separate scores for calibrated F1.
+      - margin=M, squared=False  → margin hinge, violation = max(0, M - y·z).
+        Continues shaping scores until features are confidently inside the
+        margin. M=1 is the SVM classic.
+      - margin=M, squared=True   → squared hinge, violation² / 2.
+        Smoother gradient near the boundary; more gradient on big violations.
+        Useful when gradient sparsity from linear hinge is under-training.
+
+    Class balancing: `pos_weight[i]` scales positive-label violations,
+    negatives at weight 1 — matches BCE's pos_weight policy so the
+    hinge-vs-BCE comparison isn't confounded by imbalance handling.
 
     Args:
         sup_pre:    (batch, n_sup) pre-activations for the supervised slice
         labels:     (batch, n_sup) binary labels
         pos_weight: (n_sup,) per-feature positive-class weight, or None
+        margin:     0.0 for classic hinge, >0 for margin hinge
+        squared:    False for linear hinge, True for squared hinge
     """
-    targets = 2.0 * labels - 1.0                  # {-1, +1}
-    violations = F.relu(-targets * sup_pre)       # (batch, n_sup)
+    targets = 2.0 * labels - 1.0                     # {-1, +1}
+    violations = F.relu(margin - targets * sup_pre)  # (batch, n_sup)
+    if squared:
+        violations = 0.5 * violations.pow(2)
     if pos_weight is not None:
         weights = torch.where(
             labels > 0,
@@ -377,15 +389,20 @@ def jumprelu_hinge_supervision_loss(
     theta: torch.Tensor,
     labels: torch.Tensor,
     pos_weight: torch.Tensor | None = None,
+    margin: float = 0.0,
+    squared: bool = False,
 ) -> torch.Tensor:
     """Hinge on the JumpReLU margin (z - θ).
 
-    violation_i = max(0, -(2·y_i - 1)·(z_i - θ_i))
+    violation_i = max(0, margin - (2·y_i - 1)·(z_i - θ_i))
     θ gets its gradient from this term (hinge is piecewise linear in θ).
+    Signature parity with hinge_supervision_loss for ablation uniformity.
     """
-    margin = sup_pre - theta.unsqueeze(0)          # (batch, n_sup)
+    m = sup_pre - theta.unsqueeze(0)                 # (batch, n_sup)
     targets = 2.0 * labels - 1.0
-    violations = F.relu(-targets * margin)
+    violations = F.relu(margin - targets * m)
+    if squared:
+        violations = 0.5 * violations.pow(2)
     if pos_weight is not None:
         weights = torch.where(
             labels > 0,
@@ -601,12 +618,19 @@ def train_hinge_sae(
 
             recon_loss = F.mse_loss(recon, x_b)
 
-            # Supervision loss
+            # Supervision loss. margin/squared come from cfg so the
+            # hinge-ablation runner can sweep them without editing code.
+            hinge_margin = float(getattr(cfg, "hinge_margin", 0.0))
+            hinge_squared = bool(getattr(cfg, "hinge_squared", False))
             if cfg.supervision_mode == "hinge":
-                sup_loss = hinge_supervision_loss(sup_pre, y_b, pos_weight)
+                sup_loss = hinge_supervision_loss(
+                    sup_pre, y_b, pos_weight,
+                    margin=hinge_margin, squared=hinge_squared,
+                )
             elif cfg.supervision_mode == "hinge_jumprelu":
                 sup_loss = jumprelu_hinge_supervision_loss(
                     sup_pre, sae.theta, y_b, pos_weight,
+                    margin=hinge_margin, squared=hinge_squared,
                 )
             elif cfg.supervision_mode == "gated_bce":
                 sup_loss = gated_bce_supervision_loss(
@@ -676,10 +700,14 @@ def train_hinge_sae(
                 val_recon_sum += F.mse_loss(vrec, xv, reduction="sum").item()
                 val_n_vectors += xv.numel()
                 if cfg.supervision_mode == "hinge":
-                    val_sup_sum += hinge_supervision_loss(vsp, yv, pos_weight).item()
+                    val_sup_sum += hinge_supervision_loss(
+                        vsp, yv, pos_weight,
+                        margin=hinge_margin, squared=hinge_squared,
+                    ).item()
                 elif cfg.supervision_mode == "hinge_jumprelu":
                     val_sup_sum += jumprelu_hinge_supervision_loss(
                         vsp, sae.theta, yv, pos_weight,
+                        margin=hinge_margin, squared=hinge_squared,
                     ).item()
                 else:
                     val_sup_sum += gated_bce_supervision_loss(

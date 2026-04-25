@@ -4,6 +4,80 @@
 
 ---
 
+## [v8.12] — Hinge-family ablation runner (margin, squared, frozen-vs-free, λ, epochs)
+
+**Date:** 2026-04-25
+
+### Motivation
+
+After v8.11.3 restored R² (unmasking position 0), the remaining question is why hinge's cal_F1 might still lag BCE. Reviewer's diagnostic: if AUROC ≈ probe but cal_F1 is worse, it's score-shaping (margin / λ); if AUROC also lags, it's capacity / objective / data. The fix is ablation — not committing to one variant of hinge.
+
+### Additions
+
+**Margin + squared variants on the hinge loss.** Mentor's doc defaults to zero-margin hinge (sign-correctness only, no score shaping). That stops gradient the moment a feature is barely on the correct side, which is fine for the gate decision but may leave calibrated F1 on the table because the score distribution isn't pushed apart. `hinge_supervision_loss` and `jumprelu_hinge_supervision_loss` now accept `margin` (default 0.0 for compatibility with v8.11) and `squared` (default False):
+
+```
+violation = F.relu(margin - (2y - 1) * z)
+if squared: violation = violation² / 2
+```
+
+Three useful configurations:
+- `margin=0, squared=False` — zero-margin hinge (mentor's default).
+- `margin=1, squared=False` — SVM-style margin hinge. Continues shaping scores until `|z|` clears the margin.
+- `margin=1, squared=True` — squared hinge. Smoother gradient near boundary, proportionally larger gradient on big violations.
+
+**CLI:** `--hinge-margin <float>` and `--hinge-squared`. Wire through to `cfg.hinge_margin` and `cfg.hinge_squared`.
+
+**`pipeline/hinge_ablation.py` — `--step hinge-ablation`.** Runs eight pre-defined variants covering reviewer's ordering:
+
+| variant | supervision | selectivity | margin | squared | λ_sup | epochs |
+|---|---|---|---|---|---|---|
+| `hybrid_bce` | hybrid (frozen) | bce | — | — | 2.0 | 15 |
+| `hybrid_hinge` | hybrid (frozen) | hinge | 1.0 | — | 2.0 | 15 |
+| `hinge_free_zero` | hinge (free) | — | 0.0 | F | 2.0 | 15 |
+| `hinge_free_margin1` | hinge (free) | — | 1.0 | F | 2.0 | 15 |
+| `hinge_free_margin1_sq` | hinge (free) | — | 1.0 | T | 2.0 | 15 |
+| `hinge_free_margin1_lam10` | hinge (free) | — | 1.0 | F | 10.0 | 15 |
+| `hinge_free_margin1_30ep` | hinge (free) | — | 1.0 | F | 2.0 | 30 |
+| `gated_bce` | gated | — | — | — | 2.0 | 15 |
+
+Each variant runs under `pipeline_data/hinge_ablation/<name>/` with shared artifacts (tokens, activations, annotations, catalog) symlinked from the main output dir. No annotation regen per variant. Each variant runs train + evaluate, then the runner aggregates headline metrics.
+
+**The summary table prints the reviewer's primary diagnostic**: `gap_cal_f1_vs_probe` and `gap_auroc_vs_probe`. If `gap_auroc_vs_probe` is near 0 but `gap_cal_f1_vs_probe` is negative, score-shaping is the issue — pick the variant that shrinks the F1 gap. If both gaps are negative, capacity / data / training length is the issue and the hinge family might be structurally disadvantaged on this catalog.
+
+### Subset invocation
+
+Run only the variants most likely to answer the current question:
+
+```
+python -m pipeline.run \
+--step hinge-ablation \
+--hinge-ablation-variants hybrid_bce,hybrid_hinge,hinge_free_margin1 \
+--layer 9 \
+--sae_id blocks.9.hook_resid_pre \
+--local-annotator \
+--n_sequences 1000 \
+--epochs 15
+```
+
+Three-variant run covers the reviewer's first diagnostic (hybrid+hinge isolates "hinge gate loss" from "free decoder"; hinge_free_margin1 tests whether margin alone fixes the F1 gap).
+
+### Expected runtime
+
+Each variant is train + evaluate (no annotation), ~3-5 min on a 5090 for 1000 sequences / 15 epochs. Eight variants = ~30-45 min total. The `_30ep` variant obviously doubles its own time. Resumable: if a variant's checkpoint exists, training is skipped.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/supervised_hinge.py` | `margin` + `squared` kwargs on both hinge loss functions; trainer pulls from `cfg.hinge_margin` / `cfg.hinge_squared` |
+| `pipeline/config.py` | `hinge_squared: bool = False`; `hinge_margin` doc clarifies it now covers the free-decoder path too |
+| `pipeline/hinge_ablation.py` | **NEW** — 8-variant sweep + aggregate table focused on AUROC-vs-F1 gap |
+| `pipeline/run.py` | `--step hinge-ablation` + `--hinge-ablation-variants` + `--hinge-margin` + `--hinge-squared` |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.11.3] — Root-cause the R² collapse: BOS masking, not the hinge loss
 
 **Date:** 2026-04-25
