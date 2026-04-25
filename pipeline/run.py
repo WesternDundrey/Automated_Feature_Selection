@@ -89,8 +89,21 @@ def main():
                  "splitting", "circuit", "intervention", "amplify",
                  "weaknesses", "siphoning", "discover", "discover-loop",
                  "composition", "layer-sweep", "promote-loop", "usweep",
-                 "hinge-ablation"],
+                 "hinge-ablation", "trim-by-kappa"],
         help="Run only this step",
+    )
+    parser.add_argument(
+        "--kappa-threshold", type=float, default=0.4,
+        help="κ threshold for --step trim-by-kappa (default 0.4). Features "
+             "below this drop from the catalog. 0.4 is the conventional "
+             "'fair agreement' boundary in the inter-rater literature.",
+    )
+    parser.add_argument(
+        "--apply-trim", action="store_true",
+        help="For --step trim-by-kappa, replace feature_catalog.json with "
+             "the trimmed version. Without this flag, the trimmed catalog "
+             "is written to feature_catalog.trimmed.json but the active "
+             "catalog is left alone (so you can audit before committing).",
     )
     parser.add_argument(
         "--hinge-ablation-variants", default=None,
@@ -487,6 +500,21 @@ def main():
         from .composition import run as run_composition
         run_composition(cfg)
         print(f"Composition completed in {time.time() - t0:.1f}s")
+
+    # Trim catalog by inter-annotator κ — drops features the annotator
+    # can't reliably label, projects what mean F1 would be on the kept set.
+    if args.step == "trim-by-kappa":
+        print("\n" + "=" * 70)
+        print("CATALOG TRIM BY ANNOTATOR κ")
+        print("=" * 70)
+        t0 = time.time()
+        from .trim_catalog import run as run_trim
+        run_trim(
+            cfg,
+            kappa_threshold=args.kappa_threshold,
+            apply_to_disk=args.apply_trim,
+        )
+        print(f"Trim completed in {time.time() - t0:.1f}s")
 
     # Hinge-family ablation — margin / squared / frozen-vs-free / λ / epochs
     if args.step == "hinge-ablation":

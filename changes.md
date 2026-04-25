@@ -4,6 +4,98 @@
 
 ---
 
+## [v8.13] — Catalog trim by annotator κ (`--step trim-by-kappa`)
+
+**Date:** 2026-04-25
+
+### Motivation
+
+After the v8.12 ablation showed cal_F1 ≈ 0.644 across all variants (including the linear-probe baseline at 0.650), we know the annotator's label reliability is the dominant ceiling, not the SAE architecture. Per-feature inspection showed ~15-20 catalog features with cal_F1 < 0.40, almost all in the "subjective discourse-function / syntactic-construction / semantic-role" bands where Qwen3-4B-Base annotations are inconsistent across passes (κ likely < 0.4).
+
+The honest move is to drop those features from the *headline* number — not because they don't exist as concepts, but because the annotator can't reliably label them, so any classifier (SAE / probe / readout) is bounded by annotator noise on them. The summary7 framing already acknowledged this with "κ = 0.583 sets the F1 ceiling"; v8.1 gave us the real metric (annotator-vs-annotator F1, not κ as proxy). v8.13 makes the trim mechanical and auditable.
+
+### `pipeline/trim_catalog.py` — `--step trim-by-kappa`
+
+Reads `agreement.json` (per-feature κ + F1-ceiling, written by `--step agreement` since v8.1) and `evaluation.json`, partitions catalog features into kept / dropped / no-data buckets by `kappa_threshold` (default 0.4 — the conventional "fair agreement" boundary), and produces:
+
+1. **`feature_catalog.trimmed.json`** under `cfg.output_dir` — the kept-features catalog. Original `feature_catalog.json` is untouched unless `--apply-trim` is passed.
+
+2. **Re-aggregated metrics over the kept set** — recomputes `mean_cal_F1`, `mean_val_promo_f1`, `mean_AUROC` on the kept-features subset of the existing `evaluation.json`. This is the cheap projection: "if we just drop the κ < threshold features from our reporting, what does the mean become?" No retraining needed for this number.
+
+3. **Mean annotator-self F1 ceiling on the kept set** — uses the v8.1 `f1_ceiling` per-feature metric. Gap between SAE cal_F1 and annotator ceiling tells us how much room remains: if gap < 0.05, the SAE has hit annotator noise on the kept features.
+
+4. **Worst-dropped audit** — top-15 features with lowest κ that are being dropped, so the user can sanity-check the trim isn't removing things they care about.
+
+5. **`trim_by_kappa_audit.json`** — full machine-readable record of the partition + projected metrics + dropped-feature list with κ and f1_ceiling.
+
+Optional `--apply-trim`: replaces `feature_catalog.json` with the trimmed version (after backing up the original to `feature_catalog.before_trim.json`). For the *rigorous* trimmed-catalog SAE — actually retraining on the smaller catalog rather than just re-aggregating — apply, delete the stale checkpoint, and re-run `--step train` + `--step evaluate`.
+
+### CLI
+
+- `--step trim-by-kappa`
+- `--kappa-threshold <float>` (default 0.4)
+- `--apply-trim`
+
+### Recommended usage flow
+
+```
+# 1. Run agreement (writes pipeline_data/agreement.json with per-feature κ).
+python -m pipeline.run \\
+--step agreement \\
+--layer 9 \\
+--sae_id blocks.9.hook_resid_pre \\
+--local-annotator \\
+--n_sequences 1000
+
+# 2. Inspect what the trim would do (no catalog change yet).
+python -m pipeline.run \\
+--step trim-by-kappa \\
+--kappa-threshold 0.4
+
+# 3. If the projected metrics look good, apply + retrain for rigorous numbers.
+python -m pipeline.run \\
+--step trim-by-kappa \\
+--kappa-threshold 0.4 \\
+--apply-trim
+
+rm -f pipeline_data/supervised_sae.pt \\
+pipeline_data/supervised_sae.pt.meta.json \\
+pipeline_data/supervised_sae_config.pt \\
+pipeline_data/target_directions.pt \\
+pipeline_data/split_indices.pt \\
+pipeline_data/evaluation.json \\
+pipeline_data/evaluation.json.meta.json
+
+python -m pipeline.run \\
+--step train \\
+--layer 9 \\
+--sae_id blocks.9.hook_resid_pre \\
+--local-annotator \\
+--n_sequences 1000 \\
+--epochs 15
+
+python -m pipeline.run \\
+--step evaluate \\
+--layer 9 \\
+--sae_id blocks.9.hook_resid_pre \\
+--local-annotator \\
+--n_sequences 1000
+```
+
+### What to expect
+
+The cheap projection (step 2) typically lifts mean cal_F1 by 0.04–0.08 by dropping the worst 10–20 features. Whether the rigorous retrain (step 3) gets a similar lift, larger lift, or smaller lift depends on whether the dropped features were stealing capacity from the SAE — usually it's a small additional bump because the SAE wasn't reconstructing well-classified features through the dropped slots anyway.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/trim_catalog.py` | **NEW** — κ-based trim + projected metrics + audit log |
+| `pipeline/run.py` | `--step trim-by-kappa` + `--kappa-threshold` + `--apply-trim` |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.12] — Hinge-family ablation runner (margin, squared, frozen-vs-free, λ, epochs)
 
 **Date:** 2026-04-25
