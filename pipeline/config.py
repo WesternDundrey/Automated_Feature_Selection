@@ -67,32 +67,24 @@ class Config:
     n_lista_steps: int = 0  # LISTA refinement iterations (0 = disabled)
 
     # ── Supervision mode ───────────────────────────────────────────
-    # DEFAULT: "hybrid" (restored in v8.11.2). This is the frozen-decoder
-    # pipeline that gave the validated summary7 numbers (R²=0.971,
-    # cal_F1=0.612, mean cos=1.000 by construction). Every downstream
-    # paper claim (composition linearity, intervention targeting ratio,
-    # 75x-fewer-latents reconstruction parity) was measured under this
-    # mode.
+    # DEFAULT: "hinge" (per mentor's methodology note, `supervised_saes_hinge_loss.md`).
+    # The R² regression observed in v8.11.2's end-to-end test was NOT
+    # caused by the loss function — it was BOS masking (v8.6) dropping
+    # baseline_mse 10× because position 0 in the residual stream has
+    # ~10× higher variance than other positions. SAE reconstruction MSE
+    # was essentially unchanged (3.24 → 3.31); the R² denominator was
+    # what collapsed. See v8.11.3 changelog for the full diagnostic.
     #
-    # The v8.11 hinge-family modes are EXPERIMENTAL. In user's first
-    # end-to-end test on the catalog, hinge trained to R²=0.70 (vs
-    # hybrid's 0.97) and cal_F1=0.583 (vs hybrid's 0.612), with
-    # supervised-only R² going NEGATIVE (-0.76). Whether this is a
-    # lambda_sup miscalibration, an under-training issue, or a
-    # structural regression on this data is unresolved. Do NOT adopt
-    # hinge as the default paper setup until there's A/B evidence it
-    # matches or beats hybrid on R² AND cal_F1.
-    #
-    # Frozen-decoder family (production):
-    # "hybrid"          = BCE selectivity + cosine direction alignment (default).
-    # "mse"             = MSE magnitude + cosine direction (Makelov-inspired).
-    # "bce"             = legacy BCE only, no decoder alignment.
-    #
-    # Experimental hinge-family (opt-in via --supervision <mode>):
-    # "hinge"           = ReLU + hinge on pre-activations, free decoder.
+    # Hinge-family (end-to-end training, no frozen decoder):
+    # "hinge"           = ReLU + hinge on pre-activations (default).
     # "hinge_jumprelu"  = JumpReLU + hinge on (z - θ), per-feature θ learnable.
     # "gated_bce"       = Two-path encoder (gate + magnitude), BCE on gate.
-    supervision_mode: str = "hybrid"
+    #
+    # Frozen-decoder family (for reproducing summary6/7 or A/B):
+    # "hybrid"          = BCE selectivity + cosine direction alignment.
+    # "mse"             = MSE magnitude + cosine direction (Makelov-inspired).
+    # "bce"             = legacy BCE only, no decoder alignment.
+    supervision_mode: str = "hinge"
     use_mse_supervision: bool = True    # DEPRECATED: use supervision_mode instead
     direction_loss_weight: float = 1.0  # α: decoder direction alignment (hybrid/mse)
     magnitude_loss_weight: float = 0.5  # β: activation magnitude alignment (mse only)
@@ -139,20 +131,32 @@ class Config:
     local_annotation_seq_chunk: int = 2
 
     # Positions to mask out at analysis time (starting from position 0).
-    # Position 0 in a transformer has degenerate attention (only self), no
-    # prior context, anomalous residual-stream magnitude/direction, and
-    # acts as an attention sink. Including it in supervised SAE analysis
-    # corrupts:
-    #   - target_dirs: sequence-level features collapse to the same
-    #     "position-0 vs rest" direction if many positives fall at pos 0.
-    #   - reconstruction + R²: dominated by the easy-to-reconstruct BOS
-    #     direction rather than the semantic content.
-    #   - promote-loop: the top-ΔR² U latents are often BOS detectors,
-    #     wasting a round on a causally-useless token.
-    # Standard mech-interp practice: mask position 0 from all analysis.
-    # Applied at load time (activations = activations[:, n:]); cached
-    # tensors don't need re-extraction.
-    mask_first_n_positions: int = 1
+    #
+    # DEFAULT: 0 (v8.11.3). Masking position 0 was added in v8.6 to fix
+    # the target_dir collapse where sequence-level features all
+    # converged to the same direction due to BOS dominating their
+    # positive sets. The side effect: position 0 in the residual stream
+    # has ~10× the variance of other positions (attention-sink behavior
+    # + no prior context), so masking it drops baseline_mse 10× and
+    # correspondingly drops reconstruction R² from ~0.97 to ~0.70 even
+    # though the SAE's absolute reconstruction is identical. That
+    # regression invalidates summary7's headline R² claim.
+    #
+    # Downstream BOS handling now routes through v8.10 infrastructure
+    # instead of masking:
+    #   - scaffold_catalog.json has `control.document_boundary` to name
+    #     the BOS token as a control feature (role="control"), so it's
+    #     trained but excluded from discovery-only paper stats.
+    #   - promote_denylist rejects descriptions naming BOS / endoftext /
+    #     padding before the crispness gate, so the discovery loop
+    #     never promotes BOS-detector U latents as headline features.
+    #   - evaluate reports discovery-only means alongside full-catalog
+    #     means so paper stats can cite the cleaner number.
+    #
+    # Set to 1 to restore the v8.6-v8.11.2 behavior (BOS mask on) if a
+    # specific analysis requires BOS-free data (e.g., promote_loop U
+    # ranking tends to produce BOS detectors without this).
+    mask_first_n_positions: int = 0
 
     # Maximum fraction of annotation chunks that may end up zero-labeled
     # (after max retries) before the run aborts. A few stragglers are

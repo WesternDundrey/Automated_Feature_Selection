@@ -4,6 +4,70 @@
 
 ---
 
+## [v8.11.3] — Root-cause the R² collapse: BOS masking, not the hinge loss
+
+**Date:** 2026-04-25
+
+### What actually happened
+
+v8.11.2 reverted `supervision_mode` default to `"hybrid"` based on the read that hinge had regressed. That read was wrong. Side-by-side comparison of the failed R²=0.70 run and the earlier R²=0.97 run:
+
+| | Earlier (R²=0.97) | This run (R²=0.70) |
+|---|---|---|
+| Val+test vector count | 12,800 (128 pos/seq — **un-masked**) | 12,700 (127 pos/seq — **masked**) |
+| SAE MSE | 3.24 | 3.31 |
+| Baseline MSE | 111 | 10.87 |
+| Pretrained SAE MSE | 1.69 | 1.69 |
+| R² formula | 1 − 3.24/111 = 0.971 | 1 − 3.31/10.87 = 0.696 |
+
+SAE absolute reconstruction MSE is essentially unchanged (3.24 → 3.31). The pretrained SAE's absolute MSE is identical (1.69 both runs). What collapsed is **baseline_mse**: position 0 in GPT-2's residual stream has ~10× the variance of other positions (attention-sink behavior, no prior context), so masking it drops the R² denominator by 10× and the reported R² drops accordingly — even though the SAE is reconstructing equally well.
+
+This was NOT caused by the hinge loss. It was `cfg.mask_first_n_positions = 1` (v8.6) being applied during evaluate. The R² regression is a measurement-frame artifact.
+
+User's instinct was correct: *"r^2 reconstruction collapse is something you did separate of the loss terms."*
+
+### Fix
+
+Two defaults flipped:
+
+1. `cfg.mask_first_n_positions`: `1` → `0`. Position 0 is IN the activations again. Baseline_mse and R² go back to summary7's scale (~0.97). BOS is handled post-eval via v8.10 machinery (scaffold `control.document_boundary`, `promote_denylist`, `role`-based discovery-only stats) rather than being masked out pre-eval.
+
+2. `cfg.supervision_mode`: `"hybrid"` (v8.11.2 revert) → `"hinge"`. Per user's direction: stick with the mentor's end-to-end design, now that we know R² wasn't the symptom of a loss problem.
+
+### Trade we're now taking on
+
+BOS in the data means the target_dir collapse problem from pre-v8.6 returns — features with heavy position-0 positive sets will have target_dirs dominated by the "position 0 vs rest" axis, and promote_loop's cosine gate sees 100+ feature pairs at cos > 0.8 in the existing catalog. v8.10's denylist + v8.8's decomposition path + the forthcoming scaffold catalog are the intended mitigations, not global masking.
+
+If promote_loop's U ranking starts returning mostly BOS detectors again, set `--promote-denylist-strict` or flip `mask_first_n_positions = 1` at the promote-loop stage specifically (we might want an asymmetric mask: unmask for train/eval R², mask for promote-loop U ranking — separate config knob to add if it matters in practice).
+
+### Expected behavior after `git pull`
+
+Run the standard pipeline end-to-end:
+
+```
+python -m pipeline.run \
+--layer 9 \
+--sae_id blocks.9.hook_resid_pre \
+--local-annotator \
+--n_sequences 1000 \
+--epochs 15
+```
+
+Eval log should show:
+- `Val: 12,800 vectors | Test: 12,800 vectors` (128 positions per seq; un-masked)
+- `Baseline (mean) MSE: ~111` (back to summary7 scale)
+- `R²: ~0.97` for `hinge` supervision (actually on par with hybrid now that we're measuring the same way)
+- `DECODER ↔ TARGET-DIR DIAGNOSTICS (supervision_mode=hinge)` with learned cosines — those will still NOT be 1.0 by construction (hinge free-decoder doesn't guarantee that), but now we can measure whether the hinge design is any worse than hybrid on R² without the measurement-frame artifact confounding the comparison.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/config.py` | `mask_first_n_positions` default `1` → `0`; `supervision_mode` default restored to `"hinge"` |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.11.2] — Revert default supervision_mode back to "hybrid"
 
 **Date:** 2026-04-25
