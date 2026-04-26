@@ -447,6 +447,23 @@ def _format_annotator_context(token_strs: list[str], target_pos: int) -> str:
     return "".join(parts)
 
 
+def _configure_vllm_runtime_env() -> None:
+    """Set conservative vLLM defaults for single-GPU local annotation.
+
+    Vast.ai images have repeatedly hung in vLLM V1 EngineCore before model
+    weight loading (parallel_state/NCCL init, ~1GB VRAM used). These defaults
+    are process-local, only apply if the user has not explicitly set an env
+    override, and are safe for the tensor_parallel_size=1 annotation path.
+    """
+    import os
+
+    os.environ.setdefault("VLLM_USE_V1", "0")
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+    os.environ.setdefault("NCCL_IB_DISABLE", "1")
+    os.environ.setdefault("NCCL_SHM_DISABLE", "1")
+
+
 def annotate_local(
     tokens: torch.Tensor,
     features: list[dict],
@@ -476,6 +493,7 @@ def annotate_local(
         all_token_strs.append(strs)
 
     try:
+        _configure_vllm_runtime_env()
         from vllm import LLM, SamplingParams
         if cfg.batch_positions:
             return _annotate_local_vllm_batch(
@@ -1132,6 +1150,82 @@ def propagate_group_labels(annotations: torch.Tensor, features: list[dict]) -> t
     return annotations
 
 
+def _annotate_local_subprocess(
+    tokens_or_path: torch.Tensor | Path,
+    features: list[dict],
+    cfg: Config,
+) -> torch.Tensor:
+    """Run local vLLM annotation in a fresh Python interpreter.
+
+    This is deliberately stronger than trying to keep the parent process
+    clean. Full pipeline runs may have already imported transformer-lens,
+    Delphi deps, or initialized CUDA during inventory. vLLM EngineCore is
+    brittle in that state on some vast.ai images, so local annotation gets
+    its own process and returns a saved tensor.
+    """
+    import os
+    import pickle
+    import subprocess
+    import sys
+    import tempfile
+    import copy
+
+    with tempfile.TemporaryDirectory(prefix="local_annotate_") as tmpdir:
+        tmp = Path(tmpdir)
+        cfg_path = tmp / "cfg.pkl"
+        features_path = tmp / "features.json"
+        child_tokens_path = tmp / "tokens.pt"
+        out_path = tmp / "annotations.pt"
+
+        cfg_child = copy.copy(cfg)
+        features_path.write_text(json.dumps(features))
+        if isinstance(tokens_or_path, torch.Tensor):
+            torch.save(tokens_or_path.cpu(), child_tokens_path)
+            # Mini-annotation callers pass token tensors. They should not
+            # read/write the main annotations_local_partial.pt checkpoint.
+            cfg_child.output_dir = tmp / "state"
+            cfg_child.output_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            child_tokens_path = Path(tokens_or_path)
+
+        with cfg_path.open("wb") as f:
+            pickle.dump(cfg_child, f)
+
+        script = f"""
+import json
+import pickle
+from pathlib import Path
+
+import torch
+from transformers import AutoTokenizer
+
+from pipeline.annotate import annotate_local
+
+with open({str(cfg_path)!r}, "rb") as f:
+    cfg = pickle.load(f)
+features = json.loads(Path({str(features_path)!r}).read_text())
+tokens = torch.load({str(child_tokens_path)!r}, weights_only=True)
+tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+
+annotations = annotate_local(tokens, features, tokenizer, cfg)
+torch.save(annotations, {str(out_path)!r})
+"""
+        env = os.environ.copy()
+        env.setdefault("VLLM_USE_V1", "0")
+        env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        env.setdefault("NCCL_P2P_DISABLE", "1")
+        env.setdefault("NCCL_IB_DISABLE", "1")
+        env.setdefault("NCCL_SHM_DISABLE", "1")
+        env["SUPSAE_LOCAL_ANNOTATION_SUBPROCESS"] = "1"
+        print("  Running local vLLM annotation in subprocess "
+              "(isolates vLLM EngineCore from parent CUDA/import state)...")
+        print("  vLLM subprocess env: "
+              f"VLLM_USE_V1={env.get('VLLM_USE_V1')}  "
+              f"VLLM_WORKER_MULTIPROC_METHOD={env.get('VLLM_WORKER_MULTIPROC_METHOD')}")
+        subprocess.run([sys.executable, "-c", script], check=True, env=env)
+        return torch.load(out_path, weights_only=True)
+
+
 # ── Main entry point ────────────────────────────────────────────────────────
 
 def run(cfg: Config = None):
@@ -1223,10 +1317,6 @@ if not cfg.activations_path.exists():
     tokens = torch.load(cfg.tokens_path, weights_only=True)
     print(f"Loading cached activations: {cfg.activations_path}")
     activations = torch.load(cfg.activations_path, weights_only=True)
-
-    # Get tokenizer without loading the full model onto GPU
-    from transformers import AutoTokenizer
-    tokenizer_ref = AutoTokenizer.from_pretrained(cfg.model_name)
 
     # Annotate (or load cached). The cache is validated against the current
     # catalog by FEATURE ID via the `annotations_meta.json` sidecar — this
@@ -1345,10 +1435,19 @@ if not cfg.activations_path.exists():
             f"(out of {len(leaf_features)} total leaves in current catalog)"
         )
         if cfg.use_local_annotator:
-            new_leaf_annotations = annotate_local(
-                tokens, new_leaf_features, tokenizer_ref, cfg,
-            )
+            if getattr(cfg, "local_annotation_subprocess", True):
+                new_leaf_annotations = _annotate_local_subprocess(
+                    cfg.tokens_path, new_leaf_features, cfg,
+                )
+            else:
+                from transformers import AutoTokenizer
+                tokenizer_ref = AutoTokenizer.from_pretrained(cfg.model_name)
+                new_leaf_annotations = annotate_local(
+                    tokens, new_leaf_features, tokenizer_ref, cfg,
+                )
         else:
+            from transformers import AutoTokenizer
+            tokenizer_ref = AutoTokenizer.from_pretrained(cfg.model_name)
             new_leaf_annotations = annotate_corpus(
                 tokens, new_leaf_features, tokenizer_ref, cfg,
             )

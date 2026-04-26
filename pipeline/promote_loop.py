@@ -728,14 +728,14 @@ def _mini_prefilter(
     tokens_sub = tokens[sampled_t]
     acts_sub = activations[sampled_t]
 
-    from .annotate import annotate_local, annotate_corpus
+    from .annotate import annotate_corpus, _annotate_local_subprocess
     print(
         f"  Mini-annotating {len(new_features)} candidates on {n_seqs} "
         f"randomly-sampled sequences "
         f"({'local vLLM' if cfg.use_local_annotator else 'API'})..."
     )
     if cfg.use_local_annotator:
-        mini_labels = annotate_local(tokens_sub, new_features, tokenizer, cfg)
+        mini_labels = _annotate_local_subprocess(tokens_sub, new_features, cfg)
     else:
         mini_labels = annotate_corpus(tokens_sub, new_features, tokenizer, cfg)
     # mini_labels: (n_seqs, T, len(new_features))
@@ -1488,10 +1488,10 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
 
                 print(f"  mini-annotating {len(atom_as_feats)} atoms on "
                       f"{n_seqs} sequences (for atom target_dirs)...")
-                from .annotate import annotate_local, annotate_corpus
+                from .annotate import annotate_corpus, _annotate_local_subprocess
                 if cfg.use_local_annotator:
-                    atom_labels = annotate_local(
-                        mini_tokens, atom_as_feats, decompose_tokenizer, cfg,
+                    atom_labels = _annotate_local_subprocess(
+                        mini_tokens, atom_as_feats, cfg,
                     )
                 else:
                     atom_labels = annotate_corpus(

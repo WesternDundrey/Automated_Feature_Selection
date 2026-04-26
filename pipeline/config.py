@@ -143,6 +143,10 @@ class Config:
     local_annotator_model: str = "Qwen/Qwen3-4B-Base"  # base model, no thinking, pure transformer
     local_annotation_batch_size: int = 64
     batch_positions: bool = False  # True = full-sequence JSON, False = per-token
+    # Run local vLLM annotation in a fresh Python process. This is more
+    # robust than trying to keep the parent process CUDA-clean after
+    # inventory / Delphi / transformer-lens work.
+    local_annotation_subprocess: bool = True
     # Full description is the safer default: F-index mode ("F3? ") has
     # hardcoded few-shot exemplars in annotate.py that assume F0=comma and
     # F5=capitalized, which breaks for any catalog that doesn't match those
