@@ -11,14 +11,16 @@ The on-start script clones the repo and downloads Qwen3-4B-Base.
 
 ### Install Dependencies
 
-**Do NOT reinstall torch, vllm, or numpy.** The vast.ai PyTorch CUDA 13.x image ships with Blackwell-custom builds of these. They are NOT on PyPI. Replacing them with PyPI builds (e.g., via `pip install --force-reinstall vllm`) silently breaks Blackwell support — vLLM's EngineCore subprocess hangs during cold start, before model load.
+**Do NOT reinstall torch or numpy.** The vast.ai PyTorch CUDA 13.x image ships with Blackwell-compatible builds of those. vLLM IS reinstalled from PyPI (compartment 3 of the install) because the lens packages create a dep-version mismatch that `--force-reinstall vllm` resolves cleanly.
 
 ```bash
 cd /workspace/Automated_Feature_Selection
 
-# One command does it all — install.sh installs the whole pipeline +
-# Delphi (clones + pip install -e) + uninstalls torchcodec, all
-# WITHOUT touching the pre-installed vllm/torch/numpy.
+# One command — runs all three install compartments in order:
+#   1. --no-deps sae-lens transformer-lens     (skip their numpy<2 pin)
+#   2. pipeline + Delphi runtime deps
+#   3. --force-reinstall vllm                  (resolves the lens mismatch)
+# Plus clones Delphi, pip install -e it, uninstalls torchcodec.
 bash install.sh
 
 # API key for Sonnet (feature inventory + Delphi judge).
@@ -29,17 +31,7 @@ export OPENROUTER_API_KEY="sk-or-..."
 
 ### Verifying the install
 
-`install.sh` prints a verification table at the end:
-
-```
-  vllm                      0.19.x        ← from /venv/main/... (pre-installed)
-  delphi.scorers...         OK
-  faiss-cpu                 1.x
-  ...
-  vllm location:            /venv/main/lib/python3.12/site-packages/vllm
-```
-
-Confirm `vllm location:` points to the system venv (`/venv/main/...`), NOT a user-site location like `/root/.local/...`. If it's the latter, you've clobbered the Blackwell-custom build — fix with `pip uninstall vllm` (uninstalls only the user-site copy, exposes the pre-installed one beneath).
+`install.sh` prints a verification table at the end. All ten lines should show a version (no FAILED). If any module shows FAILED, paste the line and we'll fix that single dep.
 
 ## Quick Test (Manual Catalog)
 

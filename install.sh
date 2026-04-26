@@ -3,33 +3,30 @@
 # Usage: bash install.sh
 #
 # ============================================================
-# CRITICAL — DO NOT REINSTALL torch / vllm / numpy.
-# ============================================================
-# Blackwell GPUs (5090, etc.) ship with custom CUDA 13.x builds
-# baked into the vast.ai PyTorch image. Those builds are NOT on
-# PyPI. Reinstalling vllm from PyPI silently replaces the
-# Blackwell-custom build with a generic build that lacks the
-# right kernels — manifests as EngineCore subprocess hanging
-# at cold-start (after parallel-state init, before model load).
+# THREE COMPARTMENTS (per the project's durable install rule):
+#   1. --no-deps sae-lens transformer-lens   (skip their numpy<2 pin)
+#   2. all the real deps from requirements.txt
+#   3. --force-reinstall vllm                 (because compartment 1
+#      and 2 leave the env in a state where vllm needs a clean
+#      reinstall to resolve cleanly — don't optimize this away)
 #
-# History: v8.15 added orjson/blobfile/httpx to requirements.txt
-# for Delphi. That edit is fine on its own, but a careless
-# `pip install --force-reinstall vllm` in install instructions
-# afterward tripped this exact bug. install.sh now adds Delphi
-# deps directly so users never need to bypass requirements.txt
-# or touch vllm.
+# torch and numpy are NOT touched: vast.ai's PyTorch CUDA 13.x image
+# ships them pre-built for Blackwell. Replacing them breaks the GPU.
+# vllm IS reinstalled from PyPI because there's a numpy/dep mismatch
+# between the lens packages and vllm that only --force-reinstall
+# resolves cleanly.
 # ============================================================
 set -e
 
-echo "=== Installing pipeline dependencies ==="
-echo "  (preserving pre-installed torch, vllm, numpy)"
-
-# sae-lens and transformer-lens with --no-deps to skip their numpy<2 pin
+echo "=== Compartment 1: sae-lens + transformer-lens (--no-deps) ==="
 pip install --no-deps sae-lens transformer-lens
 
-# All their real dependencies (minus torch/numpy/vllm which are pre-installed).
-# Bundled with the v8.15-v8.18.6 Delphi runtime deps so a single bash
-# install.sh covers the whole pipeline including --step delphi-score.
+echo ""
+echo "=== Compartment 2: pipeline deps (incl. Delphi runtime deps) ==="
+# All their real dependencies (minus torch/numpy/vllm).
+# Bundled with the v8.15-v8.18.6 Delphi runtime deps so a single
+# bash install.sh covers the whole pipeline including
+# --step delphi-score.
 pip install \
     datasets \
     huggingface-hub \
@@ -71,6 +68,10 @@ pip install \
     eai-sparsify \
     bitsandbytes
 
+echo ""
+echo "=== Compartment 3: vllm (--force-reinstall) ==="
+pip install --force-reinstall vllm
+
 # Recurring vast.ai gotcha: torchcodec gets dragged in by some
 # transformers/datasets module and tries to dlopen libavutil.so.56
 # at import time. If the image doesn't have FFmpeg 4 system libs,
@@ -91,10 +92,10 @@ if [ ! -d "$DELPHI_DIR" ]; then
     git clone https://github.com/EleutherAI/delphi.git "$DELPHI_DIR"
 fi
 echo ""
-echo "=== Installing Delphi as editable package (its pyproject.toml fills any dep gaps) ==="
+echo "=== Installing Delphi as editable package ==="
 pip install -e "$DELPHI_DIR"
 
-# Verify — both that imports work AND that we did NOT clobber vllm.
+# Verify
 echo ""
 echo "=== Verifying ==="
 python -c "
@@ -123,13 +124,6 @@ for mod, name in [
 import torch, numpy as np
 print(f'  torch CUDA:               {torch.version.cuda}')
 print(f'  numpy:                    {np.__version__}')
-
-# Sanity check that vllm is the BLACKWELL-CUSTOM build, not a clobbered
-# PyPI install. Pre-installed builds typically live under /venv/main/
-# or similar; PyPI builds usually live under /usr/local/lib/python*/.
-# Heuristic: print the install location so the user can compare.
-import vllm, os
-print(f'  vllm location:            {os.path.dirname(vllm.__file__)}')
 
 if not ok:
     sys.exit(1)
