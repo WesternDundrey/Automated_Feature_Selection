@@ -317,6 +317,47 @@ def _build_record_from_top_activations(
     if len(nonact_examples) < max(2, n_not_active // 2):
         return None
 
+    # v8.18.2 hotfix: every LatentRecord must produce EXACTLY
+    # n_test + n_mid_tier + n_not_active samples so the scorer's
+    # batch size matches predictions count. If mid-tier sampling fell
+    # short (rare latents whose nonzero-activation distribution is
+    # narrow, so the 25-75 percentile band is empty), pad with extra
+    # non-active examples to keep the total constant.
+    target_total = n_test + n_mid + n_not_active
+    actual_total = len(activating_examples) + len(nonact_examples)
+    if actual_total < target_total:
+        # Pad with extra random non-active positions so the batch
+        # arithmetic in DetectionScorer.classifier is always exact.
+        needed = target_total - actual_total
+        # Reuse zero-activation pool, sample additional indices.
+        leftover_zero = np.setdiff1d(flat_zero_idx, chosen, assume_unique=False)
+        if len(leftover_zero) >= needed:
+            extra = rng.choice(leftover_zero, size=needed, replace=False)
+        elif len(leftover_zero) > 0:
+            extra = rng.choice(leftover_zero, size=needed, replace=True)
+        else:
+            # No extra zeros — drop the record. Caller treats as no-data.
+            return None
+        for flat_pos in extra:
+            n = int(flat_pos // T)
+            t = int(flat_pos % T)
+            start = max(0, t - half)
+            end = min(T, start + window_len)
+            start = max(0, end - window_len)
+            ctx = full_tokens[n, start:end]
+            if ctx.shape[0] < 2:
+                continue
+            try:
+                str_tokens_pad = [tokenizer.decode([int(x)]) for x in ctx.tolist()]
+            except Exception:
+                str_tokens_pad = [str(int(x)) for x in ctx.tolist()]
+            nonact_examples.append(NonActivatingExample(
+                tokens=ctx.long(),
+                activations=torch.zeros(ctx.shape[0], dtype=torch.float32),
+                str_tokens=str_tokens_pad,
+                distance=0.0,
+            ))
+
     record = LatentRecord(
         latent=Latent(
             module_name="supsae_u",
