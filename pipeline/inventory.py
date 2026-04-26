@@ -29,6 +29,50 @@ from tqdm.auto import tqdm
 from .config import Config
 
 
+def _extract_activations_subprocess(cfg) -> None:
+    """Extract tokens.pt + activations.pt in a fresh Python subprocess so
+    no CUDA context bleeds into this parent process. Mirrors the pattern
+    annotate.py uses (see its `extract_script` block) — keeps the parent
+    GPU-pristine for vLLM cold-start.
+
+    v8.18.11: introduced because v8.17's in-parent extraction during the
+    Delphi gate caused vLLM to hang at parallel_state init in the
+    downstream annotate step (parent CUDA context was dirty from the
+    HookedTransformer forward passes that produced activations.pt).
+    """
+    extract_script = f"""
+import torch
+from pipeline.annotate import prepare_corpus, extract_activations
+from pipeline.inventory import load_target_model
+from pipeline.config import Config
+
+cfg = Config(
+    model_name={cfg.model_name!r}, device={cfg.device!r},
+    model_dtype={cfg.model_dtype!r}, n_sequences={cfg.n_sequences},
+    seq_len={cfg.seq_len}, corpus_batch_size={cfg.corpus_batch_size},
+    target_layer={cfg.target_layer}, output_dir={str(cfg.output_dir)!r},
+    hook_point={cfg.hook_point!r},
+    sae_release={cfg.sae_release!r}, sae_id={cfg.sae_id!r},
+)
+cfg.output_dir.mkdir(parents=True, exist_ok=True)
+model = load_target_model(cfg)
+from pipeline.cache_meta import write_cache_meta
+
+if not cfg.tokens_path.exists():
+    toks = prepare_corpus(model, cfg)
+    torch.save(toks, cfg.tokens_path)
+    write_cache_meta(cfg.tokens_path, "tokens", cfg)
+else:
+    toks = torch.load(cfg.tokens_path, weights_only=True)
+
+if not cfg.activations_path.exists():
+    acts = extract_activations(model, toks, cfg)
+    torch.save(acts, cfg.activations_path)
+    write_cache_meta(cfg.activations_path, "activations", cfg)
+"""
+    subprocess.run([sys.executable, "-c", extract_script], check=True)
+
+
 def _run_delphi_gate_subprocess(mode: str, payload: dict, cfg) -> tuple:
     """Run a Delphi gate in a fresh Python subprocess so its imports
     (faiss, sentence_transformers, bitsandbytes, vllm via Delphi's
@@ -869,24 +913,26 @@ def run(cfg: Config = None):
     if getattr(cfg, "delphi_gate_in_inventory", True):
         try:
             # We need raw activations.pt; if it isn't there yet (first
-            # inventory run before annotation), extract it now in this
-            # process (still safe — no Delphi imports).
+            # inventory run before annotation), extract it via SUBPROCESS
+            # so the parent-process CUDA context stays clean for the
+            # downstream vLLM annotator.
+            #
+            # v8.18.11 root-cause fix: pre-fix this block did the extract
+            # IN THE PARENT process (HookedTransformer forward passes,
+            # heavy CUDA work). After inventory finished, activations.pt
+            # existed, so --step annotate's own activation-extraction
+            # subprocess (added specifically to "isolate CUDA context"
+            # before vLLM startup) was SKIPPED — and vLLM inherited the
+            # parent's polluted CUDA context. Cold-start hang at
+            # parallel_state init followed. By running extraction in a
+            # subprocess here too, the parent never holds a CUDA context
+            # at all. Activation extraction takes ~2s + model load on a
+            # 5090 — minor cost vs. the cold-start hang it prevents.
             if not cfg.activations_path.exists():
                 print(f"  [delphi-gate inventory] activations.pt not "
                       f"found at {cfg.activations_path}; extracting "
-                      f"so the gate can sample non-activating positions.")
-                from .annotate import prepare_corpus, extract_activations
-                if not cfg.tokens_path.exists():
-                    toks = prepare_corpus(model, cfg)
-                    torch.save(toks, cfg.tokens_path)
-                    from .cache_meta import write_cache_meta
-                    write_cache_meta(cfg.tokens_path, "tokens", cfg)
-                else:
-                    toks = torch.load(cfg.tokens_path, weights_only=True)
-                acts_extracted = extract_activations(model, toks, cfg)
-                torch.save(acts_extracted, cfg.activations_path)
-                from .cache_meta import write_cache_meta
-                write_cache_meta(cfg.activations_path, "activations", cfg)
+                      f"in subprocess so vLLM cold-start stays clean.")
+                _extract_activations_subprocess(cfg)
 
             # Run the Delphi gate in a subprocess.
             kept_descs, score_log = _run_delphi_gate_subprocess(
