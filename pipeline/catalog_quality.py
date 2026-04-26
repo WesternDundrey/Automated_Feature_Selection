@@ -31,12 +31,21 @@ import re
 from pathlib import Path
 from typing import Optional
 
-# Hard-fail phrases — only the genuinely vague / non-operational ones.
+# Hard-fail phrases — only the genuinely vague / non-operational ones,
+# plus context-level predicates that have no token-level answer.
+#
 # Per the user's note, "may be" / "might be" / "can be either" are
 # valid hedges for surface variants ("Token can be opening or closing
-# quotation mark"); those go to the soft-flag → LLM crispness path
-# instead of auto-quarantine.
+# quotation mark"); those go to the soft-flag → LLM crispness path.
+#
+# v8.18.22: added context-level guards — the SAE annotates one token
+# at a time, so descriptions whose predicate is the text / sentence /
+# paragraph / context / document / topic / register / genre / domain
+# can't be answered token-locally. Every token in a "political
+# article" would fire, including 'the' and 'of' — that's not a
+# feature, it's a document classifier.
 _HARD_FAIL_PATTERNS = [
+    # Operationally-undefined / vague.
     re.compile(r"\bsometimes\b", re.IGNORECASE),
     re.compile(r"\bvarious\b", re.IGNORECASE),
     re.compile(r"\bin general\b", re.IGNORECASE),
@@ -49,6 +58,22 @@ _HARD_FAIL_PATTERNS = [
     re.compile(r"\bfor example\b", re.IGNORECASE),
     re.compile(r"\bincluding\b", re.IGNORECASE),
     re.compile(r"\betc\.", re.IGNORECASE),
+    # Context-level predicate (subject is text/sentence/etc., not token).
+    # Article is optional because descriptions sometimes start sentence-
+    # initial with the subject ("Text presents an argument..." with no
+    # "the").
+    re.compile(
+        r"(?:^|\b)(?:(?:the|this|a)\s+)?"
+        r"(?:text|sentence|paragraph|passage|context|document|article|discourse|register)"
+        r"\s+(?:is|are|presents|discusses|describes|contains|gives|introduces|provides|involves|expresses|refers to)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bcontext (?:is|belongs to|consists of|involves|contains|describes)\b", re.IGNORECASE),
+    re.compile(r"\btext (?:about|discussing|presenting|describing|involving|introducing|covering)\b", re.IGNORECASE),
+    re.compile(r"\b(?:topic|subject|theme|register|genre) of\b", re.IGNORECASE),
+    re.compile(r"\b(?:semantic|text)[_ -]?(?:domain|register|genre)\b", re.IGNORECASE),
+    re.compile(r"\bdiscourse[_ -]?function\b", re.IGNORECASE),
+    re.compile(r"\b(?:formal|informal|conversational|argumentative|expository|scientific|technical)\s+(?:text|prose|register|writing|tone)\b", re.IGNORECASE),
 ]
 
 # Soft-flag patterns. Trigger a Sonnet crispness call (which may pass

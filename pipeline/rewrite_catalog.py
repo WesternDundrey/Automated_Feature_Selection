@@ -162,12 +162,29 @@ _PROMPT_TEMPLATE = textwrap.dedent("""\
     said this feature fires; the target token is **bolded**):
     {positives}
 
+    STRICT TOKEN-LEVEL CONSTRAINT:
+
+    The description must be a YES/NO question about ONE specific
+    token. The SAE annotates one token at a time. Predicate is the
+    TOKEN, never the text/sentence/paragraph/context/document/
+    topic/register/genre/domain. Reformulate as a token-local
+    property or skip.
+
+    REJECT (predicate is wrong unit):
+      - "Text is about politics"
+      - "Sentence is in past tense"
+      - "Context belongs to news"
+      - "Register is informal"
+    ACCEPT (predicate is the token):
+      - "Token is the comma immediately after a person's surname"
+      - "Token is the verb in a quote-attribution clause"
+
     YOUR JOB — produce all four:
 
     1. ATOMIC DESCRIPTION. One sentence. Names a single
        operationally-testable property of ONE token. No "or" / "and" /
-       "sometimes". Specifies WHEN the feature fires (what token, in
-       what context).
+       "sometimes". No "the text/sentence/context [verb]" structures.
+       Specifies WHEN the feature fires (what token, in what context).
 
     2. POSITIVE EXAMPLES. 3-5 short phrases (5-10 words each) with
        the target token in **bold**. Each must clearly match the atomic

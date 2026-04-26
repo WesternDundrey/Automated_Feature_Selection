@@ -653,11 +653,24 @@ def explain_features(top_activations: dict, tokenizer, cfg: Config) -> dict:
             "The token with highest activation is marked with <<token>>. "
             "The number in parentheses is the activation strength.\n\n"
             "For EACH latent, write a precise 1-2 sentence description of what "
-            "the latent detects. The description must be operationally testable: "
-            "someone should be able to read a token in context and decide yes/no "
-            "whether this feature should fire on that token.\n\n"
+            "the latent detects. The description must be a TOKEN-LEVEL "
+            "property — a yes/no question a reader can answer for ONE specific "
+            "token (using surrounding context as evidence about THAT token).\n\n"
+            "STRICTLY FORBIDDEN: descriptions whose predicate is the text, "
+            "the sentence, the paragraph, the context, the document, the "
+            "article, the passage, the topic, the register, the genre, or "
+            "the domain. Those are NOT token-level — the SAE annotates one "
+            "token at a time, so 'Text is about politics' has no token-level "
+            "answer (every token in a political article would fire, "
+            "including 'the' and 'of'). Reformulate as a token-local property "
+            "or skip the latent.\n\n"
+            "ALLOWED: descriptions that use surrounding context as EVIDENCE "
+            "about a specific token, like 'Token is a comma immediately "
+            "after a quoted name' or 'Token is the verb in a quote-attribution "
+            "clause'. Predicate is still the token.\n\n"
             "Do NOT say 'this latent detects...'. Just state what the feature is, "
-            "e.g., 'Token is a color adjective modifying a noun.'\n\n"
+            "starting with 'Token is...' or 'Token immediately follows...' or "
+            "'Token is the X in Y'.\n\n"
             "Reply in this exact format (one per line, no blank lines):\n"
             "LATENT <idx>: <description>\n\n"
             "Here are the latents:\n"
@@ -740,16 +753,47 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
         INITIAL DESCRIPTIONS:
         {desc_lines}
 
+        STRICT TOKEN-LEVEL CONSTRAINT:
+
+        Every leaf description must be a YES/NO QUESTION ABOUT ONE
+        SPECIFIC TOKEN, using surrounding context as evidence about
+        THAT token. The SAE annotates one token at a time. A feature
+        whose predicate is the text/sentence/paragraph/context/
+        document/topic/register/genre/domain HAS NO TOKEN-LEVEL
+        ANSWER and must be excluded.
+
+        REJECT (predicate is wrong unit, not a token):
+          - "Text is about politics"            (predicate = text)
+          - "Sentence is in past tense"         (predicate = sentence)
+          - "Context belongs to scientific..."  (predicate = context)
+          - "Document discusses healthcare"     (predicate = document)
+          - "register / genre / domain of X"    (predicate = register)
+          - "text_register.informal_web"        (predicate = register)
+          - "semantic_domain.politics"          (predicate = context)
+          - "Text presents an argument"         (predicate = text)
+
+        ACCEPT (predicate is THIS token, context is evidence):
+          - "Token is a comma in a list separator"
+          - "Token is the verb in a quote-attribution clause"
+          - "Token immediately follows a person's surname in a byline"
+          - "Token is a capitalized first word of a sentence"
+          - "Token is 'said' or 'told' in a news quote attribution"
+
         STRUCTURE RULES:
 
         Use CATEGORICAL groups where features are natural alternatives:
           punctuation_type: comma, period, question_mark (a token is one or none)
-          semantic_domain: politics, sports, science (context belongs to one)
-        These are mutually exclusive by nature — don't force it.
+          part_of_speech: noun, verb, adjective (a token has one POS)
 
         Use NON-EXCLUSIVE groups where features genuinely co-occur:
           token_properties: capitalized, numeric, multi_word (a token can be all)
-          text_features: contains_quote, contains_name, past_tense (co-occur freely)
+          token_role: list_separator, quote_attribution, byline_position
+            (a token can serve multiple structural roles)
+
+        DO NOT create groups whose values are context-level
+        (semantic_domain, text_register, discourse_function,
+        text_features). Those have no token-level interpretation
+        and the SAE will fail to learn them cleanly.
 
         The key rule: each feature must have a DISTINGUISHABLE activation pattern.
         Two features that always co-occur on the same tokens are redundant — merge
@@ -768,9 +812,11 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
         Each leaf should fire on at least 1 in 200 tokens in diverse web text.
 
         YOUR TASKS:
-        1. IDENTIFY broad feature dimensions from the descriptions. Use categorical
-           groups where natural (punctuation type, part of speech, semantic domain).
-           Use non-exclusive groups where features genuinely co-occur.
+        1. IDENTIFY broad feature dimensions from the descriptions. Token-
+           level dimensions only: punctuation type, part of speech, token
+           form, token role, named-entity head token. NO semantic_domain,
+           NO text_register, NO discourse_function as context-level
+           categories.
         2. For each group, pick 3-8 BROAD leaves drawn FROM THE INPUT
            DESCRIPTIONS — do NOT invent leaves with no source. Every leaf
            must trace back to one or more `latent_<id>` from the input
