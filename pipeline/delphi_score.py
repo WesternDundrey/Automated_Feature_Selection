@@ -452,7 +452,13 @@ def score_descriptions(
     scorer = DetectionScorer(
         client=client,
         verbose=False,
-        n_examples_shown=n_test + n_not_active,
+        # v8.18.1 hotfix: include n_mid_tier in the batch size. Otherwise
+        # records have (n_test + n_mid + n_not_active) samples but Delphi
+        # batches at (n_test + n_not_active), leaving a remainder batch
+        # whose len(predictions) doesn't match self.n_examples_shown,
+        # tripping the assertion at delphi/scorers/classifier/classifier.py:147
+        # ("Parsing selections failed: AssertionError()") for every record.
+        n_examples_shown=n_test + n_mid_tier + n_not_active,
         log_prob=False,
         temperature=0.0,
     )
