@@ -86,9 +86,15 @@ def _bootstrap_delphi() -> bool:
         return _DELPHI_AVAILABLE
 
     repo_root = Path(__file__).parent.parent
+    # Accept a handful of natural clone targets so users don't need to
+    # remember a specific directory name. The first one with a valid
+    # delphi/__init__.py wins. Order: most-specific custom names first,
+    # then generic `delphi/`, then the agents-for-interp fork.
     candidates = [
-        repo_root / "agentic-delphi",
         repo_root / "delphi-eleutherai",
+        repo_root / "delphi",
+        repo_root / "EleutherAI" / "delphi",
+        repo_root / "agentic-delphi",
         repo_root / "agentic-delphi-correct" / "agentic-delphi",
     ]
     delphi_root = None
@@ -100,10 +106,11 @@ def _bootstrap_delphi() -> bool:
     if delphi_root is None:
         _DELPHI_AVAILABLE = False
         _DELPHI_IMPORT_ERROR = (
-            f"No Delphi checkout found under {repo_root}. Expected one of: "
-            f"{[str(c) for c in candidates]}. Clone "
-            f"github.com/EleutherAI/delphi or "
-            f"github.com/agents-for-interp/agentic-delphi into the repo root."
+            f"No Delphi checkout found under {repo_root}. Tried: "
+            f"{[str(c.relative_to(repo_root)) for c in candidates]}. "
+            f"Clone github.com/EleutherAI/delphi to one of those paths "
+            f"(e.g., `git clone https://github.com/EleutherAI/delphi.git "
+            f"delphi-eleutherai`) into the repo root."
         )
         return False
 
