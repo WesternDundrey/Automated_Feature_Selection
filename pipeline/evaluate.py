@@ -265,6 +265,48 @@ def evaluate(cfg: Config = None):
     print(f"  Supervised-only R²:     {r2_no_unsup:.4f}")
     print(f"  Unsupervised-only R²:   {r2_no_sup:.4f}")
 
+    # Per-feature ΔR²: ablate each supervised latent individually and
+    # measure how much its absence hurts reconstruction. If most features
+    # contribute < 0.001 R², their decoder columns are unconstrained by
+    # reconstruction, which explains why end-to-end training lets cosines
+    # drift away from target_dirs (no reconstruction pressure to align).
+    print(f"\n  PER-FEATURE ΔR² (supervised slice — diagnoses why decoder cosines drift)")
+    print(f"  {'Feature':<40}    {'ΔR²':>8} {'rank':>5}")
+    print(f"  {'-' * 40}    {'-' * 8} {'-' * 5}")
+    per_feature_delta_r2: list[tuple[str, float]] = []
+    with torch.no_grad():
+        for k in range(sae.n_supervised):
+            recon_no_k_parts = []
+            for i in range(0, all_acts.shape[0], cfg.batch_size):
+                a = all_acts[i : i + cfg.batch_size].clone().to(cfg.device)
+                a[:, k] = 0
+                recon_no_k_parts.append(sae.decoder(a).cpu())
+            recon_no_k = torch.cat(recon_no_k_parts)
+            mse_no_k = F.mse_loss(recon_no_k, x_test).item()
+            r2_no_k = 1.0 - mse_no_k / baseline_mse
+            delta_k = r2 - r2_no_k
+            fid = features[k].get("id", f"feat_{k}") if k < len(features) else f"feat_{k}"
+            per_feature_delta_r2.append((fid, float(delta_k)))
+
+    # Sort descending by ΔR² and print top 10 + bottom 10
+    sorted_drs = sorted(per_feature_delta_r2, key=lambda kv: -kv[1])
+    print(f"  Top 10 most-reconstructing features:")
+    for rank, (fid, dr) in enumerate(sorted_drs[:10], start=1):
+        print(f"  {fid:<40}    {dr:>+8.5f} {rank:>5}")
+    print(f"  Bottom 10 least-reconstructing features:")
+    for rank, (fid, dr) in enumerate(sorted_drs[-10:][::-1], start=len(sorted_drs) - 9):
+        print(f"  {fid:<40}    {dr:>+8.5f} {rank:>5}")
+    n_above_001 = sum(1 for _, dr in sorted_drs if dr >= 0.001)
+    n_above_01 = sum(1 for _, dr in sorted_drs if dr >= 0.01)
+    mean_dr = (
+        sum(dr for _, dr in sorted_drs) / len(sorted_drs)
+        if sorted_drs else 0.0
+    )
+    print(f"  features with ΔR² >= 0.01:   {n_above_01}/{len(sorted_drs)}")
+    print(f"  features with ΔR² >= 0.001:  {n_above_001}/{len(sorted_drs)}")
+    print(f"  mean per-feature ΔR²:        {mean_dr:.5f}")
+    print(f"  Verdict: {'most decoder columns are reconstruction-relevant' if n_above_001 > len(sorted_drs) * 0.5 else 'most decoder columns are reconstruction-irrelevant — cosines drift because no reconstruction pressure to align them with target_dirs'}")
+
     # Magnitude correlation: at positive positions, does sup_acts[k] correlate
     # with x @ target_dir[k]? High correlation = reconstruction already
     # supervises activation magnitude without an explicit loss term.
@@ -950,6 +992,15 @@ def evaluate(cfg: Config = None):
             "delta_r2_supervised": round(delta_r2_sup, 4),
             "delta_r2_unsupervised": round(delta_r2_unsup, 4),
             "magnitude_correlation": round(mag_corr, 4) if mag_corr is not None else None,
+            "per_feature_delta_r2": {
+                fid: round(dr, 5) for fid, dr in per_feature_delta_r2
+            },
+            "per_feature_delta_r2_summary": {
+                "n_above_001":  n_above_001,
+                "n_above_01":   n_above_01,
+                "n_total":      len(per_feature_delta_r2),
+                "mean":         round(mean_dr, 5),
+            },
         },
         "sparsity": {
             "l0_supervised": l0_supervised,
