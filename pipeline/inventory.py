@@ -948,6 +948,21 @@ def run(cfg: Config = None):
                 cfg=cfg,
             )
 
+            # v8.18.15 visibility: surface subprocess skip mode in the parent
+            # log. Pre-fix the subprocess could fail-open (Delphi unavailable,
+            # missing API key) and the parent silently passed all
+            # descriptions through with no log message — user couldn't tell
+            # the gate had been bypassed.
+            if isinstance(score_log, dict):
+                gate_mode = score_log.get("_gate_mode")
+                if gate_mode == "skipped":
+                    skip_reason = score_log.get("_skip_reason", "unknown")
+                    print(f"  [delphi-gate inventory] SUBPROCESS RAN BUT "
+                          f"GATE SKIPPED — reason={skip_reason}. All "
+                          f"{len(descriptions)} descriptions passed "
+                          f"through unfiltered. To fix, ensure Delphi is "
+                          f"importable: pip install -e ./delphi-eleutherai/")
+
             cfg.output_dir.joinpath("delphi_scores_inventory.json").write_text(
                 json.dumps({
                     "threshold": getattr(cfg, "delphi_score_threshold", 0.7),
@@ -993,6 +1008,13 @@ def run(cfg: Config = None):
                     },
                     cfg=cfg,
                 )
+                if isinstance(organized_score_log, dict):
+                    gate_mode = organized_score_log.get("_gate_mode")
+                    if gate_mode == "skipped":
+                        skip_reason = organized_score_log.get("_skip_reason", "unknown")
+                        print(f"  [delphi-gate organized] SUBPROCESS RAN BUT "
+                              f"GATE SKIPPED — reason={skip_reason}. Catalog "
+                              f"unfiltered. Fix: pip install -e ./delphi-eleutherai/")
                 cfg.output_dir.joinpath("delphi_scores_organized.json").write_text(
                     json.dumps(organized_score_log, indent=2)
                 )
