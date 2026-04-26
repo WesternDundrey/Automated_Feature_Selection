@@ -740,12 +740,21 @@ def _annotate_local_vllm_pertoken(
     gc.collect()
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
+    # v8.18.3 hotfix: enforce_eager=True. Without it, vLLM silently
+    # compiles CUDA graphs at cold start (max_cudagraph_capture_size=512
+    # default → ~512 graph variants), which on vast.ai's newer vLLM
+    # builds takes 15-25 minutes silently between parallel-state init
+    # and the first annotation log line. The throughput cost in eager
+    # mode is ~10-20% per token; the cold-start savings are >20×.
+    # Override with --no-enforce-eager-vllm if you want graph
+    # compilation back.
     llm = LLM(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=computed_max_len,
         gpu_memory_utilization=0.80,
+        enforce_eager=getattr(cfg, "vllm_enforce_eager", True),
     )
     # Base model: no thinking, no chat template. Just completes text.
     # allowed_token_ids forces "0" or "1" — safe on base models.
@@ -890,6 +899,7 @@ def _annotate_local_vllm_batch(
         dtype="auto",
         enable_prefix_caching=True,
         max_model_len=2048,
+        enforce_eager=getattr(cfg, "vllm_enforce_eager", True),
     )
     # Generous output for JSON with position lists
     max_out = max(500, n_features * 30)

@@ -229,6 +229,12 @@ class Config:
     # tests recall, not just peak-case precision. Setting to 0 reverts
     # to peak-only behavior.
     delphi_n_mid_tier: int = 3
+    # v8.18.3: skip vLLM CUDA-graph compilation on cold start.
+    # Cold-start speedup: ~20× (15-25 min → ~1 min) at the cost of
+    # ~10-20% per-token throughput. Worth it for one-shot annotation
+    # runs on small corpora; flip to False for production-scale runs
+    # where total wall-clock dominates cold-start.
+    vllm_enforce_eager: bool = True
     # v8.17: whether `--step inventory` runs the Delphi gate between
     # description generation and organize_hierarchy. Default-on. Set
     # to False (or pass --no-delphi-gate-inventory at the CLI) to
