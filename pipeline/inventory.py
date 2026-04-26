@@ -548,8 +548,16 @@ def explain_features(top_activations: dict, tokenizer, cfg: Config) -> dict:
             "Here are the latents:\n"
         ]
 
+        # v8.16 (audit fix #3): the describer sees only the first
+        # `top_k_examples - delphi_held_out_n` examples; the remaining
+        # `delphi_held_out_n` are reserved for the Delphi detection gate
+        # so its scoring is genuinely held-out. With defaults (top_k=30,
+        # held_out=10), Sonnet sees 20 — same as it always did pre-v8.16
+        # — and 10 fresh examples are reserved for scoring.
+        n_held_out = int(getattr(cfg, "delphi_held_out_n", 0))
+        n_for_describer = max(1, cfg.top_k_examples - n_held_out)
         for lat_idx in batch:
-            examples = top_activations[lat_idx][:cfg.top_k_examples]
+            examples = top_activations[lat_idx][:n_for_describer]
             examples_str = format_examples_for_prompt(examples, tokenizer)
             prompt_parts.append(f"\n--- Latent {lat_idx} ---\n{examples_str}\n")
 

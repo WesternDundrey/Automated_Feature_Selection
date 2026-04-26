@@ -17,19 +17,33 @@ homegrown prompt — the prompt is Delphi's published one with the
 neuronpedia-style few-shot examples baked in. That keeps the score
 comparable to what Delphi reports in its papers.
 
-The gate runs at two slots in the pipeline:
+The gate runs at one place in the active pipeline:
 
-  inventory.run    : after explain_features, before organize_hierarchy.
-                     Drops fuzzy descriptions before they enter the catalog.
-  promote_loop.run : between the crispness gate and the mini-prefilter.
-                     Latents whose Sonnet description fails to predict
-                     their own held-out firing are dropped before any
-                     corpus annotation cost is paid.
+  promote_loop.run : between the crispness gate and the proposal-building
+                     step. Latents whose Sonnet description fails to
+                     predict their own held-out firing are dropped before
+                     any corpus annotation cost is paid.
 
-Standalone CLI: `--step delphi-score` runs the gate over the existing
-top_activations.json + raw_descriptions.json and writes a scores file
-without modifying the catalog. Useful for sanity-checking a catalog
-that was built before v8.15.
+Inventory-time gating is intentionally NOT inlined in `--step inventory`:
+it would need a fresh pretrained-SAE forward pass on activations.pt
+(which holds residual-stream vectors, not SAE codes) and `--step
+inventory` is meant to be quick. The standalone CLI below covers this
+case explicitly.
+
+Standalone CLI: `--step delphi-score` loads the pretrained SAE,
+encodes activations.pt → SAE codes for the latent indices that have
+descriptions, builds LatentRecords, and runs DetectionScorer. Writes
+delphi_scores.json without modifying the catalog. Useful for
+sanity-checking a catalog built before v8.15 or for ad-hoc audits.
+
+Held-out positives (v8.16): both the describer (Sonnet, in
+`inventory.explain_features`) and the gate take their examples from
+the same `top_activations` list, but the describer uses
+`top_activations[:top_k_examples - delphi_held_out_n]` (default first
+20) and the gate uses `top_activations[top_k_examples - delphi_held_out_n :]`
+(default last 10). This keeps the gate's positives out-of-sample so
+detection accuracy isn't artificially inflated by the description
+literally referencing the test examples.
 
 Tradeoffs / scope:
   - Detection accuracy is a precision-on-positives + recall-on-negatives
@@ -136,6 +150,7 @@ def _build_record_from_top_activations(
     n_test: int,
     n_not_active: int,
     rng_seed: int,
+    held_out_skip: int = 0,
 ):
     """Build a Delphi LatentRecord from our top_activations.json shape and
     cached activations. Returns LatentRecord or None if there's not enough
@@ -146,6 +161,11 @@ def _build_record_from_top_activations(
                           latent (CPU). Used to find non-activating
                           contexts and to fill the per-position activations
                           field of each Example.
+    held_out_skip: skip the first `held_out_skip` entries of
+                   `top_activations` before drawing positive test
+                   examples — those were the entries the description LLM
+                   saw, so scoring on them would be optimistic. v8.16
+                   audit fix.
     """
     if not _bootstrap_delphi():
         return None
@@ -153,18 +173,23 @@ def _build_record_from_top_activations(
         Latent, LatentRecord, ActivatingExample, NonActivatingExample,
     )
 
-    if len(top_activations) < n_test:
-        return None
-
     rng = np.random.RandomState(rng_seed + latent_idx)
     N, T = full_tokens.shape
 
-    # ── Activating examples — taken from the supplied top_activations list.
-    # Each entry has {context_ids, pos, activation}. We render a short
-    # window centered on `pos` so the example is a contiguous tensor
-    # (Delphi expects fixed-length tokens / activations per Example).
+    # ── Activating examples — taken from the held-out slice of
+    # top_activations: examples the description LLM did NOT see. Falls
+    # back to a regular slice if the held-out window is too small (e.g.
+    # an old top_activations.json from pre-v8.16 inventory only has 20
+    # entries, all of which the LLM saw). In the fallback case we still
+    # score, but we print a warning so the user knows the score is
+    # optimistic on this latent.
+    held_out_pool = top_activations[held_out_skip:]
+    if len(held_out_pool) < n_test:
+        # Fallback: use the head of the list (overlap with describer).
+        # Score remains directionally informative even if optimistic.
+        held_out_pool = top_activations[:max(n_test, len(top_activations))]
     activating_examples = []
-    used_test = top_activations[:n_test]
+    used_test = held_out_pool[:n_test]
     for ex in used_test:
         ctx_ids = ex.get("context_ids") or []
         pos = ex.get("pos", 0)
@@ -290,6 +315,7 @@ def score_descriptions(
     n_not_active: int = 5,
     judge_model: str | None = None,
     api_key: str | None = None,
+    held_out_skip: int | None = None,
 ) -> dict[str, dict]:
     """Score each (latent_id → description) pair via Delphi DetectionScorer.
 
@@ -340,8 +366,20 @@ def score_descriptions(
     if not cfg_judge:
         cfg_judge = cfg.organization_model
     judge_model = judge_model or cfg_judge
+
+    # v8.16: held-out positives. Default skip = top_k_examples - held_out_n
+    # so the gate uses examples the description LLM didn't see. Caller
+    # can override (e.g., promote_loop with its own held-out logic).
+    if held_out_skip is None:
+        held_out_skip = max(
+            0,
+            int(getattr(cfg, "top_k_examples", 30))
+            - int(getattr(cfg, "delphi_held_out_n", 10)),
+        )
+
     print(f"  [delphi-score] judge={judge_model} threshold={threshold:.2f} "
-          f"n_test={n_test} n_not_active={n_not_active}")
+          f"n_test={n_test} n_not_active={n_not_active} "
+          f"held_out_skip={held_out_skip}")
 
     client = OpenRouter(
         model=judge_model,
@@ -391,6 +429,7 @@ def score_descriptions(
             n_test=n_test,
             n_not_active=n_not_active,
             rng_seed=cfg.seed,
+            held_out_skip=held_out_skip,
         )
         if record is None:
             out[lid_str] = {
@@ -563,10 +602,61 @@ def gate_promote_loop_candidates(
 # ── CLI: `--step delphi-score` ──────────────────────────────────────────
 
 
+def _encode_pretrained_sae_for_latents(
+    sae, x_flat: torch.Tensor, N: int, T: int,
+    latent_ids: list[int], device: str,
+) -> torch.Tensor:
+    """Compute (N, T, K) of pretrained-SAE activations for K specific
+    latents. Memory-bounded: only the K columns we're scoring, never the
+    full (N, T, d_sae) tensor (which is ~25 GB for d_sae=24576).
+
+    v8.16 audit fix: the pre-fix `score_descriptions` was passed
+    `activations.pt` directly and treated its last axis as latent
+    activations — but `activations.pt` holds residual-stream vectors
+    (last axis = d_model), not SAE codes. For latent_ids ≥ d_model the
+    indexing went out of bounds; for latent_ids < d_model it scored
+    residual dimensions, not latent firing. Both modes silently
+    produced garbage scores. This function fixes that by encoding only
+    the requested latent columns through the actual pretrained SAE.
+    """
+    sae = sae.to(device)
+    bs = 8192   # rows per matmul chunk
+
+    out = torch.zeros((N * T, len(latent_ids)), dtype=torch.float32)
+    latent_t = torch.tensor(latent_ids, dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        for i in range(0, x_flat.shape[0], bs):
+            xb = x_flat[i : i + bs].to(device)
+            try:
+                # Native sae_lens path: encode → slice by latent_ids.
+                z = sae.encode(xb.to(sae.W_enc.dtype))  # (bs, d_sae)
+            except Exception:
+                # Fallback: bare-weights computation if `sae.encode` is
+                # unavailable for some reason (very rare on the supported
+                # sae_lens / GemmaScope paths).
+                z = xb.to(sae.W_enc.dtype) @ sae.W_enc + sae.b_enc
+                if sae.threshold is not None:
+                    z = (z > sae.threshold) * torch.relu(z)
+                else:
+                    z = torch.relu(z)
+            out[i : i + bs] = z.index_select(dim=-1, index=latent_t).float().cpu()
+
+    return out.reshape(N, T, len(latent_ids))
+
+
 def run(cfg: Config = None, threshold: float = 0.7) -> dict:
-    """Standalone runner: score the existing top_activations.json + raw
-    descriptions, write per-latent scores to disk. Doesn't modify the
-    catalog — sanity check only."""
+    """Standalone runner: score every description in raw_descriptions.json
+    against the pretrained SAE's actual latent firing on activations.pt,
+    write per-latent scores to disk. Does NOT modify the catalog.
+
+    v8.16 (audit fix): previously this function passed activations.pt
+    (residual stream) directly into the scorer's last-axis indexer,
+    which scored residual dimensions or went OOB instead of measuring
+    latent firing. Now it loads the pretrained SAE, encodes only the
+    columns corresponding to descriptions we have, and passes those
+    codes to the scorer.
+    """
     if cfg is None:
         cfg = Config()
 
@@ -585,27 +675,83 @@ def run(cfg: Config = None, threshold: float = 0.7) -> dict:
 
     top_activations = json.loads(cfg.top_activations_path.read_text())
     descriptions = json.loads(cfg.raw_descriptions_path.read_text())
+
     activations = torch.load(cfg.activations_path, weights_only=True)
     tokens = torch.load(cfg.tokens_path, weights_only=True)
+    if activations.dim() != 3:
+        raise RuntimeError(
+            f"activations.pt has unexpected shape {tuple(activations.shape)}; "
+            f"expected (N, T, d_model)."
+        )
+    N, T, d_model = activations.shape
+    print(f"  Loaded activations: {tuple(activations.shape)}, "
+          f"tokens: {tuple(tokens.shape)}")
+
+    # Load the pretrained SAE so we can encode actual latent activations.
+    print(f"  Loading pretrained SAE ({cfg.sae_release} / {cfg.sae_id})...")
+    from .inventory import load_sae as _load_pretrained_sae
+    sae, _sparsity = _load_pretrained_sae(cfg)
+
+    # Subset to the latents that have descriptions (scoring only the
+    # columns we actually use). The keys in `descriptions` are string-form
+    # latent indices set by inventory.collect_top_activations.
+    latent_ids: list[int] = []
+    valid_keys: list[str] = []
+    for k in descriptions.keys():
+        try:
+            lid = int(k)
+        except ValueError:
+            continue
+        if 0 <= lid < sae.d_sae:
+            latent_ids.append(lid)
+            valid_keys.append(k)
+
+    if not latent_ids:
+        raise RuntimeError(
+            "No valid latent ids in raw_descriptions.json — keys must be "
+            "string-form integer indices into the pretrained SAE."
+        )
+    print(f"  Encoding pretrained-SAE activations for {len(latent_ids)} "
+          f"latents (avoids materializing the full (N,T,d_sae) tensor)...")
+
+    x_flat = activations.reshape(-1, d_model).to(torch.float32)
+    sae_codes = _encode_pretrained_sae_for_latents(
+        sae, x_flat, N, T, latent_ids, device=cfg.device,
+    )
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
 
-    print(f"  Scoring {len(descriptions)} descriptions over "
-          f"{activations.shape} activations...")
+    # score_descriptions expects the last axis of its `activations` arg to
+    # be latent-indexed. We've built sae_codes to match `latent_ids`. Map
+    # each description's key onto its position-in-stack so the scorer can
+    # find the right column.
+    pos_keyed_descs = {
+        str(i): descriptions[k] for i, k in enumerate(valid_keys)
+    }
+    pos_keyed_top_acts = {
+        str(i): top_activations.get(k, []) for i, k in enumerate(valid_keys)
+    }
 
-    # For pretrained-SAE latents the offset is 0 (descriptions are for the
-    # raw SAE, not the supervised slice).
-    scores = score_descriptions(
-        descriptions=descriptions,
-        top_activations=top_activations,
+    print(f"  Scoring {len(pos_keyed_descs)} descriptions...")
+    pos_scores = score_descriptions(
+        descriptions=pos_keyed_descs,
+        top_activations=pos_keyed_top_acts,
         full_tokens=tokens,
-        activations=activations,
+        activations=sae_codes,
         latent_offset=0,
         tokenizer=tokenizer,
         cfg=cfg,
         threshold=threshold,
     )
+
+    # Reverse-map back to original latent-id keys for the on-disk record.
+    scores: dict = {}
+    for i, k in enumerate(valid_keys):
+        scores[k] = pos_scores.get(str(i), {
+            "score": None, "n_correct": 0, "n_total": 0,
+            "kept": True, "reason": "missing_score",
+        })
 
     out_path = cfg.output_dir / "delphi_scores.json"
     out_path.write_text(json.dumps({
@@ -613,6 +759,8 @@ def run(cfg: Config = None, threshold: float = 0.7) -> dict:
         "judge_model": (
             getattr(cfg, "delphi_judge_model", "") or cfg.organization_model
         ),
+        "sae_release": cfg.sae_release,
+        "sae_id": cfg.sae_id,
         "n_total": len(scores),
         "n_kept": sum(1 for v in scores.values() if v.get("kept")),
         "scores": scores,

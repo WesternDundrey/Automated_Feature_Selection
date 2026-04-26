@@ -55,6 +55,22 @@ def _format_feature_for_annotator(f: dict, max_exclusions: int = 2) -> str:
     are appended as ", NOT X, NOT Y" clauses so the boundary is explicit
     in the prompt itself.
 
+    SCOPE NOTE (v8.16 audit fix #5): only the `exclusions` field is
+    propagated into the annotator suffix. The richer v8.14 fields
+    `positive_examples` and `negative_examples` are NOT in the suffix
+    by design. Reasoning:
+      - Adding 3-5 example phrases per feature would multiply suffix
+        length by ~5-10x, blowing past the prefix-cache budget and
+        slowing annotation by the same factor.
+      - Examples in the prompt invite the annotator to memorize them
+        instead of generalizing the rule, which we want to avoid.
+      - positive_examples / negative_examples are kept for human audit
+        (--step audit-feature reads them) and for the decomposer's
+        own internal use; they're catalog metadata, not annotator
+        instructions.
+    The v8.15 changelog overstated this as "richer fields wired into
+    annotator" — only `exclusions` actually made it into the prompt.
+
     Without this, v8.14's exclusion metadata is dead weight: the catalog
     knows the boundary but the annotator doesn't. Appending up to two
     exclusions costs ~10-25 extra suffix tokens per feature; the local

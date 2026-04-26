@@ -356,7 +356,23 @@ def main():
     # Merge scaffold catalog (if provided) into the main catalog BEFORE
     # annotation. Scaffold entries carry role="control" so eval stats can
     # separate headline/discovery from surface scaffolding.
-    if cfg.scaffold_catalog and cfg.catalog_path.exists():
+    #
+    # v8.16 fix (audit #1): scaffold merge ONLY fires for steps that
+    # produce or consume the catalog freshly — `inventory`, `annotate`,
+    # or a full pipeline run (args.step is None). Read-only steps like
+    # `evaluate`, `train`, `audit-feature`, `delphi-score`, etc. SKIP
+    # the merge — bloating a 64-feature catalog to 97 mid-evaluate would
+    # mismatch annotations.pt and the supervised SAE checkpoint, which
+    # would crash on shape or silently give wrong numbers. Plus the
+    # belt-and-suspenders check: we also bail out (no-op) when every
+    # scaffold id is already present in the catalog, so a re-run of
+    # --step annotate is idempotent.
+    _scaffold_merge_steps = {None, "inventory", "annotate"}
+    if (
+        cfg.scaffold_catalog
+        and cfg.catalog_path.exists()
+        and args.step in _scaffold_merge_steps
+    ):
         scaffold_path = Path(cfg.scaffold_catalog)
         # v8.15: the default scaffold path is pipeline-package-relative, so
         # fall back to <package_dir>/scaffold_catalog.json when the literal
@@ -368,9 +384,33 @@ def main():
             if candidate.exists():
                 scaffold_path = candidate
         if scaffold_path.exists():
+            import json as _json
             from .catalog_utils import merge_scaffold
-            print(f"\n  Merging scaffold catalog: {scaffold_path}")
-            merge_scaffold(cfg.catalog_path, scaffold_path)
+            existing_ids = {
+                f["id"]
+                for f in _json.loads(cfg.catalog_path.read_text())["features"]
+            }
+            scaffold_ids = {
+                f["id"]
+                for f in _json.loads(scaffold_path.read_text()).get("features", [])
+            }
+            if scaffold_ids and scaffold_ids.issubset(existing_ids):
+                print(f"\n  Scaffold already merged ({len(scaffold_ids)} ids "
+                      f"present); no-op.")
+            else:
+                # If annotations.pt already exists with a feature count
+                # that doesn't match catalog + scaffold, warn loudly —
+                # the merge will require re-annotation to remain valid.
+                if cfg.annotations_path.exists():
+                    print(
+                        f"\n  WARNING: annotations.pt exists; merging "
+                        f"scaffold will mismatch its feature axis. "
+                        f"--step annotate will detect the mismatch via "
+                        f"annotations_meta.json and re-annotate "
+                        f"missing features."
+                    )
+                print(f"\n  Merging scaffold catalog: {scaffold_path}")
+                merge_scaffold(cfg.catalog_path, scaffold_path)
         else:
             print(f"\n  WARNING: scaffold_catalog not found at {scaffold_path}")
 

@@ -4,6 +4,123 @@
 
 ---
 
+## [v8.16] — Audit fixes: scaffold scope, real SAE codes for delphi-score, held-out positives, doc accuracy
+
+**Date:** 2026-04-26
+
+### Motivation
+
+Second user audit (v8.15) surfaced four bugs and one documentation overstep:
+
+1. **High** — Default scaffold-on can silently corrupt existing runs. `pipeline/run.py:359` merged scaffold into `feature_catalog.json` for ANY step whenever the catalog exists, including `evaluate`, `train`, `audit-feature`, `delphi-score`. A 64-feature run under v8.15 would silently bloat its catalog to 97 features mid-evaluate, mismatching `annotations.pt` and `supervised_sae.pt`.
+2. **High** — Standalone `--step delphi-score` was scoring the wrong tensor. `pipeline/delphi_score.run` loaded `activations.pt` (residual stream, last axis = `d_model`) and treated the last axis as latent activations. For latent IDs ≥ d_model, OOB; for IDs < d_model, scored residual dimensions, not latent firing. Both modes produced silently-garbage scores. (Promote-loop's gate computed correctly; only the standalone CLI was wrong.)
+3. **Medium-high** — The Delphi gate's "held-out" positives weren't held out. `_build_record_from_top_activations` used `top_activations[:n_test]` — the same examples Sonnet saw to write the description. Detection accuracy was optimistically inflated.
+4. **Medium** — Docstring claimed the gate runs in `inventory.run`, but `inventory.py` explicitly does not run it.
+5. **Medium-low** — v8.15 changelog claimed "richer fields wired into annotator," but only `exclusions` actually reaches the suffix; `positive_examples` / `negative_examples` are kept as catalog metadata only (intentionally — see scope note below).
+
+### Fixes
+
+#### #1 — Scaffold merge gated by step
+
+`pipeline/run.py` now only merges scaffold for steps that produce or consume the catalog freshly: `inventory`, `annotate`, or a full pipeline run (`args.step is None`). Read-only steps (`evaluate`, `train`, `audit-feature`, `delphi-score`, `agreement`, etc.) skip the merge, so an existing 64-feature run can use any new tooling without bloating its catalog.
+
+Belt-and-suspenders: even when the merge IS allowed, we first check whether every scaffold ID is already present in the catalog. If yes, no-op (so re-running `--step annotate` is idempotent).
+
+If `annotations.pt` exists when we're about to merge, we print a warning that re-annotation will be needed for the new features (the existing `annotations_meta.json` sidecar machinery handles this — annotate's diff path will detect missing feature IDs and fill them in).
+
+#### #2 — `--step delphi-score` now uses real SAE codes
+
+`pipeline/delphi_score.run` now:
+
+1. Loads the pretrained SAE via `inventory.load_sae(cfg)`.
+2. Encodes only the columns of `activations.pt` corresponding to latent IDs we have descriptions for — never materializes the full `(N, T, d_sae)` tensor (which would be ~25 GB for `d_sae=24576`).
+3. Passes those (N, T, K) SAE codes (not residual stream) into `score_descriptions` so the scorer's "where does this latent NOT fire" sampling actually queries the latent's firing pattern.
+
+`_encode_pretrained_sae_for_latents` chunks at 8192 rows × `K` columns to keep VRAM bounded; with K up to 500 this is well under 1 GB on any vast.ai box.
+
+#### #3 — Held-out positives for the gate
+
+Two new behaviors:
+
+- `cfg.top_k_examples` default bumped 20 → **30**.
+- New `cfg.delphi_held_out_n: int = 10`.
+- `inventory.explain_features` slices `top_activations[:top_k_examples - delphi_held_out_n]` (= first 20 with defaults) for the description LLM. Same number Sonnet saw pre-v8.16, just from a longer collection.
+- `_build_record_from_top_activations` accepts `held_out_skip` and uses `top_activations[held_out_skip:]` for activating examples. `score_descriptions` defaults `held_out_skip = top_k_examples - delphi_held_out_n` (= 20 with defaults) so the gate uses positives 21-30, never seen by the describer.
+- Fallback when an old `top_activations.json` only has 20 entries: gate falls back to the head of the list and the score is optimistic on those latents (logged but not crashed).
+
+#### #4 — Docstring fixed
+
+`delphi_score.py` module docstring no longer claims the gate runs in `inventory.run`. New text accurately states: gate runs in `promote_loop.run` only, with `--step delphi-score` covering the standalone case after the fact.
+
+#### #5 — Annotator-suffix scope comment
+
+`_format_feature_for_annotator` now carries a SCOPE NOTE explaining that `positive_examples` / `negative_examples` are deliberately NOT in the annotator suffix (would explode prompt length and invite memorization-over-generalization). Only `exclusions` reaches the suffix. The v8.15 changelog claim "richer fields wired into annotator" is corrected here: only `exclusions`, not all v8.14 fields.
+
+### Clean-run install instructions
+
+For a clean vast.ai box (zero current install), the v8.15-and-newer pipeline still uses the same 3-compartment uv pip approach. The new `orjson`, `blobfile`, `httpx` deps are picked up automatically by step 2.
+
+```bash
+# 1. Clone (if not already): supsae + Delphi.
+git clone <supsae-remote> supsae
+cd supsae
+git clone https://github.com/agents-for-interp/agentic-delphi.git agentic-delphi
+# (or git clone https://github.com/EleutherAI/delphi.git delphi-eleutherai —
+#  pipeline/delphi_score.py auto-detects either path under repo root)
+
+# 2. Standard 3-compartment install (unchanged from v8.14):
+uv pip install --no-deps sae-lens transformer-lens
+uv pip install -r pipeline/requirements.txt
+uv pip install --force-reinstall vllm
+
+# 3. Confirm Delphi imports cleanly:
+python -c "import sys; sys.path.insert(0, 'agentic-delphi'); \
+import delphi.scorers.classifier.detection; \
+print('Delphi OK')"
+
+# 4. Confirm OPENROUTER_API_KEY:
+echo "$OPENROUTER_API_KEY" | head -c 8
+
+# 5. Clean run starts here.
+python -m pipeline.run \
+--layer 9 --sae_id blocks.9.hook_resid_pre \
+--local-annotator --full-desc \
+--n_sequences 1000
+
+# 6. Standalone Delphi sanity check after inventory completes:
+python -m pipeline.run --step delphi-score --delphi-threshold 0.7
+
+# 7. Promote-loop with the Delphi gate active by default:
+python -m pipeline.run --step promote-loop \
+--layer 9 --sae_id blocks.9.hook_resid_pre \
+--local-annotator --full-desc
+```
+
+### Compatibility check
+
+| Step | v8.16 behavior |
+|---|---|
+| `inventory` | Collects 30 examples per latent (was 20). Describer LLM still sees 20. |
+| `annotate` | Auto-merges scaffold once (no-op on re-runs). `_format_feature_for_annotator` injects `, NOT X` from exclusions when present. |
+| `train` | Scaffold merge skipped (read-only step). Uses whatever catalog is on disk. |
+| `evaluate` | Scaffold merge skipped. Reads the same catalog the SAE was trained on. |
+| `audit-feature` | Scaffold merge skipped. Safe to run on existing artifacts. |
+| `delphi-score` | Scaffold merge skipped. Loads pretrained SAE, encodes correct latent codes, scores held-out positives. |
+| `promote-loop` | Scaffold merge skipped (catalog already has scaffold from prior annotate). Delphi gate active by default; pass `--no-delphi-gate` for pre-v8.15 behavior. |
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/run.py` | Scaffold merge gated to inventory/annotate/full-run; idempotency check on existing scaffold IDs; warns when annotations.pt exists |
+| `pipeline/delphi_score.py` | Standalone `run()` loads pretrained SAE and encodes real SAE codes; module docstring corrected; `held_out_skip` plumbed through |
+| `pipeline/inventory.py` | `explain_features` slices `top_k_examples - delphi_held_out_n` for the describer |
+| `pipeline/config.py` | `top_k_examples` 20→30; new `delphi_held_out_n: int = 10` |
+| `pipeline/annotate.py` | Added scope note in `_format_feature_for_annotator` clarifying that only `exclusions` is in the suffix |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.15] — Real Delphi integration + audit-driven plumbing fixes
 
 **Date:** 2026-04-26

@@ -27,7 +27,16 @@ class Config:
 
     # ── Feature selection from pretrained SAE ────────────────────────
     n_latents_to_explain: int = 500
-    top_k_examples: int = 20
+    # v8.16: bumped 20 → 30 so the Delphi gate has held-out positives
+    # (audit fix #3). The describer LLM sees `top_k_examples -
+    # delphi_held_out_n` = 20; the scorer reserves the next
+    # `delphi_held_out_n` = 10 as never-shown-to-the-describer test
+    # positives. The pre-fix gate scored on the same examples Sonnet
+    # had used to write the description, which made detection accuracy
+    # optimistically high (Sonnet's description literally references
+    # those examples).
+    top_k_examples: int = 30
+    delphi_held_out_n: int = 10
     n_tokens_for_activation_collection: int = 2_000_000
     activation_collection_batch_size: int = 8
     activation_collection_seq_len: int = 128
