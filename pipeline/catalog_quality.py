@@ -31,21 +31,20 @@ import re
 from pathlib import Path
 from typing import Optional
 
-# Hard-fail phrases — only the genuinely vague / non-operational ones,
-# plus context-level predicates that have no token-level answer.
+# Hard-fail phrases — only the genuinely vague / non-operational
+# patterns AND context-level predicates that have no token-level answer.
 #
-# Per the user's note, "may be" / "might be" / "can be either" are
-# valid hedges for surface variants ("Token can be opening or closing
-# quotation mark"); those go to the soft-flag → LLM crispness path.
+# v8.18.24 audit fix: dropped `such as`, `for example`, `including`,
+# `etc.` from hard-fail. Per user: "Token is a unit suffix including
+# km, cm, or mm" is a legitimate token-local description with examples.
+# Those phrases go to soft-flag → LLM crispness now.
 #
 # v8.18.22: added context-level guards — the SAE annotates one token
 # at a time, so descriptions whose predicate is the text / sentence /
 # paragraph / context / document / topic / register / genre / domain
-# can't be answered token-locally. Every token in a "political
-# article" would fire, including 'the' and 'of' — that's not a
-# feature, it's a document classifier.
+# can't be answered token-locally.
 _HARD_FAIL_PATTERNS = [
-    # Operationally-undefined / vague.
+    # Operationally-undefined / vague (these are unambiguously bad).
     re.compile(r"\bsometimes\b", re.IGNORECASE),
     re.compile(r"\bvarious\b", re.IGNORECASE),
     re.compile(r"\bin general\b", re.IGNORECASE),
@@ -54,10 +53,6 @@ _HARD_FAIL_PATTERNS = [
     re.compile(r"\bassociated with\b", re.IGNORECASE),
     re.compile(r"\bone of\b", re.IGNORECASE),
     re.compile(r"\band/or\b", re.IGNORECASE),
-    re.compile(r"\bsuch as\b", re.IGNORECASE),       # non-exhaustive enumeration
-    re.compile(r"\bfor example\b", re.IGNORECASE),
-    re.compile(r"\bincluding\b", re.IGNORECASE),
-    re.compile(r"\betc\.", re.IGNORECASE),
     # Context-level predicate (subject is text/sentence/etc., not token).
     # Article is optional because descriptions sometimes start sentence-
     # initial with the subject ("Text presents an argument..." with no
@@ -80,11 +75,20 @@ _HARD_FAIL_PATTERNS = [
 # or fail the feature) rather than auto-rejecting. Surface variants
 # like "opening or closing bracket" are legitimate; "noun or verb" is
 # not. The Sonnet judgment makes that call.
+#
+# v8.18.24: moved `such as`, `for example`, `including`, `etc.` here
+# from hard-fail. They sometimes indicate non-exhaustive enumeration
+# (bad) and sometimes just illustrate (fine — "unit suffix including
+# km, cm, or mm" is token-local). Let the LLM decide.
 _SOFT_FLAG_PATTERNS = [
     re.compile(r"\bor\b", re.IGNORECASE),
     re.compile(r"\bany\b", re.IGNORECASE),
     re.compile(r"\beither\b", re.IGNORECASE),
     re.compile(r"\bmultiple\b", re.IGNORECASE),
+    re.compile(r"\bsuch as\b", re.IGNORECASE),
+    re.compile(r"\bfor example\b", re.IGNORECASE),
+    re.compile(r"\bincluding\b", re.IGNORECASE),
+    re.compile(r"\betc\.", re.IGNORECASE),
 ]
 
 _MAX_DESCRIPTION_WORDS = 30  # over this length is almost always over-broad
@@ -205,33 +209,66 @@ def assess_feature_quality(
     if wc > _MAX_DESCRIPTION_WORDS:
         findings.append(f"description_too_long ({wc} words)")
 
-    # Soft flags trigger LLM crispness judgment if available.
+    # Soft flags + LLM crispness (v8.18.24 corrected logic per audit).
+    # Pre-fix: soft-flag finding was added BEFORE the LLM verdict, so
+    # even if Sonnet said "crisp", the soft-flag finding still pushed
+    # the status to quarantine. Under --catalog-gate-mode hard, valid
+    # surface variants like "opening or closing quotation mark" got
+    # dropped just because "or" was lexically present.
+    # Now: ask the LLM first; only emit soft_flag finding if the LLM
+    # confirms a real issue (or is unreachable). LLM=crisp → no
+    # quarantine finding from soft flags.
     crispness_category: str | None = None
     crispness_reason: str | None = None
-    if soft_flag_phrases or wc > 20:
-        findings.append(
-            f"soft_flags: {soft_flag_phrases}"
-            + (f", word_count={wc}" if wc > 20 else "")
-        )
+    has_soft_signal = bool(soft_flag_phrases) or wc > 20
+
+    if has_soft_signal:
         if use_llm_crispness and cfg is not None:
             try:
                 from .promote_loop import _crispness_judgment
                 is_crisp, reason, category = _crispness_judgment(description, cfg)
                 crispness_category = category
                 crispness_reason = reason
-                if not is_crisp and category in (
+                if is_crisp:
+                    # LLM cleared it. Don't emit a soft-flag finding —
+                    # the surface tokens were a false alarm.
+                    pass
+                elif category in (
                     "multi_concept", "vague", "too_broad", "not_token_local",
                     "uninterpretable", "nuisance"
                 ):
                     findings.append(
                         f"crispness_judgment_fail: {category} ({reason[:80]})"
                     )
+                else:
+                    # LLM didn't categorize cleanly — keep soft flags
+                    # as quarantine signal, surface what we saw.
+                    findings.append(
+                        f"soft_flags_uncategorized: {soft_flag_phrases}"
+                        + (f", word_count={wc}" if wc > 20 else "")
+                    )
             except Exception as e:
+                # LLM unreachable → can't clear soft flags. Quarantine
+                # is the safe default; user can re-run when LLM is back.
                 findings.append(
                     f"crispness_judgment_unreachable: {type(e).__name__}"
                 )
+                findings.append(
+                    f"soft_flags: {soft_flag_phrases}"
+                    + (f", word_count={wc}" if wc > 20 else "")
+                )
+        else:
+            # No LLM available → can't clear, so soft flags stand.
+            findings.append(
+                f"soft_flags: {soft_flag_phrases}"
+                + (f", word_count={wc}" if wc > 20 else "")
+            )
 
     # Decide status from findings.
+    # `crispness_judgment_fail` is hard-fail because the LLM explicitly
+    # judged the description bad. Soft flags only quarantine if the LLM
+    # didn't clear them (unreachable OR uncategorized) — see the soft-
+    # flag block above for the cleared/uncleared logic.
     has_hard_fail_finding = any(
         f.startswith("hard_fail_phrases")
         or f.startswith("crispness_judgment_fail")
@@ -241,7 +278,8 @@ def assess_feature_quality(
     )
     has_quarantine_finding = any(
         f.startswith("description_too_long")
-        or f.startswith("soft_flags")
+        or f.startswith("soft_flags")  # only present when LLM didn't clear
+        or f.startswith("soft_flags_uncategorized")
         or f.startswith("crispness_judgment_unreachable")
         for f in findings
     )

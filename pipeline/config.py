@@ -159,6 +159,13 @@ class Config:
     # Whether the validator calls Sonnet's crispness judgment on
     # soft-flagged descriptions. Off = lexical-only (cheap but noisy).
     catalog_gate_use_llm: bool = True
+    # Strict mode: a validator crash/import-failure/exception RAISES
+    # instead of falling through with an unfiltered catalog. Off by
+    # default (research code, often want to keep going). Per audit:
+    # "If this is meant to be a defensive contract, failing the
+    # validator should fail the run, not silently proceed." Set to
+    # True when you want hard guarantees.
+    catalog_gate_strict: bool = False
     # Auto-run pairwise overlap check after annotation. Reports
     # redundant pairs (IoU >= iou_threshold) and subset pairs
     # (max(P(A|B), P(B|A)) >= subset_threshold). Doesn't drop by

@@ -1087,6 +1087,7 @@ def run(cfg: Config = None):
     # written report. Scaffold / manual / control features are exempt
     # from the source_latents check.
     gate_mode = getattr(cfg, "catalog_gate_mode", "quarantine")
+    gate_strict = getattr(cfg, "catalog_gate_strict", False)
     if gate_mode != "off":
         try:
             from .catalog_quality import (
@@ -1108,8 +1109,29 @@ def run(cfg: Config = None):
             print(f"  Quarantined catalog: {quarantined_path}  "
                   f"({len(quarantined.get('features', []))} dropped leaves)")
         except Exception as e:
-            print(f"  [catalog-quality] error "
-                  f"({type(e).__name__}: {e}); skipping gate.")
+            # v8.18.24 audit fix: don't silently swallow validator errors.
+            # Pre-fix the broad `except` would mask import failures /
+            # crashes and let the unfiltered catalog through unchallenged
+            # — exactly what the gate is supposed to prevent. Loud
+            # warning at minimum; raise in strict mode.
+            import traceback
+            print(f"\n  ============================================")
+            print(f"  WARNING: catalog-quality gate FAILED — "
+                  f"catalog passed through UNFILTERED.")
+            print(f"  Exception: {type(e).__name__}: {e}")
+            print(f"  Stack:")
+            for line in traceback.format_exc().splitlines():
+                print(f"    {line}")
+            print(f"  ============================================")
+            if gate_strict:
+                raise RuntimeError(
+                    "Catalog-quality gate failed and "
+                    "cfg.catalog_gate_strict=True. Fix the validator "
+                    "before continuing, or unset strict mode to "
+                    "fail-open."
+                ) from e
+            print(f"  (continuing with unfiltered catalog because "
+                  f"cfg.catalog_gate_strict=False)\n")
 
     cfg.catalog_path.write_text(json.dumps(catalog, indent=2))
     print(f"Saved feature catalog: {cfg.catalog_path}")

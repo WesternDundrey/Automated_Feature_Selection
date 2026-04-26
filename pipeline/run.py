@@ -147,6 +147,13 @@ def main():
              "soft lexical flags that didn't reach LLM).",
     )
     parser.add_argument(
+        "--catalog-gate-strict", action="store_true",
+        help="Treat catalog-quality validator crashes as hard errors "
+             "(raise instead of falling through with unfiltered catalog). "
+             "Off by default — useful when you want a defensive contract "
+             "rather than research-mode fail-open.",
+    )
+    parser.add_argument(
         "--no-overlap-check", action="store_true",
         help="Skip the post-annotation pairwise overlap report.",
     )
@@ -406,6 +413,8 @@ def main():
         overrides["target_dir_method"] = args.target_dir_method
     if args.catalog_gate_mode is not None:
         overrides["catalog_gate_mode"] = args.catalog_gate_mode
+    if args.catalog_gate_strict:
+        overrides["catalog_gate_strict"] = True
     if args.no_overlap_check:
         overrides["overlap_check_auto"] = False
     if args.selectivity:
