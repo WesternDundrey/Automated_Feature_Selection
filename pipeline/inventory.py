@@ -755,6 +755,18 @@ def run(cfg: Config = None):
     del model, sae
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
+    # NOTE (v8.15): the Delphi detection gate is NOT run here at inventory
+    # time. The gate needs per-latent activation maps to sample
+    # non-activating positions, which would require re-running the
+    # pretrained SAE on activations.pt. The supervised promote_loop has
+    # the same gate built in (see `delphi_score.score_descriptions`)
+    # where it's free — the supervised SAE's `all_acts` tensor is
+    # already in memory after a forward pass. To run the gate over
+    # pretrained-SAE descriptions explicitly, use:
+    #     python -m pipeline.run --step delphi-score
+    # which loads the inventory's top_activations.json + raw_descriptions.json
+    # and writes a per-latent score file without modifying the catalog.
+
     # 5. Organize into hierarchy
     catalog = organize_hierarchy(descriptions, cfg)
     cfg.catalog_path.write_text(json.dumps(catalog, indent=2))

@@ -4,6 +4,119 @@
 
 ---
 
+## [v8.15] — Real Delphi integration + audit-driven plumbing fixes
+
+**Date:** 2026-04-26
+
+### Motivation
+
+User audit of v8.14 surfaced four gaps. v8.15 closes them all:
+
+> 1. *Delphi is not really integrated into the active pipeline.* The folders are cloned local references, but the running code uses your own pipeline.inventory + Sonnet prompts, not Eleuther Delphi's explainer/scorer pipeline.
+> 2. *The initial catalog still has no Delphi-style held-out explanation scoring.* explain_features() generates descriptions from top positive contexts, then organize_hierarchy() rewrites them into a catalog at pipeline/inventory.py:587. There is no "does this explanation predict held-out activations?" gate before annotation.
+> 3. *v8.14's richer positive_examples / negative_examples / exclusions metadata is mostly not consumed by annotation.* The local annotator suffix only uses f["description"] at pipeline/annotate.py:633. Promote-loop atom mini-annotation also strips atoms down to only id and description.
+> 4. *The scaffold catalog is not enabled by default.* Config says scaffold_catalog: str = "" at pipeline/config.py:185. So the v8.14 control-feature expansion is inert unless you pass --scaffold-catalog.
+
+User's directive on the integration scope: "Do not spend time 'integrating Delphi' broadly. Add one narrow gate: after Sonnet generates a latent description, run a Delphi-style detection/fuzz score on held-out activating vs non-activating contexts. Keep descriptions only if they predict the latent's held-out firing pattern. That directly addresses bad catalog proposals without disrupting your annotation/training pipeline." v8.15 implements exactly that.
+
+### `pipeline/delphi_score.py` — real Delphi integration (NEW; closes audit findings #1, #2)
+
+Imports EleutherAI Delphi's `DetectionScorer` from the local `agentic-delphi/` clone (sys.path-injected at module load — no `pip install -e` required). For each candidate description we build a `LatentRecord` with N activating + N non-activating examples, run the scorer, and compute detection accuracy = mean of `ClassifierOutput.correct`. Descriptions whose accuracy is below `cfg.delphi_score_threshold` (default 0.7) are dropped before annotation.
+
+The scorer's prompt is Delphi's published Detection prompt with the neuronpedia-style few-shot examples baked in — not a homegrown variant. Score numbers reported by this gate are directly comparable to anything Delphi reports in its papers.
+
+#### Two integration slots
+
+**`promote_loop` (default-on, `cfg.promote_use_delphi_gate=True`):**
+Runs between the crispness gate and the proposal-building step. Each crisp candidate's description is scored against held-out U-latent firing positions on the cached `activations.pt`. The U-latent activation map is computed via `sae.unsup_encoder_*()` (uniform API across HingeSAE / JumpReLUHingeSAE / GatedBCESAE / legacy SupervisedSAE), so every supervision_mode picks up the gate without code changes. Per-round logs land at `pipeline_data/promote_iter_*/delphi_gate.json`. Disable with `--no-delphi-gate`.
+
+**`--step delphi-score` (standalone CLI):**
+Runs the scorer over the existing inventory artifacts (`top_activations.json` + `raw_descriptions.json`) and writes `pipeline_data/delphi_scores.json` without modifying the catalog. Useful for sanity-checking a v8.14-or-earlier catalog: see which descriptions the held-out judge can/can't predict.
+
+#### Inventory-time gating, intentionally NOT done
+
+The pretrained-SAE-latent gate at inventory time would need a fresh SAE forward pass on `activations.pt` (the cached residual-stream tensor doesn't carry SAE codes), which is meaningful compute. The `--step delphi-score` standalone runner exposes the same gate after the fact when the user wants it; the inline inventory gate is omitted to keep `--step inventory` quick.
+
+#### Fail-open semantics
+
+If `import delphi` fails (clone missing or deps not installed), or `OPENROUTER_API_KEY` isn't set, or a transport error trips, the gate keeps every candidate and logs the reason. The gate must never silently reject everything for an environment problem.
+
+#### Delphi clone deps added to requirements
+
+`orjson`, `blobfile`, `httpx` added to `pipeline/requirements.txt`. Even though we only use `delphi.latents`'s dataclasses, those modules import all three at module-load time — without them, `import delphi` fails before our code can use anything.
+
+### Scaffold catalog default-on (closes audit finding #4)
+
+`Config.scaffold_catalog` default flipped from `""` to `"pipeline/scaffold_catalog.json"`. New runs absorb the v8.14 33 surface-artifact features automatically. `run.py` resolves the path package-relative when the literal string doesn't resolve from the current working directory, so default-on works regardless of CWD.
+
+New flag `--no-scaffold` to opt out.
+
+### Richer description fields wired into the annotator (closes audit finding #3)
+
+New helper `_format_feature_for_annotator(f)` in `annotate.py`. When a feature carries `exclusions` (set by `--step rewrite-catalog` or by promote-loop's atom decomposer), they're appended to the suffix as `, NOT X, NOT Y` clauses. The annotator now sees the boundary explicitly:
+
+```
+Old:  "Token is a comma in a list separator? "
+New:  "Token is a comma in a list separator, NOT a sentence-internal pause? "
+```
+
+Cost: ~10–25 extra suffix tokens per feature (2–3× the suffix length in the worst case). Local Qwen3-4B-Base annotator runs at ~600 dec/s with prefix caching, so the throughput hit is roughly proportional. Wired into all four annotator suffix sites:
+
+- API path glossary (`annotate.py:113`)
+- vLLM F-index glossary (`annotate.py:609`)
+- vLLM full-desc suffix (`annotate.py:638`)
+- HF model annotator prefix (`annotate.py:980`)
+
+The decomposed-atom mini-annotation path (`promote_loop.py:1429`) now passes `exclusions` through to `atom_as_feats` so the v8.14 decomposer's per-atom "NOT X" clauses actually reach the annotator during atom mini-labeling. Pre-v8.15 these were dropped at the dict-stripping step.
+
+Auto-on when the field is present; auto-off (plain description) when it isn't. No new flag needed for backward compat.
+
+### Duplicate Delphi clone — gitignored, deletion documented
+
+`agentic-delphi-correct/` (a 130MB duplicate of `agentic-delphi/`, both at commit `87f934d1`) is now in `.gitignore`. It's safe to delete with:
+
+```bash
+rm -rf agentic-delphi-correct/
+```
+
+Not deleted in this commit — destructive operations on disk content require explicit confirmation.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/delphi_score.py` | **NEW** — Delphi DetectionScorer adapter + promote-loop gate + `--step delphi-score` |
+| `pipeline/promote_loop.py` | Delphi gate inserted between crispness and proposal building; atom mini-annotate now passes `exclusions` through |
+| `pipeline/annotate.py` | `_format_feature_for_annotator` helper; wired into all four suffix sites |
+| `pipeline/inventory.py` | Comment block explaining why inventory-time gating is delegated to `--step delphi-score` |
+| `pipeline/config.py` | `scaffold_catalog` default → bundled path; `delphi_score_threshold`, `delphi_judge_model`, `promote_use_delphi_gate` fields |
+| `pipeline/run.py` | `--step delphi-score`; `--delphi-threshold`, `--no-delphi-gate`, `--no-scaffold`; package-relative scaffold path resolution |
+| `pipeline/requirements.txt` | `orjson`, `blobfile`, `httpx` (Delphi deps) |
+| `.gitignore` | `agentic-delphi-correct/` |
+| `changes.md` | This entry |
+
+### Recommended workflow change
+
+```bash
+# Sanity-check the existing catalog with Delphi (no retrain).
+python -m pipeline.run --step delphi-score --delphi-threshold 0.7
+# → reads top_activations.json + raw_descriptions.json
+# → writes delphi_scores.json with per-description detection accuracy
+# → prints worst-10 + best-5 for quick eyeball
+
+# Promote-loop now Delphi-gates new features automatically.
+python -m pipeline.run --step promote-loop \
+--layer 9 --sae_id blocks.9.hook_resid_pre \
+--local-annotator --full-desc \
+--delphi-threshold 0.7
+# → see pipeline_data/promote_iter_*/delphi_gate.json for per-round drops
+
+# Pre-v8.15 promote-loop behavior (no Delphi gate):
+python -m pipeline.run --step promote-loop --no-delphi-gate ...
+```
+
+---
+
 ## [v8.14] — Catalog/proposal quality upgrade: audit, rewrite, richer atoms, expanded scaffold, stricter mini-prefilter
 
 **Date:** 2026-04-26

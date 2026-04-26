@@ -31,3 +31,10 @@ typing-extensions
 transformers
 transformers-stream-generator
 pandas
+# v8.15: needed by Delphi (agentic-delphi/) for `--step delphi-score`.
+# blobfile + orjson are imported at module-load time in delphi.latents.latents
+# even though we only use the dataclasses; without them, `import delphi` fails.
+# httpx is the OpenRouter client transport.
+orjson
+blobfile
+httpx

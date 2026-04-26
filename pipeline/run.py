@@ -52,12 +52,16 @@ def main():
     parser.add_argument("--catalog", default=None,
                         help="Path to manual feature catalog JSON (skips inventory step)")
     parser.add_argument("--scaffold-catalog", default=None,
-                        help="Optional scaffold catalog merged into the "
-                             "main catalog pre-training. Features inherit "
+                        help="Path to scaffold catalog merged into the main "
+                             "catalog pre-training. Features inherit "
                              "role='control' so downstream eval stats can "
                              "separate discovery-only headlines from scaffold. "
-                             "Default pipeline/scaffold_catalog.json ships with "
-                             "~20 surface/artifact features.")
+                             "Default: pipeline/scaffold_catalog.json (33 "
+                             "surface/artifact features as of v8.14). Pass "
+                             "--no-scaffold to disable.")
+    parser.add_argument("--no-scaffold", action="store_true",
+                        help="Disable scaffold merge entirely. Overrides "
+                             "--scaffold-catalog and the default scaffold path.")
     parser.add_argument("--no-mse", action="store_true",
                         help="Use legacy BCE supervision instead of MSE")
     parser.add_argument("--full-desc", action="store_true",
@@ -90,8 +94,22 @@ def main():
                  "weaknesses", "siphoning", "discover", "discover-loop",
                  "composition", "layer-sweep", "promote-loop", "usweep",
                  "hinge-ablation", "trim-by-kappa",
-                 "audit-feature", "rewrite-catalog"],
+                 "audit-feature", "rewrite-catalog", "delphi-score"],
         help="Run only this step",
+    )
+    parser.add_argument(
+        "--delphi-threshold", type=float, default=0.7,
+        help="For --step delphi-score (and the v8.15 promote-loop gate): "
+             "minimum DetectionScorer accuracy a description must achieve "
+             "to be kept. Default 0.7. The scorer asks a held-out judge "
+             "to label N activating + N non-activating examples; accuracy "
+             "is the mean of correct calls.",
+    )
+    parser.add_argument(
+        "--no-delphi-gate", action="store_true",
+        help="Disable the Delphi detection gate inside --step promote-loop. "
+             "Default-on as of v8.15. Use this if you want to rerun the "
+             "loop in pre-v8.15 behavior.",
     )
     parser.add_argument(
         "--feature-id", default=None,
@@ -268,6 +286,13 @@ def main():
         overrides["manual_catalog"] = args.catalog
     if args.scaffold_catalog:
         overrides["scaffold_catalog"] = args.scaffold_catalog
+    if args.no_scaffold:
+        overrides["scaffold_catalog"] = ""
+    # delphi_score_threshold is set via overrides so promote_loop reads
+    # the same value the user passed at the CLI.
+    overrides["delphi_score_threshold"] = args.delphi_threshold
+    if args.no_delphi_gate:
+        overrides["promote_use_delphi_gate"] = False
     if args.supervision:
         overrides["supervision_mode"] = args.supervision
     if args.gated_tie_weights:
@@ -333,6 +358,15 @@ def main():
     # separate headline/discovery from surface scaffolding.
     if cfg.scaffold_catalog and cfg.catalog_path.exists():
         scaffold_path = Path(cfg.scaffold_catalog)
+        # v8.15: the default scaffold path is pipeline-package-relative, so
+        # fall back to <package_dir>/scaffold_catalog.json when the literal
+        # string doesn't resolve from CWD. This makes default-on scaffold
+        # work regardless of where the user runs --step from.
+        if not scaffold_path.exists():
+            pkg_dir = Path(__file__).parent
+            candidate = pkg_dir / Path(cfg.scaffold_catalog).name
+            if candidate.exists():
+                scaffold_path = candidate
         if scaffold_path.exists():
             from .catalog_utils import merge_scaffold
             print(f"\n  Merging scaffold catalog: {scaffold_path}")
@@ -639,6 +673,16 @@ def main():
             run_causal=not args.sweep_skip_causal,
         )
         print(f"Layer sweep completed in {time.time() - t0:.1f}s")
+
+    # Delphi DetectionScorer over inventory descriptions (standalone)
+    if args.step == "delphi-score":
+        print("\n" + "=" * 70)
+        print("DELPHI SCORE — DetectionScorer over inventory descriptions")
+        print("=" * 70)
+        t0 = time.time()
+        from .delphi_score import run as run_delphi_score
+        run_delphi_score(cfg, threshold=args.delphi_threshold)
+        print(f"Delphi score completed in {time.time() - t0:.1f}s")
 
     # Per-feature human audit dump (TP / FP / FN markdown)
     if args.step == "audit-feature":

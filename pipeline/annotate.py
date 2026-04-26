@@ -44,6 +44,46 @@ from .config import Config
 _ANNOTATION_FAILURE_COUNT: list = []
 
 
+_NOT_PREFIX_RE = re.compile(r"^not\s+", re.IGNORECASE)
+_PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _format_feature_for_annotator(f: dict, max_exclusions: int = 2) -> str:
+    """Build the description string the annotator actually sees for a
+    feature. When the catalog entry carries `exclusions` (set by
+    --step rewrite-catalog or by promote-loop's atom decomposer), they
+    are appended as ", NOT X, NOT Y" clauses so the boundary is explicit
+    in the prompt itself.
+
+    Without this, v8.14's exclusion metadata is dead weight: the catalog
+    knows the boundary but the annotator doesn't. Appending up to two
+    exclusions costs ~10-25 extra suffix tokens per feature; the local
+    Qwen3-4B-Base annotator runs at ~600 dec/s with prefix caching, so
+    the throughput hit is roughly proportional. Limit to 2 exclusions
+    so a verbose Sonnet rewrite doesn't blow up the suffix budget.
+
+    The formatting normalizes Sonnet's output: strips a leading "NOT "
+    if the exclusion already has one, drops trailing parentheticals
+    (often "(because Y)" rationale that's meaningful to the human
+    auditor but noise to the annotator).
+    """
+    desc = (f.get("description") or "").rstrip(".").strip()
+    excl_raw = f.get("exclusions") or []
+    if not excl_raw or not desc:
+        return desc
+    cleaned = []
+    for e in excl_raw[:max_exclusions]:
+        s = str(e).strip()
+        s = _NOT_PREFIX_RE.sub("", s)
+        s = _PARENTHETICAL_RE.sub("", s)
+        s = s.rstrip(".").strip()
+        if s:
+            cleaned.append(s)
+    if not cleaned:
+        return desc
+    return f"{desc}, NOT {', NOT '.join(cleaned)}"
+
+
 # ── Corpus preparation ──────────────────────────────────────────────────────
 
 def prepare_corpus(model, cfg: Config) -> torch.Tensor:
@@ -110,7 +150,7 @@ def build_annotation_prompt(
     token_block = " ".join(f"[{i}]{t}" for i, t in enumerate(token_strs))
 
     feat_block = "\n".join(
-        f"F{chunk_offset + k} ({f['id']}): {f['description']}"
+        f"F{chunk_offset + k} ({f['id']}): {_format_feature_for_annotator(f)}"
         for k, f in enumerate(feature_chunk)
     )
 
@@ -566,7 +606,7 @@ def _annotate_local_vllm_pertoken(
     use_findex = cfg.use_findex_suffix
     if use_findex:
         feat_defs = "\n".join(
-            f"F{i}: {f['description']}" for i, f in enumerate(features)
+            f"F{i}: {_format_feature_for_annotator(f)}" for i, f in enumerate(features)
         )
         SYS_STR = (
             f'Answer 0 (no) or 1 (yes).\n\n'
@@ -632,7 +672,8 @@ def _annotate_local_vllm_pertoken(
     else:
         feat_suffix_list = [
             tuple(ann_tokenizer.encode(
-                f'{f["description"].rstrip(".")}? ', add_special_tokens=False
+                f'{_format_feature_for_annotator(f)}? ',
+                add_special_tokens=False,
             ))
             for f in features
         ]
@@ -934,7 +975,7 @@ def _annotate_local_hf(
     for fi, feat in enumerate(features):
         feat_prefix = (
             "You are a feature annotator. "
-            f"Feature: {feat['description']}\n"
+            f"Feature: {_format_feature_for_annotator(feat)}\n"
             "Output only 0 or 1. 1 if the feature activates at the LAST token.\n\n"
         )
 

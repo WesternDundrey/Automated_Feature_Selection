@@ -182,7 +182,30 @@ class Config:
     # are tagged `role="control"` so downstream evaluation stats can
     # report "headline / discovery-only" numbers separately from "all
     # features (including scaffold)". Empty string = no scaffold merge.
-    scaffold_catalog: str = ""
+    #
+    # v8.15: default flipped from "" to the bundled scaffold path. Pre-v8.15
+    # the v8.14 control features were inert by default (only merged when
+    # the user explicitly passed --scaffold-catalog). Default-on means new
+    # runs absorb surface-artifact directions automatically; pass
+    # --no-scaffold to opt out.
+    scaffold_catalog: str = "pipeline/scaffold_catalog.json"
+
+    # ── Delphi detection gate (v8.15) ────────────────────────────
+    # After Sonnet generates a candidate description, run Delphi's
+    # DetectionScorer on held-out activating + non-activating contexts
+    # to measure whether the description actually predicts the latent's
+    # firing pattern. Descriptions whose detection accuracy is below
+    # `delphi_score_threshold` are dropped before annotation. Default
+    # 0.7: a coin-flip judge would score 0.5 on a balanced split, so
+    # 0.7 is "clearly above chance, not yet rigorous." Raise to 0.8 if
+    # you want stricter gating; lower to 0.6 if too many drop.
+    delphi_score_threshold: float = 0.7
+    # The judge model the DetectionScorer asks. Falls back to
+    # `organization_model` (Sonnet) when None.
+    delphi_judge_model: str = ""
+    # Whether `--step promote-loop` runs the Delphi gate between
+    # crispness and the mini-prefilter. Default-on as of v8.15.
+    promote_use_delphi_gate: bool = True
 
     # Denylist of description patterns. During promote-loop triage, any
     # candidate description (from Sonnet) that contains ANY of these

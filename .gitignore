@@ -35,3 +35,4 @@ Thumbs.db
 # Cloned dependencies (large, not ours)
 circuit-tracer/
 agentic-delphi/
+agentic-delphi-correct/
