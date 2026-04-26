@@ -5,18 +5,15 @@
 #
 # This script runs ONCE on instance start. It does NOT install python
 # packages — that's install.sh's job. This is the lightweight bootstrap:
-# tools, repo clone, model pre-download, Delphi clone.
+# tools, repo clone, model pre-download.
+#
+# v8.18.26: Delphi removed entirely; no Delphi clone here.
 
 apt-get update -qq && apt-get install -y -qq curl git tmux > /dev/null 2>&1
 
 # supsae repo
 git clone https://github.com/WesternDundrey/Automated_Feature_Selection.git /workspace/Automated_Feature_Selection
 cd /workspace/Automated_Feature_Selection
-
-# Delphi (EleutherAI). install.sh also clones if missing, but doing it
-# here means the clone is ready before the user runs anything and the
-# heavy uv-pip step doesn't have to download Delphi mid-install.
-git clone https://github.com/EleutherAI/delphi.git /workspace/Automated_Feature_Selection/delphi-eleutherai || true
 
 # Pre-download annotator model so the first vLLM cold-start doesn't
 # include an 8GB download (which looks like a hang).
@@ -32,7 +29,7 @@ echo "==========================================="
 echo "Bootstrap complete. To install python deps:"
 echo "==========================================="
 echo "  cd /workspace/Automated_Feature_Selection"
-echo "  bash install.sh        # installs all pipeline + Delphi deps"
+echo "  bash install.sh        # installs all pipeline deps"
 echo "                         # — preserves pre-installed vllm/torch/numpy"
 echo ""
 echo "Then:"

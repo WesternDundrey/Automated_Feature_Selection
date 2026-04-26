@@ -1308,38 +1308,8 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
                 f"latents. Decomposition mines these for atomic features."
             )
 
-        # ── 3a-bis. (v8.15) Delphi detection gate. Ask a held-out judge
-        # whether each crisp description predicts its own activating vs
-        # non-activating contexts. Drops descriptions that don't survive
-        # the held-out test BEFORE we spend any annotation budget. Uses
-        # EleutherAI Delphi's DetectionScorer (via agentic-delphi/) on
-        # log-prob-free OpenRouter; fails open when Delphi is unavailable
-        # so the gate never silently rejects everything for an env reason.
-        if crisp_candidates and getattr(cfg, "promote_use_delphi_gate", True):
-            from .delphi_score import gate_promote_loop_candidates
-            tokens_full = torch.load(cfg.tokens_path, weights_only=True)
-            tokens_masked = mask_leading(tokens_full, cfg=cfg)
-            kept_after_delphi, delphi_log = gate_promote_loop_candidates(
-                crisp_candidates=crisp_candidates,
-                all_top_acts=all_top_acts,
-                sae=sae,
-                activations=activations,
-                tokens_masked=tokens_masked,
-                n_supervised=n_supervised,
-                d_model=d_model,
-                tokenizer=tokenizer_ref,
-                cfg=cfg,
-                threshold=getattr(cfg, "delphi_score_threshold", 0.7),
-            )
-            (iter_dir / "delphi_gate.json").write_text(
-                json.dumps({
-                    "threshold": getattr(cfg, "delphi_score_threshold", 0.7),
-                    "n_in":   len(crisp_candidates),
-                    "n_kept": len(kept_after_delphi),
-                    "scores": delphi_log,
-                }, indent=2)
-            )
-            crisp_candidates = kept_after_delphi
+        # v8.18.26: Delphi detection gate REMOVED. Crispness gate above
+        # plus the AUROC mini-prefilter below are sufficient screening.
 
         # ── 3b. Source-U crisp proposals get mean-shift target_dirs from
         # source U's firing mask. Atoms (from decomposition below) get

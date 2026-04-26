@@ -27,16 +27,10 @@ class Config:
 
     # ── Feature selection from pretrained SAE ────────────────────────
     n_latents_to_explain: int = 500
-    # v8.16: bumped 20 → 30 so the Delphi gate has held-out positives
-    # (audit fix #3). The describer LLM sees `top_k_examples -
-    # delphi_held_out_n` = 20; the scorer reserves the next
-    # `delphi_held_out_n` = 10 as never-shown-to-the-describer test
-    # positives. The pre-fix gate scored on the same examples Sonnet
-    # had used to write the description, which made detection accuracy
-    # optimistically high (Sonnet's description literally references
-    # those examples).
+    # v8.18.26: Delphi removed. top_k_examples retained at 30 — Sonnet
+    # benefits from seeing more activating contexts when writing the
+    # description, even without a held-out scorer to reserve some for.
     top_k_examples: int = 30
-    delphi_held_out_n: int = 10
     n_tokens_for_activation_collection: int = 2_000_000
     activation_collection_batch_size: int = 8
     activation_collection_seq_len: int = 128
@@ -287,58 +281,19 @@ class Config:
     # --no-scaffold to opt out.
     scaffold_catalog: str = "pipeline/scaffold_catalog.json"
 
-    # ── Delphi detection gate (v8.15) ────────────────────────────
-    # After Sonnet generates a candidate description, run Delphi's
-    # DetectionScorer on held-out activating + non-activating contexts
-    # to measure whether the description actually predicts the latent's
-    # firing pattern. Descriptions whose detection accuracy is below
-    # `delphi_score_threshold` are dropped before annotation. Default
-    # 0.7: a coin-flip judge would score 0.5 on a balanced split, so
-    # 0.7 is "clearly above chance, not yet rigorous." Raise to 0.8 if
-    # you want stricter gating; lower to 0.6 if too many drop.
-    delphi_score_threshold: float = 0.7
-    # The judge model the DetectionScorer asks. v8.18.12: defaulted to
-    # Haiku 4.5 (~10× cheaper than Sonnet 4.6) because the Detection task
-    # is simple — just "for each example, does it match the explanation?"
-    # — and a 500-latent gate ran on Sonnet was burning through OpenRouter
-    # credits fast (user hit their account's total-limit cap mid-run).
-    # Empty string = fall back to organization_model (Sonnet) for the
-    # rare case where Haiku judgment quality is insufficient.
-    delphi_judge_model: str = "anthropic/claude-haiku-4.5"
-    # Whether `--step promote-loop` runs the Delphi gate between
-    # crispness and the mini-prefilter. Default-on as of v8.15.
-    promote_use_delphi_gate: bool = True
-    # v8.18: number of mid-tier activating examples to add to the
-    # Delphi gate's test set (in addition to top-K held-out positives).
-    # Mid-tier means activations in the 25-75th percentile of nonzero —
-    # tests recall, not just peak-case precision. Setting to 0 reverts
-    # to peak-only behavior.
-    #
-    # v8.18.14: bumped 3 → 5 so total samples per record (n_test=5 +
-    # n_mid=5 + n_not_active=5 = 15) is an exact multiple of Delphi's
-    # native 5-example batch size. Previously 5+3+5=13 left a trailing
-    # 3-sample batch whose response shape ([1,0,1]) didn't match the
-    # judge's 5-element few-shot, causing parse failures the gate then
-    # treated as wrong predictions.
-    delphi_n_mid_tier: int = 5
     # v8.18.3: skip vLLM CUDA-graph compilation on cold start.
     # Cold-start speedup: ~20× (15-25 min → ~1 min) at the cost of
     # ~10-20% per-token throughput. Worth it for one-shot annotation
     # runs on small corpora; flip to False for production-scale runs
     # where total wall-clock dominates cold-start.
     vllm_enforce_eager: bool = True
-    # v8.18.25: DEFAULT FLIPPED to False. Per audit:
-    # "delphi_gate_in_inventory=True optimizes source-latent
-    # faithfulness, not human-useful supervised features... Use Delphi
-    # as audit metadata, not as the initial catalog gate." The gate
-    # was nerfing supervised-SAE F1 by dropping easy-but-real features
-    # whose top-K activations Sonnet couldn't predict crisply enough,
-    # while the unsupervised post-train readout barely moved. Now the
-    # default is OFF — Delphi runs only via the explicit
-    # --step delphi-score audit (or by setting this flag back to True
-    # via --delphi-gate-inventory). v8.17–v8.18 history of this flag:
-    # introduced default-on, audit-driven flipped to default-off.
-    delphi_gate_in_inventory: bool = False
+    # v8.18.26: Delphi REMOVED entirely. The fields delphi_*,
+    # promote_use_delphi_gate, delphi_gate_in_inventory, etc. are
+    # gone. Delphi was nerfing supervised-SAE F1 by source-latent
+    # faithfulness filtering — the user's audit + experimental
+    # evidence both pointed at removal. Catalog quality is enforced
+    # via pipeline.catalog_quality (lexical + LLM crispness) and
+    # post-annotation overlap analysis instead.
 
     # Denylist of description patterns. During promote-loop triage, any
     # candidate description (from Sonnet) that contains ANY of these

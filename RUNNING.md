@@ -18,12 +18,12 @@ cd /workspace/Automated_Feature_Selection
 
 # One command — runs all three install compartments in order:
 #   1. --no-deps sae-lens transformer-lens     (skip their numpy<2 pin)
-#   2. pipeline + Delphi runtime deps
+#   2. pipeline deps
 #   3. --force-reinstall vllm                  (resolves the lens mismatch)
-# Plus clones Delphi, pip install -e it, uninstalls torchcodec.
+# Plus uninstalls torchcodec (vast.ai dlopen workaround).
 bash install.sh
 
-# API key for Sonnet (feature inventory + Delphi judge).
+# API key for Sonnet (feature inventory).
 export OPENROUTER_API_KEY="sk-or-..."
 ```
 
@@ -100,20 +100,19 @@ Both modes cache the system prefix + text tokens + token name. Only the feature 
 | MSE (legacy) | `--supervision mse` | MSE magnitude + direction (Makelov-style). |
 | BCE (legacy) | `--supervision bce` | BCE only, no decoder alignment. |
 
-## Catalog & Decoder Defaults (v8.18.25)
+## Catalog & Decoder Defaults (v8.18.26)
 
 | Default | Value | Override |
 |---|---|---|
 | Catalog quality validator | `quarantine` mode | `--catalog-gate-mode {report,hard}` |
 | Catalog flatten (no groups) | on | `--keep-groups` |
 | Scaffold catalog merge | on (33 control features) | `--no-scaffold` |
-| **Delphi inventory gate** | **OFF** (use as audit metadata via `--step delphi-score`) | `--delphi-gate-inventory` to opt in |
 | **Hinge-family frozen decoder** | **ON** (cos=1.0 by construction, FVE~0.30) | `--no-freeze-decoder` to ablate the principled formulation |
 | Target direction method | `mean_shift` | `--target-dir-method {logistic,lda}` |
 
-The flipped defaults (Delphi off, freeze on) reflect audit findings that:
-1. Delphi was nerfing supervised-SAE F1 by source-latent-faithfulness filtering — useful features got dropped because Sonnet couldn't predict their top-K activations crisply enough, even though the unsupervised post-train readout could still classify them.
-2. End-to-end hinge / gated_bce gave decoder cosines ~0.16 (random) and FVE ~0.005 (useless for intervention). Frozen decoder gives cos=1 + FVE ~0.30 at ~0.03 F1 cost vs. linear probe baseline.
+End-to-end hinge / gated_bce gave decoder cosines ~0.16 (random) and FVE ~0.005 (useless for intervention). Frozen decoder gives cos=1 + FVE ~0.30 at ~0.03 F1 cost vs. linear probe baseline.
+
+**v8.18.26: Delphi removed entirely** — the gate was nerfing supervised-SAE F1 by source-latent-faithfulness filtering (dropping easy-but-real features whose top-K activations Sonnet couldn't predict crisply enough). The post-annotation overlap report and the `pipeline.catalog_quality` validator handle catalog quality without Delphi.
 
 ## Gemma-2-2B
 

@@ -118,16 +118,8 @@ def main():
                  "weaknesses", "siphoning", "discover", "discover-loop",
                  "composition", "layer-sweep", "promote-loop", "usweep",
                  "hinge-ablation", "trim-by-kappa",
-                 "audit-feature", "rewrite-catalog", "delphi-score"],
+                 "audit-feature", "rewrite-catalog"],
         help="Run only this step",
-    )
-    parser.add_argument(
-        "--delphi-threshold", type=float, default=0.7,
-        help="For --step delphi-score (and the v8.15 promote-loop gate): "
-             "minimum DetectionScorer accuracy a description must achieve "
-             "to be kept. Default 0.7. The scorer asks a held-out judge "
-             "to label N activating + N non-activating examples; accuracy "
-             "is the mean of correct calls.",
     )
     parser.add_argument(
         "--target-dir-method", default=None,
@@ -173,36 +165,10 @@ def main():
         help="Force single-GPU annotation even when 2+ GPUs are visible. "
              "Use to leave a GPU free for another job.",
     )
-    parser.add_argument(
-        "--no-delphi-gate", action="store_true",
-        help="Disable the Delphi detection gate inside --step promote-loop. "
-             "Default-on as of v8.15. Use this if you want to rerun the "
-             "loop in pre-v8.15 behavior.",
-    )
-    parser.add_argument(
-        "--no-delphi-gate-inventory", action="store_true",
-        help="(v8.18.25: now a no-op since default is OFF) Disable the "
-             "Delphi detection gate inside --step inventory. Kept for "
-             "backwards compat — was used to opt out when default was on.",
-    )
-    parser.add_argument(
-        "--delphi-gate-inventory", action="store_true",
-        help="Opt IN to the Delphi detection gate inside --step inventory. "
-             "Off by default as of v8.18.25 (audit found Delphi was nerfing "
-             "supervised-SAE F1 by source-latent-faithfulness filtering "
-             "real features the unsupervised post-train readout could still "
-             "predict; use Delphi as audit metadata via --step delphi-score "
-             "instead).",
-    )
-    parser.add_argument(
-        "--delphi-judge-model", default=None,
-        help="Override the model the Delphi gate asks for binary detection "
-             "judgments. Default (v8.18.12+): anthropic/claude-haiku-4.5 "
-             "(~10x cheaper than Sonnet, sufficient for Detection task). "
-             "Pass anthropic/claude-sonnet-4.6 for final paper-quality runs "
-             "where absolute score fidelity matters. Empty string falls "
-             "back to organization_model (Sonnet).",
-    )
+    # v8.18.26: Delphi removed entirely. Removed flags:
+    #   --no-delphi-gate, --no-delphi-gate-inventory,
+    #   --delphi-gate-inventory, --delphi-judge-model,
+    #   --delphi-threshold, --step delphi-score
     parser.add_argument(
         "--feature-id", default=None,
         help="For --step audit-feature: catalog id of the feature to audit. "
@@ -382,21 +348,10 @@ def main():
         overrides["scaffold_catalog"] = args.scaffold_catalog
     if args.no_scaffold:
         overrides["scaffold_catalog"] = ""
-    # delphi_score_threshold is set via overrides so promote_loop reads
-    # the same value the user passed at the CLI.
-    overrides["delphi_score_threshold"] = args.delphi_threshold
     if args.annotation_gpus is not None:
         overrides["n_annotation_gpus"] = args.annotation_gpus
     if args.no_parallel_annotation:
         overrides["local_annotation_parallel"] = False
-    if args.no_delphi_gate:
-        overrides["promote_use_delphi_gate"] = False
-    if args.no_delphi_gate_inventory:
-        overrides["delphi_gate_in_inventory"] = False
-    if args.delphi_gate_inventory:
-        overrides["delphi_gate_in_inventory"] = True
-    if args.delphi_judge_model is not None:
-        overrides["delphi_judge_model"] = args.delphi_judge_model
     if args.keep_groups:
         overrides["flatten_catalog"] = False
     if args.supervision:
@@ -479,7 +434,7 @@ def main():
     # v8.16 fix (audit #1): scaffold merge ONLY fires for steps that
     # produce or consume the catalog freshly — `inventory`, `annotate`,
     # or a full pipeline run (args.step is None). Read-only steps like
-    # `evaluate`, `train`, `audit-feature`, `delphi-score`, etc. SKIP
+    # `evaluate`, `train`, `audit-feature`, etc. SKIP
     # the merge — bloating a 64-feature catalog to 97 mid-evaluate would
     # mismatch annotations.pt and the supervised SAE checkpoint, which
     # would crash on shape or silently give wrong numbers. Plus the
@@ -836,16 +791,6 @@ def main():
             run_causal=not args.sweep_skip_causal,
         )
         print(f"Layer sweep completed in {time.time() - t0:.1f}s")
-
-    # Delphi DetectionScorer over inventory descriptions (standalone)
-    if args.step == "delphi-score":
-        print("\n" + "=" * 70)
-        print("DELPHI SCORE — DetectionScorer over inventory descriptions")
-        print("=" * 70)
-        t0 = time.time()
-        from .delphi_score import run as run_delphi_score
-        run_delphi_score(cfg, threshold=args.delphi_threshold)
-        print(f"Delphi score completed in {time.time() - t0:.1f}s")
 
     # Per-feature human audit dump (TP / FP / FN markdown)
     if args.step == "audit-feature":

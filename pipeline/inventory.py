@@ -14,11 +14,7 @@ Usage:
 """
 
 import json
-import os
 import re
-import subprocess
-import sys
-import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -27,117 +23,6 @@ import torch
 from tqdm.auto import tqdm
 
 from .config import Config
-
-
-def _extract_activations_subprocess(cfg) -> None:
-    """Extract tokens.pt + activations.pt in a fresh Python subprocess so
-    no CUDA context bleeds into this parent process. Mirrors the pattern
-    annotate.py uses (see its `extract_script` block) — keeps the parent
-    GPU-pristine for vLLM cold-start.
-
-    v8.18.11: introduced because v8.17's in-parent extraction during the
-    Delphi gate caused vLLM to hang at parallel_state init in the
-    downstream annotate step (parent CUDA context was dirty from the
-    HookedTransformer forward passes that produced activations.pt).
-    """
-    extract_script = f"""
-import torch
-from pipeline.annotate import prepare_corpus, extract_activations
-from pipeline.inventory import load_target_model
-from pipeline.config import Config
-
-cfg = Config(
-    model_name={cfg.model_name!r}, device={cfg.device!r},
-    model_dtype={cfg.model_dtype!r}, n_sequences={cfg.n_sequences},
-    seq_len={cfg.seq_len}, corpus_batch_size={cfg.corpus_batch_size},
-    target_layer={cfg.target_layer}, output_dir={str(cfg.output_dir)!r},
-    hook_point={cfg.hook_point!r},
-    sae_release={cfg.sae_release!r}, sae_id={cfg.sae_id!r},
-)
-cfg.output_dir.mkdir(parents=True, exist_ok=True)
-model = load_target_model(cfg)
-from pipeline.cache_meta import write_cache_meta
-
-if not cfg.tokens_path.exists():
-    toks = prepare_corpus(model, cfg)
-    torch.save(toks, cfg.tokens_path)
-    write_cache_meta(cfg.tokens_path, "tokens", cfg)
-else:
-    toks = torch.load(cfg.tokens_path, weights_only=True)
-
-if not cfg.activations_path.exists():
-    acts = extract_activations(model, toks, cfg)
-    torch.save(acts, cfg.activations_path)
-    write_cache_meta(cfg.activations_path, "activations", cfg)
-"""
-    subprocess.run([sys.executable, "-c", extract_script], check=True)
-
-
-def _run_delphi_gate_subprocess(mode: str, payload: dict, cfg) -> tuple:
-    """Run a Delphi gate in a fresh Python subprocess so its imports
-    (faiss, sentence_transformers, bitsandbytes, vllm via Delphi's
-    pyproject) NEVER enter this process. v8.18.10 fix for the
-    "delphi processes features then vllm hangs" bug — by isolating
-    Delphi to a subprocess, the main pipeline process's CUDA / sys.modules
-    state stays clean so the downstream vLLM annotator starts cleanly.
-
-    `mode` must be 'inventory' or 'organized'.
-    `payload` is what the subprocess reads from --input.
-    `cfg` is the Config instance we serialize a relevant subset of.
-
-    Returns (kept_descriptions_or_filtered_catalog, score_log).
-    """
-    cfg_dict = {
-        "model_name": cfg.model_name,
-        "device": cfg.device,
-        "model_dtype": cfg.model_dtype,
-        "target_layer": cfg.target_layer,
-        "hook_point": cfg.hook_point,
-        "sae_release": cfg.sae_release,
-        "sae_id": cfg.sae_id,
-        "seed": cfg.seed,
-        "top_k_examples": getattr(cfg, "top_k_examples", 30),
-        "delphi_held_out_n": getattr(cfg, "delphi_held_out_n", 10),
-        "delphi_n_mid_tier": getattr(cfg, "delphi_n_mid_tier", 3),
-        "delphi_score_threshold": getattr(cfg, "delphi_score_threshold", 0.7),
-        "delphi_judge_model": getattr(cfg, "delphi_judge_model", ""),
-        "organization_model": cfg.organization_model,
-    }
-
-    with tempfile.TemporaryDirectory(prefix="delphi_gate_") as tmpdir:
-        in_path  = Path(tmpdir) / "input.json"
-        out_path = Path(tmpdir) / "output.json"
-        cfg_path = Path(tmpdir) / "cfg.json"
-        in_path.write_text(json.dumps(payload))
-        cfg_path.write_text(json.dumps(cfg_dict))
-
-        cmd = [
-            sys.executable, "-m", "pipeline.delphi_subprocess",
-            mode,
-            "--input",  str(in_path),
-            "--output", str(out_path),
-            "--cfg",    str(cfg_path),
-        ]
-        # Inherit env so OPENROUTER_API_KEY etc. propagate.
-        env = os.environ.copy()
-        try:
-            subprocess.run(cmd, check=True, env=env)
-        except subprocess.CalledProcessError as e:
-            # Subprocess wrote a sentinel error to output.json; read it.
-            if out_path.exists():
-                err = json.loads(out_path.read_text()).get("_subprocess_error")
-                raise RuntimeError(f"Delphi gate subprocess failed: {err}") from e
-            raise
-
-        result = json.loads(out_path.read_text())
-        if "_subprocess_error" in result:
-            raise RuntimeError(
-                f"Delphi gate subprocess error: {result['_subprocess_error']}"
-            )
-        if mode == "inventory":
-            return result["kept_descriptions"], result["score_log"]
-        else:
-            return result["filtered_catalog"], result["score_log"]
 
 
 def _extract_json_object(text: str) -> dict | None:
@@ -267,8 +152,10 @@ class PretrainedSAE:
 def load_sae(cfg: Config) -> tuple[PretrainedSAE, torch.Tensor | None]:
     """Load a pretrained SAE.
 
-    For GemmaScope releases we prefer direct npz loading (matches the reference
-    implementation in agentic-delphi/delphi/sparse_coders/custom/gemmascope.py).
+    For GemmaScope releases we prefer direct npz loading (matches the
+    reference JumpReluSae implementation: GemmaScope SAEs use
+    z = JumpReLU(x @ W_enc + b_enc) on bare residual stream, no
+    b_dec subtraction in encode).
     sae_lens is known to apply extra preprocessing to GemmaScope weights (e.g.,
     folding in normalization factors or adjusting for apply_b_dec_to_input),
     which breaks reconstruction when we use our bare PretrainedSAE wrapper.
@@ -353,7 +240,7 @@ def _load_sae_gemmascope_npz(cfg: Config) -> tuple[PretrainedSAE, None]:
     path = hf_hub_download(repo_id=repo_id, filename=filename)
 
     params = np.load(path)
-    # GemmaScope convention (matches JumpReluSae in agentic-delphi):
+    # GemmaScope convention (matches the reference JumpReluSae format):
     #   W_enc: (d_model, d_sae)
     #   W_dec: (d_sae, d_model)
     W_enc = torch.from_numpy(params["W_enc"].copy())   # (d_model, d_sae)
@@ -676,16 +563,8 @@ def explain_features(top_activations: dict, tokenizer, cfg: Config) -> dict:
             "Here are the latents:\n"
         ]
 
-        # v8.16 (audit fix #3): the describer sees only the first
-        # `top_k_examples - delphi_held_out_n` examples; the remaining
-        # `delphi_held_out_n` are reserved for the Delphi detection gate
-        # so its scoring is genuinely held-out. With defaults (top_k=30,
-        # held_out=10), Sonnet sees 20 — same as it always did pre-v8.16
-        # — and 10 fresh examples are reserved for scoring.
-        n_held_out = int(getattr(cfg, "delphi_held_out_n", 0))
-        n_for_describer = max(1, cfg.top_k_examples - n_held_out)
         for lat_idx in batch:
-            examples = top_activations[lat_idx][:n_for_describer]
+            examples = top_activations[lat_idx][:cfg.top_k_examples]
             examples_str = format_examples_for_prompt(examples, tokenizer)
             prompt_parts.append(f"\n--- Latent {lat_idx} ---\n{examples_str}\n")
 
@@ -943,91 +822,23 @@ def run(cfg: Config = None):
         cfg.raw_descriptions_path.write_text(json.dumps(descriptions, indent=2))
         print(f"Saved raw descriptions: {cfg.raw_descriptions_path}")
 
-    # 4b. (v8.17, refactored to subprocess in v8.18.10)
-    # Delphi detection gate — DROP descriptions before catalog.
-    #
-    # CRITICAL (v8.18.10): the gate runs in a SUBPROCESS, never inside this
-    # process. User report: "now that delphi processes those features, it's
-    # stuck. it was instant pre-delphi features." Root cause: importing the
-    # Delphi graph (faiss, sentence_transformers, bitsandbytes, vllm via
-    # Delphi's pyproject) leaves residual sys.modules / CUDA-context state
-    # in the main pipeline process. The downstream vLLM annotator (when run
-    # as part of a full pipeline invocation) inherits that state and hangs
-    # at parallel_state init. Running the gate in a subprocess isolates
-    # Delphi's imports completely — the parent process never imports
-    # delphi at all, only reads the subprocess's output JSON.
-    if getattr(cfg, "delphi_gate_in_inventory", True):
-        try:
-            # We need raw activations.pt; if it isn't there yet (first
-            # inventory run before annotation), extract it via SUBPROCESS
-            # so the parent-process CUDA context stays clean for the
-            # downstream vLLM annotator.
-            #
-            # v8.18.11 root-cause fix: pre-fix this block did the extract
-            # IN THE PARENT process (HookedTransformer forward passes,
-            # heavy CUDA work). After inventory finished, activations.pt
-            # existed, so --step annotate's own activation-extraction
-            # subprocess (added specifically to "isolate CUDA context"
-            # before vLLM startup) was SKIPPED — and vLLM inherited the
-            # parent's polluted CUDA context. Cold-start hang at
-            # parallel_state init followed. By running extraction in a
-            # subprocess here too, the parent never holds a CUDA context
-            # at all. Activation extraction takes ~2s + model load on a
-            # 5090 — minor cost vs. the cold-start hang it prevents.
-            if not cfg.activations_path.exists():
-                print(f"  [delphi-gate inventory] activations.pt not "
-                      f"found at {cfg.activations_path}; extracting "
-                      f"in subprocess so vLLM cold-start stays clean.")
-                _extract_activations_subprocess(cfg)
+    # v8.18.26: Delphi gate REMOVED entirely per user direction.
+    # The pre-fix gate (v8.17–v8.18.25) ran source-latent
+    # DetectionScorer over Sonnet descriptions and dropped the
+    # ones whose top-K activations Sonnet's judge couldn't predict
+    # crisply enough. Audit found this nerfed supervised-SAE F1
+    # without a corresponding lift on the unsupervised post-train
+    # readout — the gate optimized "source-latent faithfulness" not
+    # "useful supervised features." Inventory now writes the
+    # catalog without any Delphi step.
 
-            # Run the Delphi gate in a subprocess.
-            kept_descs, score_log = _run_delphi_gate_subprocess(
-                mode="inventory",
-                payload={
-                    "descriptions": descriptions,
-                    "top_activations": top_acts,
-                    "activations_path": str(cfg.activations_path),
-                    "tokens_path": str(cfg.tokens_path),
-                    "sae_release": cfg.sae_release,
-                    "sae_id": cfg.sae_id,
-                },
-                cfg=cfg,
-            )
-
-            # v8.18.15 visibility: surface subprocess skip mode in the parent
-            # log. Pre-fix the subprocess could fail-open (Delphi unavailable,
-            # missing API key) and the parent silently passed all
-            # descriptions through with no log message — user couldn't tell
-            # the gate had been bypassed.
-            if isinstance(score_log, dict):
-                gate_mode = score_log.get("_gate_mode")
-                if gate_mode == "skipped":
-                    skip_reason = score_log.get("_skip_reason", "unknown")
-                    print(f"  [delphi-gate inventory] SUBPROCESS RAN BUT "
-                          f"GATE SKIPPED — reason={skip_reason}. All "
-                          f"{len(descriptions)} descriptions passed "
-                          f"through unfiltered. To fix, ensure Delphi is "
-                          f"importable: pip install -e ./delphi-eleutherai/")
-
-            cfg.output_dir.joinpath("delphi_scores_inventory.json").write_text(
-                json.dumps({
-                    "threshold": getattr(cfg, "delphi_score_threshold", 0.7),
-                    "n_in":   len(descriptions),
-                    "n_kept": len(kept_descs),
-                    "scores": score_log,
-                }, indent=2)
-            )
-            # Replace the description set with the gated subset.
-            descriptions = kept_descs
-        except Exception as e:
-            print(f"  [delphi-gate inventory] error "
-                  f"({type(e).__name__}: {e}); skipping gate.")
-
-    # Free model only — keep SAE for the post-organize_hierarchy gate.
-    # Model isn't needed for organize_hierarchy or the second Delphi pass;
-    # SAE is. We free SAE after the second gate.
+    # Free model + SAE before the heavier organize_hierarchy LLM call.
     try:
         del model
+    except NameError:
+        pass
+    try:
+        del sae
     except NameError:
         pass
     if torch.cuda.is_available():
@@ -1035,49 +846,6 @@ def run(cfg: Config = None):
 
     # 5. Organize into hierarchy
     catalog = organize_hierarchy(descriptions, cfg)
-
-    # 5b. (v8.18 audit fix #1, refactored to subprocess in v8.18.10)
-    # Delphi gate on FINAL leaves. Same isolation rationale as gate 4b —
-    # runs in a subprocess so Delphi's imports never enter this process.
-    if getattr(cfg, "delphi_gate_in_inventory", True):
-        try:
-            if cfg.activations_path.exists() and cfg.tokens_path.exists():
-                catalog, organized_score_log = _run_delphi_gate_subprocess(
-                    mode="organized",
-                    payload={
-                        "catalog": catalog,
-                        "top_activations": top_acts,
-                        "activations_path": str(cfg.activations_path),
-                        "tokens_path": str(cfg.tokens_path),
-                        "sae_release": cfg.sae_release,
-                        "sae_id": cfg.sae_id,
-                    },
-                    cfg=cfg,
-                )
-                if isinstance(organized_score_log, dict):
-                    gate_mode = organized_score_log.get("_gate_mode")
-                    if gate_mode == "skipped":
-                        skip_reason = organized_score_log.get("_skip_reason", "unknown")
-                        print(f"  [delphi-gate organized] SUBPROCESS RAN BUT "
-                              f"GATE SKIPPED — reason={skip_reason}. Catalog "
-                              f"unfiltered. Fix: pip install -e ./delphi-eleutherai/")
-                cfg.output_dir.joinpath("delphi_scores_organized.json").write_text(
-                    json.dumps(organized_score_log, indent=2)
-                )
-            else:
-                print(f"  [delphi-gate organized] activations.pt/tokens.pt "
-                      f"not yet cached; second gate skipped.")
-        except Exception as e:
-            print(f"  [delphi-gate organized] error "
-                  f"({type(e).__name__}: {e}); skipping gate.")
-
-    # Now safe to free SAE — both gates are done.
-    try:
-        del sae
-    except NameError:
-        pass
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     # v8.18.20: catalog quality gates. Strict validator + quarantine
     # (per user's design: lexical flags trigger LLM crispness, not

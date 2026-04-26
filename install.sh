@@ -49,11 +49,11 @@ echo "=== Compartment 1: sae-lens + transformer-lens (--no-deps) ==="
 $UV_PIP --no-deps sae-lens transformer-lens
 
 echo ""
-echo "=== Compartment 2: pipeline deps (incl. Delphi runtime deps) ==="
-# All their real dependencies (minus torch/numpy/vllm).
-# Bundled with the v8.15-v8.18.6 Delphi runtime deps so a single
-# bash install.sh covers the whole pipeline including
-# --step delphi-score.
+echo "=== Compartment 2: pipeline deps ==="
+# v8.18.26: Delphi removed entirely. The Delphi-specific runtime
+# deps (faiss-cpu, sentence-transformers, aiofiles, anyio, asyncer,
+# fire, flask, eai-sparsify, bitsandbytes, orjson, blobfile, httpx)
+# are dropped from the install. The pipeline's own deps remain.
 $UV_PIP \
     datasets \
     huggingface-hub \
@@ -81,19 +81,7 @@ $UV_PIP \
     typing-extensions \
     transformers \
     transformers-stream-generator \
-    pandas \
-    orjson \
-    blobfile \
-    httpx \
-    faiss-cpu \
-    sentence-transformers \
-    aiofiles \
-    "anyio>=4.8.0" \
-    "asyncer>=0.0.8" \
-    fire \
-    flask \
-    eai-sparsify \
-    bitsandbytes
+    pandas
 
 echo ""
 echo "=== Compartment 3: vllm (--force-reinstall) ==="
@@ -106,21 +94,6 @@ $UV_PIP --force-reinstall vllm
 # /venv/main/.../libtorchcodec_core4.so`. We don't need video
 # decoding — uninstall it preemptively.
 $UV_UNINSTALL torchcodec 2>/dev/null || true
-
-# Delphi (EleutherAI) for --step delphi-score and the inventory
-# / promote-loop gates. Cloned alongside the supsae checkout if
-# not already present, then installed editable so its own
-# pyproject.toml deps fill in any gaps the explicit list above
-# missed (and any future deps Delphi adds).
-DELPHI_DIR="${DELPHI_DIR:-./delphi-eleutherai}"
-if [ ! -d "$DELPHI_DIR" ]; then
-    echo ""
-    echo "=== Cloning EleutherAI/delphi to $DELPHI_DIR ==="
-    git clone https://github.com/EleutherAI/delphi.git "$DELPHI_DIR"
-fi
-echo ""
-echo "=== Installing Delphi as editable package ==="
-$UV_PIP -e "$DELPHI_DIR"
 
 # Verify
 echo ""
@@ -136,9 +109,6 @@ for mod, name in [
     ('numpy', 'numpy'),
     ('datasets', 'datasets'),
     ('einops', 'einops'),
-    ('delphi.scorers.classifier.detection', 'delphi'),
-    ('faiss', 'faiss-cpu'),
-    ('sentence_transformers', 'sentence-transformers'),
 ]:
     try:
         m = __import__(mod, fromlist=['_'])
