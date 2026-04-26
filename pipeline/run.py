@@ -128,6 +128,15 @@ def main():
              "Delphi was only a post-hoc audit via --step delphi-score.",
     )
     parser.add_argument(
+        "--delphi-judge-model", default=None,
+        help="Override the model the Delphi gate asks for binary detection "
+             "judgments. Default (v8.18.12+): anthropic/claude-haiku-4.5 "
+             "(~10x cheaper than Sonnet, sufficient for Detection task). "
+             "Pass anthropic/claude-sonnet-4.6 for final paper-quality runs "
+             "where absolute score fidelity matters. Empty string falls "
+             "back to organization_model (Sonnet).",
+    )
+    parser.add_argument(
         "--feature-id", default=None,
         help="For --step audit-feature: catalog id of the feature to audit. "
              "Empty string + --audit-cal-f1-below batch-audits every feature "
@@ -311,6 +320,8 @@ def main():
         overrides["promote_use_delphi_gate"] = False
     if args.no_delphi_gate_inventory:
         overrides["delphi_gate_in_inventory"] = False
+    if args.delphi_judge_model is not None:
+        overrides["delphi_judge_model"] = args.delphi_judge_model
     if args.keep_groups:
         overrides["flatten_catalog"] = False
     if args.supervision:
