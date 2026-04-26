@@ -43,6 +43,13 @@ def main():
                         help="L1 sparsity loss weight (default: 0.05; bump for tighter unsup L0)")
     parser.add_argument("--lambda-hier", type=float, default=None,
                         help="Hierarchy loss weight (default: 0.5)")
+    parser.add_argument("--n-unsupervised", type=int, default=None,
+                        help="Number of unsupervised SAE latents (default 256). "
+                             "Set to 0 to force the supervised slice to carry "
+                             "all reconstruction — diagnostic test for "
+                             "whether decoder-cosine drift comes from the "
+                             "unsupervised slice absorbing reconstruction "
+                             "pressure off the supervised columns.")
     parser.add_argument("--local-annotator", action="store_true",
                         help="Use local model for annotation (vLLM)")
     parser.add_argument("--annotator-model", default=None,
@@ -311,6 +318,8 @@ def main():
         overrides["n_lista_steps"] = args.lista
     if args.lambda_sup is not None:
         overrides["lambda_sup"] = args.lambda_sup
+    if args.n_unsupervised is not None:
+        overrides["n_unsupervised"] = args.n_unsupervised
     if args.lambda_sparse is not None:
         overrides["lambda_sparse"] = args.lambda_sparse
     if args.lambda_hier is not None:
