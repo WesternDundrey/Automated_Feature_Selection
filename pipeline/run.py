@@ -112,6 +112,15 @@ def main():
              "loop in pre-v8.15 behavior.",
     )
     parser.add_argument(
+        "--no-delphi-gate-inventory", action="store_true",
+        help="Disable the Delphi detection gate inside --step inventory. "
+             "Default-on as of v8.17 — the gate filters fuzzy descriptions "
+             "BEFORE they enter the catalog so annotation budget is spent "
+             "only on descriptions that can predict their own latent's "
+             "firing. Use this flag to restore pre-v8.17 behavior where "
+             "Delphi was only a post-hoc audit via --step delphi-score.",
+    )
+    parser.add_argument(
         "--feature-id", default=None,
         help="For --step audit-feature: catalog id of the feature to audit. "
              "Empty string + --audit-cal-f1-below batch-audits every feature "
@@ -293,6 +302,8 @@ def main():
     overrides["delphi_score_threshold"] = args.delphi_threshold
     if args.no_delphi_gate:
         overrides["promote_use_delphi_gate"] = False
+    if args.no_delphi_gate_inventory:
+        overrides["delphi_gate_in_inventory"] = False
     if args.supervision:
         overrides["supervision_mode"] = args.supervision
     if args.gated_tie_weights:

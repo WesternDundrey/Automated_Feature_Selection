@@ -4,6 +4,80 @@
 
 ---
 
+## [v8.17] — Delphi at the catalog: drop bad descriptions BEFORE annotation
+
+**Date:** 2026-04-26
+
+### Motivation
+
+User: "why isn't delphi used at the catalog? isn't that the whole point of using delphi? to not waste time annotating useless features and get good features or force good features?"
+
+Correct, and v8.15 / v8.16 were half-measures. The Delphi gate was running in:
+
+- `promote_loop.run` — for new features added during iterative discovery (good)
+- `--step delphi-score` — as a post-hoc audit that didn't filter anything (decorative)
+
+But NOT at the actual catalog gate during `--step inventory`. The pretrained-SAE descriptions that became the initial catalog flowed straight into `organize_hierarchy` without any held-out validation — annotation budget was being spent on whatever Sonnet wrote, regardless of whether the description could predict its own latent's firing.
+
+The original excuse ("activations.pt holds residual stream, not SAE codes; would need a fresh SAE forward") was real but trivially fixable — v8.16 already wrote `_encode_pretrained_sae_for_latents` for exactly this purpose, used by the standalone `--step delphi-score`. v8.17 just calls that helper from `inventory.run` and uses the result to filter descriptions before they reach `organize_hierarchy`.
+
+### Implementation
+
+`pipeline/delphi_score.py` — new public function `gate_inventory_descriptions(sae, activations, tokens, descriptions, top_activations, tokenizer, cfg, threshold)` that:
+
+1. Subsets the descriptions dict to keys that parse as valid latent indices in `sae.W_enc`.
+2. Calls `_encode_pretrained_sae_for_latents` to compute `(N, T, K)` SAE codes for only those K latents — chunked at 8192 rows, never materializes the full `(N, T, d_sae)` tensor.
+3. Calls `score_descriptions` with held-out positives (`top_activations[20:30]` by default — examples Sonnet didn't see).
+4. Returns `(kept_descriptions_dict, score_log)`.
+
+`pipeline/inventory.py` — calls `gate_inventory_descriptions` between `explain_features` and `organize_hierarchy`. The gate sees the SAE we just used to collect top activations (no second load), reuses cached `activations.pt` and `tokens.pt` if present, or extracts them on-the-fly if not. Drops descriptions below `cfg.delphi_score_threshold` (default 0.7). The pruned dict feeds `organize_hierarchy`, so the catalog only contains descriptions that proved they predict their own latent's firing.
+
+Per-latent score log written to `pipeline_data/delphi_scores_inventory.json` with the threshold, kept/dropped counts, and full per-description scores. The post-hoc `--step delphi-score` still works for re-scoring the existing inventory; v8.17 just makes the same gate run automatically during the inventory step.
+
+Failure modes (Delphi import error, no API key, transport error): fail-open — every description is kept and the reason is logged. The gate must never silently nuke the whole catalog for an environment problem.
+
+### CLI
+
+- Default-on. No new flags needed for the standard run.
+- `--no-delphi-gate-inventory`: opt out, restore pre-v8.17 behavior (Delphi only as post-hoc audit).
+- `cfg.delphi_gate_in_inventory: bool = True` — config-level toggle.
+
+### Effect on the clean run
+
+```bash
+python -m pipeline.run \
+--layer 9 --sae_id blocks.9.hook_resid_pre \
+--local-annotator --full-desc \
+--n_sequences 1000 \
+--delphi-threshold 0.7
+```
+
+What now happens:
+
+1. `inventory`: collect 30 top activations per pretrained-SAE latent, generate descriptions on the first 20.
+2. **`inventory` (Delphi gate, NEW v8.17)**: encode held-out latent activations, ask Delphi judge to label activating + non-activating contexts, drop descriptions with detection accuracy < 0.7. Per-description scores logged to `delphi_scores_inventory.json`.
+3. `inventory` continues: organize the SURVIVING descriptions into the hierarchical catalog.
+4. `annotate`: now runs only over the Delphi-validated catalog. Budget no longer spent on fuzzy descriptions.
+5. `train` / `evaluate`: unchanged.
+
+Expected impact: the catalog drops from ~50–80 features to ~30–60 (depending on threshold + judge model). Annotation runtime drops proportionally. Per-feature `cal_F1` improves because the surviving features are the ones whose descriptions are actually testable.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/delphi_score.py` | `gate_inventory_descriptions` public function (extracted from `--step delphi-score` logic) |
+| `pipeline/inventory.py` | Calls `gate_inventory_descriptions` between `explain_features` and `organize_hierarchy`; auto-extracts activations/tokens if not yet cached |
+| `pipeline/config.py` | `delphi_gate_in_inventory: bool = True` |
+| `pipeline/run.py` | `--no-delphi-gate-inventory` CLI flag |
+| `changes.md` | This entry |
+
+### What this changes about the v8.15/v8.16 framing
+
+v8.15 docstring claimed "the gate runs at two slots: inventory.run and promote_loop.run" — that was wrong then (only promote_loop) and is right now (both). v8.16 changelog said the inventory gate was "intentionally NOT inlined" — that was the wrong call. The user's audit got us back to the right design.
+
+---
+
 ## [v8.16] — Audit fixes: scaffold scope, real SAE codes for delphi-score, held-out positives, doc accuracy
 
 **Date:** 2026-04-26

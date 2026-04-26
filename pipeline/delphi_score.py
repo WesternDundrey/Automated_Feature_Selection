@@ -599,6 +599,154 @@ def gate_promote_loop_candidates(
     return kept, log
 
 
+# ── inventory-time gate: filter descriptions before the catalog ───────
+
+
+def gate_inventory_descriptions(
+    sae,
+    activations: torch.Tensor,    # (N, T, d_model) residual stream
+    tokens: torch.Tensor,          # (N, T) token IDs
+    descriptions: dict[str, str],
+    top_activations: dict[str, list[dict]],
+    tokenizer,
+    cfg: Config,
+    threshold: float | None = None,
+    judge_model: str | None = None,
+) -> tuple[dict[str, str], dict]:
+    """Gate the inventory's pretrained-SAE descriptions through Delphi
+    DetectionScorer BEFORE they enter the feature catalog. Returns
+    (kept_descriptions, score_log).
+
+    This is what the user actually wanted from "Delphi integration":
+    drop descriptions whose own held-out latent firing the description
+    can't predict, so the annotator never wastes budget on fuzzy
+    descriptions. Pre-v8.17 this was deferred to a standalone audit
+    (`--step delphi-score`); v8.17 makes it the default catalog filter.
+
+    `descriptions` keys must be string-form integer indices into
+    `sae.W_enc`'s last axis (i.e., latent indices). Same convention as
+    `inventory.collect_top_activations` produces.
+
+    Fail-open: if Delphi is unavailable / no API key / transport errors,
+    every description is kept and the reason is logged. The gate must
+    never silently nuke the whole catalog for an environment problem.
+    """
+    threshold = float(
+        threshold
+        if threshold is not None
+        else getattr(cfg, "delphi_score_threshold", 0.7)
+    )
+
+    if not _bootstrap_delphi():
+        msg = _DELPHI_IMPORT_ERROR or "delphi unavailable"
+        print(f"  [delphi-gate inventory] skipped: {msg}")
+        return descriptions, {
+            lid: {"score": None, "kept": True, "reason": "delphi_unavailable"}
+            for lid in descriptions
+        }
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        print("  [delphi-gate inventory] skipped: OPENROUTER_API_KEY not set")
+        return descriptions, {
+            lid: {"score": None, "kept": True, "reason": "no_api_key"}
+            for lid in descriptions
+        }
+
+    # Subset to descriptions whose keys parse as valid latent indices.
+    latent_ids: list[int] = []
+    valid_keys: list[str] = []
+    for k in descriptions.keys():
+        try:
+            lid = int(k)
+        except ValueError:
+            continue
+        if 0 <= lid < sae.d_sae:
+            latent_ids.append(lid)
+            valid_keys.append(k)
+    if not latent_ids:
+        print("  [delphi-gate inventory] no valid latent ids; skipping")
+        return descriptions, {}
+
+    if activations.dim() != 3:
+        print(f"  [delphi-gate inventory] unexpected activations shape "
+              f"{tuple(activations.shape)}; skipping")
+        return descriptions, {}
+    N, T, d_model = activations.shape
+    print(f"  [delphi-gate inventory] encoding {len(latent_ids)} latents "
+          f"through pretrained SAE (chunked, no full d_sae materialization)...")
+    x_flat = activations.reshape(-1, d_model).to(torch.float32)
+    sae_codes = _encode_pretrained_sae_for_latents(
+        sae, x_flat, N, T, latent_ids, device=cfg.device,
+    )
+
+    # Re-key by stack position so score_descriptions's last-axis indexing
+    # lines up with sae_codes' last axis.
+    pos_keyed_descs = {
+        str(i): descriptions[k] for i, k in enumerate(valid_keys)
+    }
+    pos_keyed_top_acts = {
+        str(i): top_activations.get(k, []) for i, k in enumerate(valid_keys)
+    }
+
+    print(f"  [delphi-gate inventory] scoring {len(pos_keyed_descs)} "
+          f"descriptions against held-out latent firing "
+          f"(threshold={threshold:.2f})")
+
+    pos_scores = score_descriptions(
+        descriptions=pos_keyed_descs,
+        top_activations=pos_keyed_top_acts,
+        full_tokens=tokens,
+        activations=sae_codes,
+        latent_offset=0,
+        tokenizer=tokenizer,
+        cfg=cfg,
+        threshold=threshold,
+        judge_model=judge_model,
+        api_key=api_key,
+    )
+
+    # Reverse-map back to original latent-id keys.
+    score_log: dict = {}
+    kept: dict[str, str] = {}
+    for i, k in enumerate(valid_keys):
+        s = pos_scores.get(str(i), {
+            "score": None, "kept": True, "reason": "missing_score",
+        })
+        score_log[k] = {**s, "description": descriptions[k]}
+        if s.get("kept", True):
+            kept[k] = descriptions[k]
+    # Carry through any descriptions whose keys couldn't be parsed —
+    # these never went through the gate but shouldn't be dropped silently.
+    for k, desc in descriptions.items():
+        if k not in score_log:
+            kept[k] = desc
+            score_log[k] = {
+                "score": None, "kept": True,
+                "reason": "non_integer_key",
+                "description": desc,
+            }
+
+    n_dropped = len(descriptions) - len(kept)
+    if n_dropped > 0:
+        print(f"  [delphi-gate inventory] kept {len(kept)} of "
+              f"{len(descriptions)} descriptions (dropped {n_dropped} below "
+              f"threshold {threshold:.2f})")
+        # Show the worst 10 drops so the user can eyeball
+        dropped_with_scores = sorted(
+            [(k, score_log[k]["score"]) for k in score_log
+             if not score_log[k].get("kept", True)
+             and score_log[k].get("score") is not None],
+            key=lambda kv: kv[1] if kv[1] is not None else 0.0,
+        )
+        for k, s in dropped_with_scores[:10]:
+            print(f"    drop L{k} (score={s:.3f}): {descriptions[k][:80]}")
+    else:
+        print(f"  [delphi-gate inventory] kept all {len(kept)} descriptions")
+
+    return kept, score_log
+
+
 # ── CLI: `--step delphi-score` ──────────────────────────────────────────
 
 

@@ -215,6 +215,15 @@ class Config:
     # Whether `--step promote-loop` runs the Delphi gate between
     # crispness and the mini-prefilter. Default-on as of v8.15.
     promote_use_delphi_gate: bool = True
+    # v8.17: whether `--step inventory` runs the Delphi gate between
+    # description generation and organize_hierarchy. Default-on. Set
+    # to False (or pass --no-delphi-gate-inventory at the CLI) to
+    # restore the pre-v8.17 behavior where Delphi was only a post-hoc
+    # audit via `--step delphi-score`. The point of having it on by
+    # default: drop fuzzy descriptions BEFORE they enter the catalog,
+    # so the annotator never spends budget on descriptions that can't
+    # even predict their own latent's firing.
+    delphi_gate_in_inventory: bool = True
 
     # Denylist of description patterns. During promote-loop triage, any
     # candidate description (from Sonnet) that contains ANY of these

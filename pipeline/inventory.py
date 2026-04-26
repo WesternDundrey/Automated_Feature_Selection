@@ -759,21 +759,81 @@ def run(cfg: Config = None):
         cfg.raw_descriptions_path.write_text(json.dumps(descriptions, indent=2))
         print(f"Saved raw descriptions: {cfg.raw_descriptions_path}")
 
+    # 4b. (v8.17) Delphi detection gate — DROP descriptions before catalog.
+    # User feedback: "why isn't delphi used at the catalog? isn't that the
+    # whole point of using delphi? to not waste time annotating useless
+    # features and get good features or force good features?"
+    #
+    # Pre-v8.17 the gate was a post-hoc audit (--step delphi-score) that
+    # didn't filter the catalog. v8.17 wires it BEFORE organize_hierarchy:
+    # for each Sonnet description, ask Delphi's DetectionScorer to label
+    # held-out activating + non-activating examples; descriptions whose
+    # judge accuracy is below `cfg.delphi_score_threshold` are dropped.
+    # The result feeds into organize_hierarchy, so the catalog only
+    # contains descriptions that proved they predict their own latent's
+    # firing.
+    #
+    # Reuses the SAE we just loaded (don't free it before this gate).
+    # Skipped when `cfg.delphi_gate_in_inventory=False` or when Delphi
+    # imports fail / OPENROUTER_API_KEY missing (fail-open).
+    if getattr(cfg, "delphi_gate_in_inventory", True):
+        try:
+            from .delphi_score import gate_inventory_descriptions, is_available
+            ok, why = is_available()
+            if not ok:
+                print(f"  [delphi-gate inventory] {why}")
+            else:
+                # We need raw activations.pt; if it isn't there yet (first
+                # inventory run before annotation), we have to extract it.
+                if not cfg.activations_path.exists():
+                    print(f"  [delphi-gate inventory] activations.pt not "
+                          f"found at {cfg.activations_path}; extracting "
+                          f"so the gate can sample non-activating positions.")
+                    from .annotate import prepare_corpus, extract_activations
+                    if not cfg.tokens_path.exists():
+                        toks = prepare_corpus(model, cfg)
+                        torch.save(toks, cfg.tokens_path)
+                        from .cache_meta import write_cache_meta
+                        write_cache_meta(cfg.tokens_path, "tokens", cfg)
+                    else:
+                        toks = torch.load(cfg.tokens_path, weights_only=True)
+                    acts_extracted = extract_activations(model, toks, cfg)
+                    torch.save(acts_extracted, cfg.activations_path)
+                    from .cache_meta import write_cache_meta
+                    write_cache_meta(cfg.activations_path, "activations", cfg)
+                activations_full = torch.load(
+                    cfg.activations_path, weights_only=True,
+                )
+                tokens_full = torch.load(cfg.tokens_path, weights_only=True)
+
+                kept_descs, score_log = gate_inventory_descriptions(
+                    sae=sae,
+                    activations=activations_full,
+                    tokens=tokens_full,
+                    descriptions=descriptions,
+                    top_activations=top_acts,
+                    tokenizer=tokenizer,
+                    cfg=cfg,
+                    threshold=getattr(cfg, "delphi_score_threshold", 0.7),
+                )
+
+                cfg.output_dir.joinpath("delphi_scores_inventory.json").write_text(
+                    json.dumps({
+                        "threshold": getattr(cfg, "delphi_score_threshold", 0.7),
+                        "n_in":   len(descriptions),
+                        "n_kept": len(kept_descs),
+                        "scores": score_log,
+                    }, indent=2)
+                )
+                # Replace the description set with the gated subset.
+                descriptions = kept_descs
+        except Exception as e:
+            print(f"  [delphi-gate inventory] error "
+                  f"({type(e).__name__}: {e}); skipping gate.")
+
     # Free GPU memory before LLM calls
     del model, sae
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-    # NOTE (v8.15): the Delphi detection gate is NOT run here at inventory
-    # time. The gate needs per-latent activation maps to sample
-    # non-activating positions, which would require re-running the
-    # pretrained SAE on activations.pt. The supervised promote_loop has
-    # the same gate built in (see `delphi_score.score_descriptions`)
-    # where it's free — the supervised SAE's `all_acts` tensor is
-    # already in memory after a forward pass. To run the gate over
-    # pretrained-SAE descriptions explicitly, use:
-    #     python -m pipeline.run --step delphi-score
-    # which loads the inventory's top_activations.json + raw_descriptions.json
-    # and writes a per-latent score file without modifying the catalog.
 
     # 5. Organize into hierarchy
     catalog = organize_hierarchy(descriptions, cfg)
