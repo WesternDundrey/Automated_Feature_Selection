@@ -14,7 +14,11 @@ Usage:
 """
 
 import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -23,6 +27,73 @@ import torch
 from tqdm.auto import tqdm
 
 from .config import Config
+
+
+def _run_delphi_gate_subprocess(mode: str, payload: dict, cfg) -> tuple:
+    """Run a Delphi gate in a fresh Python subprocess so its imports
+    (faiss, sentence_transformers, bitsandbytes, vllm via Delphi's
+    pyproject) NEVER enter this process. v8.18.10 fix for the
+    "delphi processes features then vllm hangs" bug — by isolating
+    Delphi to a subprocess, the main pipeline process's CUDA / sys.modules
+    state stays clean so the downstream vLLM annotator starts cleanly.
+
+    `mode` must be 'inventory' or 'organized'.
+    `payload` is what the subprocess reads from --input.
+    `cfg` is the Config instance we serialize a relevant subset of.
+
+    Returns (kept_descriptions_or_filtered_catalog, score_log).
+    """
+    cfg_dict = {
+        "model_name": cfg.model_name,
+        "device": cfg.device,
+        "model_dtype": cfg.model_dtype,
+        "target_layer": cfg.target_layer,
+        "hook_point": cfg.hook_point,
+        "sae_release": cfg.sae_release,
+        "sae_id": cfg.sae_id,
+        "seed": cfg.seed,
+        "top_k_examples": getattr(cfg, "top_k_examples", 30),
+        "delphi_held_out_n": getattr(cfg, "delphi_held_out_n", 10),
+        "delphi_n_mid_tier": getattr(cfg, "delphi_n_mid_tier", 3),
+        "delphi_score_threshold": getattr(cfg, "delphi_score_threshold", 0.7),
+        "delphi_judge_model": getattr(cfg, "delphi_judge_model", ""),
+        "organization_model": cfg.organization_model,
+    }
+
+    with tempfile.TemporaryDirectory(prefix="delphi_gate_") as tmpdir:
+        in_path  = Path(tmpdir) / "input.json"
+        out_path = Path(tmpdir) / "output.json"
+        cfg_path = Path(tmpdir) / "cfg.json"
+        in_path.write_text(json.dumps(payload))
+        cfg_path.write_text(json.dumps(cfg_dict))
+
+        cmd = [
+            sys.executable, "-m", "pipeline.delphi_subprocess",
+            mode,
+            "--input",  str(in_path),
+            "--output", str(out_path),
+            "--cfg",    str(cfg_path),
+        ]
+        # Inherit env so OPENROUTER_API_KEY etc. propagate.
+        env = os.environ.copy()
+        try:
+            subprocess.run(cmd, check=True, env=env)
+        except subprocess.CalledProcessError as e:
+            # Subprocess wrote a sentinel error to output.json; read it.
+            if out_path.exists():
+                err = json.loads(out_path.read_text()).get("_subprocess_error")
+                raise RuntimeError(f"Delphi gate subprocess failed: {err}") from e
+            raise
+
+        result = json.loads(out_path.read_text())
+        if "_subprocess_error" in result:
+            raise RuntimeError(
+                f"Delphi gate subprocess error: {result['_subprocess_error']}"
+            )
+        if mode == "inventory":
+            return result["kept_descriptions"], result["score_log"]
+        else:
+            return result["filtered_catalog"], result["score_log"]
 
 
 def _extract_json_object(text: str) -> dict | None:
@@ -782,74 +853,65 @@ def run(cfg: Config = None):
         cfg.raw_descriptions_path.write_text(json.dumps(descriptions, indent=2))
         print(f"Saved raw descriptions: {cfg.raw_descriptions_path}")
 
-    # 4b. (v8.17) Delphi detection gate — DROP descriptions before catalog.
-    # User feedback: "why isn't delphi used at the catalog? isn't that the
-    # whole point of using delphi? to not waste time annotating useless
-    # features and get good features or force good features?"
+    # 4b. (v8.17, refactored to subprocess in v8.18.10)
+    # Delphi detection gate — DROP descriptions before catalog.
     #
-    # Pre-v8.17 the gate was a post-hoc audit (--step delphi-score) that
-    # didn't filter the catalog. v8.17 wires it BEFORE organize_hierarchy:
-    # for each Sonnet description, ask Delphi's DetectionScorer to label
-    # held-out activating + non-activating examples; descriptions whose
-    # judge accuracy is below `cfg.delphi_score_threshold` are dropped.
-    # The result feeds into organize_hierarchy, so the catalog only
-    # contains descriptions that proved they predict their own latent's
-    # firing.
-    #
-    # Reuses the SAE we just loaded (don't free it before this gate).
-    # Skipped when `cfg.delphi_gate_in_inventory=False` or when Delphi
-    # imports fail / OPENROUTER_API_KEY missing (fail-open).
+    # CRITICAL (v8.18.10): the gate runs in a SUBPROCESS, never inside this
+    # process. User report: "now that delphi processes those features, it's
+    # stuck. it was instant pre-delphi features." Root cause: importing the
+    # Delphi graph (faiss, sentence_transformers, bitsandbytes, vllm via
+    # Delphi's pyproject) leaves residual sys.modules / CUDA-context state
+    # in the main pipeline process. The downstream vLLM annotator (when run
+    # as part of a full pipeline invocation) inherits that state and hangs
+    # at parallel_state init. Running the gate in a subprocess isolates
+    # Delphi's imports completely — the parent process never imports
+    # delphi at all, only reads the subprocess's output JSON.
     if getattr(cfg, "delphi_gate_in_inventory", True):
         try:
-            from .delphi_score import gate_inventory_descriptions, is_available
-            ok, why = is_available()
-            if not ok:
-                print(f"  [delphi-gate inventory] {why}")
-            else:
-                # We need raw activations.pt; if it isn't there yet (first
-                # inventory run before annotation), we have to extract it.
-                if not cfg.activations_path.exists():
-                    print(f"  [delphi-gate inventory] activations.pt not "
-                          f"found at {cfg.activations_path}; extracting "
-                          f"so the gate can sample non-activating positions.")
-                    from .annotate import prepare_corpus, extract_activations
-                    if not cfg.tokens_path.exists():
-                        toks = prepare_corpus(model, cfg)
-                        torch.save(toks, cfg.tokens_path)
-                        from .cache_meta import write_cache_meta
-                        write_cache_meta(cfg.tokens_path, "tokens", cfg)
-                    else:
-                        toks = torch.load(cfg.tokens_path, weights_only=True)
-                    acts_extracted = extract_activations(model, toks, cfg)
-                    torch.save(acts_extracted, cfg.activations_path)
+            # We need raw activations.pt; if it isn't there yet (first
+            # inventory run before annotation), extract it now in this
+            # process (still safe — no Delphi imports).
+            if not cfg.activations_path.exists():
+                print(f"  [delphi-gate inventory] activations.pt not "
+                      f"found at {cfg.activations_path}; extracting "
+                      f"so the gate can sample non-activating positions.")
+                from .annotate import prepare_corpus, extract_activations
+                if not cfg.tokens_path.exists():
+                    toks = prepare_corpus(model, cfg)
+                    torch.save(toks, cfg.tokens_path)
                     from .cache_meta import write_cache_meta
-                    write_cache_meta(cfg.activations_path, "activations", cfg)
-                activations_full = torch.load(
-                    cfg.activations_path, weights_only=True,
-                )
-                tokens_full = torch.load(cfg.tokens_path, weights_only=True)
+                    write_cache_meta(cfg.tokens_path, "tokens", cfg)
+                else:
+                    toks = torch.load(cfg.tokens_path, weights_only=True)
+                acts_extracted = extract_activations(model, toks, cfg)
+                torch.save(acts_extracted, cfg.activations_path)
+                from .cache_meta import write_cache_meta
+                write_cache_meta(cfg.activations_path, "activations", cfg)
 
-                kept_descs, score_log = gate_inventory_descriptions(
-                    sae=sae,
-                    activations=activations_full,
-                    tokens=tokens_full,
-                    descriptions=descriptions,
-                    top_activations=top_acts,
-                    tokenizer=tokenizer,
-                    cfg=cfg,
-                    threshold=getattr(cfg, "delphi_score_threshold", 0.7),
-                )
+            # Run the Delphi gate in a subprocess.
+            kept_descs, score_log = _run_delphi_gate_subprocess(
+                mode="inventory",
+                payload={
+                    "descriptions": descriptions,
+                    "top_activations": top_acts,
+                    "activations_path": str(cfg.activations_path),
+                    "tokens_path": str(cfg.tokens_path),
+                    "sae_release": cfg.sae_release,
+                    "sae_id": cfg.sae_id,
+                },
+                cfg=cfg,
+            )
 
-                cfg.output_dir.joinpath("delphi_scores_inventory.json").write_text(
-                    json.dumps({
-                        "threshold": getattr(cfg, "delphi_score_threshold", 0.7),
-                        "n_in":   len(descriptions),
-                        "n_kept": len(kept_descs),
-                        "scores": score_log,
-                    }, indent=2)
-                )
-                # Replace the description set with the gated subset.
-                descriptions = kept_descs
+            cfg.output_dir.joinpath("delphi_scores_inventory.json").write_text(
+                json.dumps({
+                    "threshold": getattr(cfg, "delphi_score_threshold", 0.7),
+                    "n_in":   len(descriptions),
+                    "n_kept": len(kept_descs),
+                    "scores": score_log,
+                }, indent=2)
+            )
+            # Replace the description set with the gated subset.
+            descriptions = kept_descs
         except Exception as e:
             print(f"  [delphi-gate inventory] error "
                   f"({type(e).__name__}: {e}); skipping gate.")
@@ -867,42 +929,30 @@ def run(cfg: Config = None):
     # 5. Organize into hierarchy
     catalog = organize_hierarchy(descriptions, cfg)
 
-    # 5b. (v8.18 audit fix #1) Delphi gate on FINAL leaves. organize_hierarchy
-    # is allowed to rewrite descriptions and drop redundant ones, but each
-    # leaf must declare `source_latents`. We re-score the rewritten
-    # description against the source latent's actual firing pattern. Leaves
-    # that drift too far OR have no source_latents are dropped — closes the
-    # v8.17 hole where rewrites and gap-fill bypassed Delphi.
+    # 5b. (v8.18 audit fix #1, refactored to subprocess in v8.18.10)
+    # Delphi gate on FINAL leaves. Same isolation rationale as gate 4b —
+    # runs in a subprocess so Delphi's imports never enter this process.
     if getattr(cfg, "delphi_gate_in_inventory", True):
         try:
-            from .delphi_score import gate_organized_leaves, is_available
-            ok, why = is_available()
-            if ok:
-                if cfg.activations_path.exists() and cfg.tokens_path.exists():
-                    activations_full = torch.load(
-                        cfg.activations_path, weights_only=True,
-                    )
-                    tokens_full = torch.load(
-                        cfg.tokens_path, weights_only=True,
-                    )
-                    catalog, organized_score_log = gate_organized_leaves(
-                        catalog=catalog,
-                        sae=sae,
-                        activations=activations_full,
-                        tokens=tokens_full,
-                        top_activations=top_acts,
-                        tokenizer=tokenizer,
-                        cfg=cfg,
-                        threshold=getattr(cfg, "delphi_score_threshold", 0.7),
-                    )
-                    cfg.output_dir.joinpath("delphi_scores_organized.json").write_text(
-                        json.dumps(organized_score_log, indent=2)
-                    )
-                else:
-                    print(f"  [delphi-gate organized] activations.pt/tokens.pt "
-                          f"not yet cached; second gate skipped.")
+            if cfg.activations_path.exists() and cfg.tokens_path.exists():
+                catalog, organized_score_log = _run_delphi_gate_subprocess(
+                    mode="organized",
+                    payload={
+                        "catalog": catalog,
+                        "top_activations": top_acts,
+                        "activations_path": str(cfg.activations_path),
+                        "tokens_path": str(cfg.tokens_path),
+                        "sae_release": cfg.sae_release,
+                        "sae_id": cfg.sae_id,
+                    },
+                    cfg=cfg,
+                )
+                cfg.output_dir.joinpath("delphi_scores_organized.json").write_text(
+                    json.dumps(organized_score_log, indent=2)
+                )
             else:
-                print(f"  [delphi-gate organized] {why}")
+                print(f"  [delphi-gate organized] activations.pt/tokens.pt "
+                      f"not yet cached; second gate skipped.")
         except Exception as e:
             print(f"  [delphi-gate organized] error "
                   f"({type(e).__name__}: {e}); skipping gate.")
