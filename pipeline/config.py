@@ -147,6 +147,19 @@ class Config:
     # robust than trying to keep the parent process CUDA-clean after
     # inventory / Delphi / transformer-lens work.
     local_annotation_subprocess: bool = True
+    # v8.18.16: data-parallel local annotation. When local_annotation_parallel
+    # is True AND >= 2 GPUs are visible (via CUDA_VISIBLE_DEVICES or
+    # torch.cuda.device_count), the annotator splits the corpus into
+    # N shards and runs one vLLM instance per GPU concurrently. Each
+    # subprocess loads its own ~7.5 GB Qwen3-4B-Base copy; both 5090s
+    # have 32 GB each so this fits comfortably. Roughly linear speedup.
+    # Set to False to force single-GPU annotation even when 2+ GPUs
+    # are present (e.g., to leave one free for another job).
+    local_annotation_parallel: bool = True
+    # 0 = auto-detect (CUDA_VISIBLE_DEVICES count, falling back to
+    # torch.cuda.device_count); 1 = force single-GPU; 2+ = use exactly
+    # this many shards (must be ≤ available GPUs).
+    n_annotation_gpus: int = 0
     # Full description is the safer default: F-index mode ("F3? ") has
     # hardcoded few-shot exemplars in annotate.py that assume F0=comma and
     # F5=capitalized, which breaks for any catalog that doesn't match those

@@ -113,6 +113,20 @@ def main():
              "is the mean of correct calls.",
     )
     parser.add_argument(
+        "--annotation-gpus", type=int, default=None,
+        help="Number of GPUs to use for local annotation. 0 = auto-detect "
+             "(CUDA_VISIBLE_DEVICES or torch.cuda.device_count, default), "
+             "1 = single-GPU, N = use exactly N shards. With 2+ GPUs, the "
+             "corpus is split N ways and N vLLM instances run concurrently, "
+             "each pinned via CUDA_VISIBLE_DEVICES. Roughly N× speedup minus "
+             "subprocess startup overhead.",
+    )
+    parser.add_argument(
+        "--no-parallel-annotation", action="store_true",
+        help="Force single-GPU annotation even when 2+ GPUs are visible. "
+             "Use to leave a GPU free for another job.",
+    )
+    parser.add_argument(
         "--no-delphi-gate", action="store_true",
         help="Disable the Delphi detection gate inside --step promote-loop. "
              "Default-on as of v8.15. Use this if you want to rerun the "
@@ -316,6 +330,10 @@ def main():
     # delphi_score_threshold is set via overrides so promote_loop reads
     # the same value the user passed at the CLI.
     overrides["delphi_score_threshold"] = args.delphi_threshold
+    if args.annotation_gpus is not None:
+        overrides["n_annotation_gpus"] = args.annotation_gpus
+    if args.no_parallel_annotation:
+        overrides["local_annotation_parallel"] = False
     if args.no_delphi_gate:
         overrides["promote_use_delphi_gate"] = False
     if args.no_delphi_gate_inventory:

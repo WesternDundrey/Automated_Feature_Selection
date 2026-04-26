@@ -1226,6 +1226,174 @@ torch.save(annotations, {str(out_path)!r})
         return torch.load(out_path, weights_only=True)
 
 
+def _annotate_local_parallel(
+    tokens: torch.Tensor,
+    features: list[dict],
+    cfg: Config,
+    n_gpus: int,
+) -> torch.Tensor:
+    """Data-parallel local annotation across N GPUs.
+
+    Splits `tokens` into `n_gpus` shards along axis 0 (sequences). Spawns
+    one vLLM subprocess per GPU, each pinned via CUDA_VISIBLE_DEVICES,
+    each annotating its own shard. Concatenates the per-shard
+    `annotations.pt` tensors and returns the full (N, T, n_features)
+    tensor.
+
+    All subprocesses run concurrently. Speedup is roughly
+    n_gpus × throughput_per_gpu, minus subprocess startup (~30 s per
+    GPU) and the gather (~1 s for our tensor sizes). For 1000 sequences
+    on 2× 5090s, expected wall-clock drop from ~9 h to ~5 h.
+
+    Each subprocess re-loads the Qwen3-4B-Base model independently
+    (~7.5 GB per GPU) — vLLM has no shared-weight mechanism across
+    independent processes, so this is the cost. Both 5090s have 32 GB,
+    plenty of headroom.
+
+    Falls back to single-process subprocess if n_gpus < 2.
+    """
+    if n_gpus < 2:
+        return _annotate_local_subprocess(tokens, features, cfg)
+
+    import os
+    import pickle
+    import subprocess
+    import sys
+    import tempfile
+    import copy
+
+    N = tokens.shape[0]
+    chunk_starts = [int(N * i / n_gpus) for i in range(n_gpus + 1)]
+    chunks = [
+        tokens[chunk_starts[i] : chunk_starts[i + 1]] for i in range(n_gpus)
+    ]
+    print(f"  Data-parallel annotation: splitting {N} sequences across "
+          f"{n_gpus} GPUs")
+    for i in range(n_gpus):
+        print(f"    GPU {i}: sequences [{chunk_starts[i]}:"
+              f"{chunk_starts[i + 1]}] ({chunks[i].shape[0]} seqs)")
+
+    with tempfile.TemporaryDirectory(prefix="parallel_annotate_") as tmpdir:
+        tmp = Path(tmpdir)
+        cfg_path = tmp / "cfg.pkl"
+        features_path = tmp / "features.json"
+
+        cfg_child = copy.copy(cfg)
+        # Each shard writes to its own state dir so partial-checkpoint
+        # files don't collide across shards.
+        features_path.write_text(json.dumps(features))
+        with cfg_path.open("wb") as f:
+            pickle.dump(cfg_child, f)
+
+        procs = []
+        out_paths = []
+        for gpu_idx in range(n_gpus):
+            shard_tokens = tmp / f"tokens_shard_{gpu_idx}.pt"
+            shard_state_dir = tmp / f"state_{gpu_idx}"
+            shard_state_dir.mkdir(parents=True, exist_ok=True)
+            shard_out = tmp / f"annotations_shard_{gpu_idx}.pt"
+            torch.save(chunks[gpu_idx].cpu(), shard_tokens)
+
+            # Each shard needs its own Config with shard-scoped output_dir
+            # so annotations_local_partial.pt checkpoints don't step on
+            # each other.
+            shard_cfg_path = tmp / f"cfg_shard_{gpu_idx}.pkl"
+            shard_cfg = copy.copy(cfg_child)
+            shard_cfg.output_dir = shard_state_dir
+            with shard_cfg_path.open("wb") as f:
+                pickle.dump(shard_cfg, f)
+
+            script = f"""
+import json
+import pickle
+from pathlib import Path
+
+import torch
+from transformers import AutoTokenizer
+
+from pipeline.annotate import annotate_local
+
+with open({str(shard_cfg_path)!r}, "rb") as f:
+    cfg = pickle.load(f)
+features = json.loads(Path({str(features_path)!r}).read_text())
+tokens = torch.load({str(shard_tokens)!r}, weights_only=True)
+tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+
+annotations = annotate_local(tokens, features, tokenizer, cfg)
+torch.save(annotations, {str(shard_out)!r})
+"""
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+            env.setdefault("VLLM_USE_V1", "0")
+            env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+            env.setdefault("NCCL_P2P_DISABLE", "1")
+            env.setdefault("NCCL_IB_DISABLE", "1")
+            env.setdefault("NCCL_SHM_DISABLE", "1")
+            env["SUPSAE_LOCAL_ANNOTATION_SUBPROCESS"] = "1"
+            env["SUPSAE_SHARD_ID"] = str(gpu_idx)
+
+            print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx}...")
+            proc = subprocess.Popen(
+                [sys.executable, "-c", script],
+                env=env,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+            )
+            procs.append(proc)
+            out_paths.append(shard_out)
+
+        # Wait for all shards. If any fails, kill the rest and raise.
+        first_failure = None
+        for gpu_idx, proc in enumerate(procs):
+            ret = proc.wait()
+            if ret != 0 and first_failure is None:
+                first_failure = (gpu_idx, ret)
+        if first_failure is not None:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+            raise RuntimeError(
+                f"Annotation subprocess on GPU {first_failure[0]} exited "
+                f"with code {first_failure[1]}; aborting parallel annotate."
+            )
+
+        # Gather per-shard tensors and concatenate along sequence axis.
+        print(f"  Gathering {n_gpus} shards into final annotations tensor...")
+        shard_tensors = [torch.load(p, weights_only=True) for p in out_paths]
+        full = torch.cat(shard_tensors, dim=0)
+        assert full.shape[0] == N, (
+            f"Concatenated annotations have {full.shape[0]} sequences, "
+            f"expected {N}. Shard sizes: {[t.shape[0] for t in shard_tensors]}"
+        )
+        return full
+
+
+def _detect_annotation_gpus(cfg: Config) -> int:
+    """Resolve the number of GPUs to use for parallel annotation.
+
+    Priority:
+      1. cfg.n_annotation_gpus if explicitly set (>=1)
+      2. CUDA_VISIBLE_DEVICES count if set
+      3. torch.cuda.device_count()
+      4. Fallback: 1
+    """
+    explicit = int(getattr(cfg, "n_annotation_gpus", 0) or 0)
+    if explicit >= 1:
+        return explicit
+
+    import os
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if cvd.strip():
+        return len([x for x in cvd.split(",") if x.strip()])
+
+    try:
+        import torch as _torch
+        n = _torch.cuda.device_count() if _torch.cuda.is_available() else 0
+        return max(1, n)
+    except Exception:
+        return 1
+
+
 # ── Main entry point ────────────────────────────────────────────────────────
 
 def run(cfg: Config = None):
@@ -1436,9 +1604,24 @@ if not cfg.activations_path.exists():
         )
         if cfg.use_local_annotator:
             if getattr(cfg, "local_annotation_subprocess", True):
-                new_leaf_annotations = _annotate_local_subprocess(
-                    cfg.tokens_path, new_leaf_features, cfg,
+                # v8.18.16: data-parallel across N GPUs when 2+ are
+                # visible AND cfg.local_annotation_parallel is True
+                # (default). Falls back to single-GPU subprocess when
+                # only 1 GPU or when explicitly disabled.
+                _n_gpus = _detect_annotation_gpus(cfg)
+                _parallel = (
+                    _n_gpus >= 2
+                    and getattr(cfg, "local_annotation_parallel", True)
                 )
+                if _parallel:
+                    new_leaf_annotations = _annotate_local_parallel(
+                        torch.load(cfg.tokens_path, weights_only=True),
+                        new_leaf_features, cfg, n_gpus=_n_gpus,
+                    )
+                else:
+                    new_leaf_annotations = _annotate_local_subprocess(
+                        cfg.tokens_path, new_leaf_features, cfg,
+                    )
             else:
                 from transformers import AutoTokenizer
                 tokenizer_ref = AutoTokenizer.from_pretrained(cfg.model_name)
