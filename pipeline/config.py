@@ -217,9 +217,14 @@ class Config:
     # 0.7 is "clearly above chance, not yet rigorous." Raise to 0.8 if
     # you want stricter gating; lower to 0.6 if too many drop.
     delphi_score_threshold: float = 0.7
-    # The judge model the DetectionScorer asks. Falls back to
-    # `organization_model` (Sonnet) when None.
-    delphi_judge_model: str = ""
+    # The judge model the DetectionScorer asks. v8.18.12: defaulted to
+    # Haiku 4.5 (~10× cheaper than Sonnet 4.6) because the Detection task
+    # is simple — just "for each example, does it match the explanation?"
+    # — and a 500-latent gate ran on Sonnet was burning through OpenRouter
+    # credits fast (user hit their account's total-limit cap mid-run).
+    # Empty string = fall back to organization_model (Sonnet) for the
+    # rare case where Haiku judgment quality is insufficient.
+    delphi_judge_model: str = "anthropic/claude-haiku-4.5"
     # Whether `--step promote-loop` runs the Delphi gate between
     # crispness and the mini-prefilter. Default-on as of v8.15.
     promote_use_delphi_gate: bool = True
