@@ -237,7 +237,14 @@ class Config:
     # Mid-tier means activations in the 25-75th percentile of nonzero —
     # tests recall, not just peak-case precision. Setting to 0 reverts
     # to peak-only behavior.
-    delphi_n_mid_tier: int = 3
+    #
+    # v8.18.14: bumped 3 → 5 so total samples per record (n_test=5 +
+    # n_mid=5 + n_not_active=5 = 15) is an exact multiple of Delphi's
+    # native 5-example batch size. Previously 5+3+5=13 left a trailing
+    # 3-sample batch whose response shape ([1,0,1]) didn't match the
+    # judge's 5-element few-shot, causing parse failures the gate then
+    # treated as wrong predictions.
+    delphi_n_mid_tier: int = 5
     # v8.18.3: skip vLLM CUDA-graph compilation on cold start.
     # Cold-start speedup: ~20× (15-25 min → ~1 min) at the cost of
     # ~10-20% per-token throughput. Worth it for one-shot annotation

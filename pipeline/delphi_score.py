@@ -394,15 +394,45 @@ async def _score_batch(scorer, records):
     return await asyncio.gather(*[_score_one(scorer, r) for r in records])
 
 
-def _accuracy_from_result(result) -> tuple[float, int, int]:
-    """Pull (accuracy, n_correct, n_total) out of a Delphi ScorerResult.
-    ScorerResult.score is a list[ClassifierOutput], each with `.correct`."""
+def _accuracy_from_result(result) -> tuple[float | None, int, int, int]:
+    """Pull (accuracy, n_correct, n_total, n_parse_failed) out of a Delphi
+    ScorerResult.
+
+    ScorerResult.score is a list[ClassifierOutput], each with `.correct`
+    set to True/False on a successful parse OR None on parse failure. The
+    pre-fix version did `bool(getattr(o, "correct", False))` which silently
+    counted parse failures as wrong predictions — so a single Sonnet
+    JSON-format glitch produced score=0/13 and the description got
+    rejected as if the latent's firing were unrelated to the description.
+
+    v8.18.14 fix: explicitly distinguish parse failure (correct=None)
+    from real correct/incorrect calls. Returns:
+      - accuracy: fraction of PARSED calls that were correct, or None
+                  if no calls parsed (gate fails open with kept=True)
+      - n_correct: count of correct calls (only well-defined when
+                   accuracy is not None)
+      - n_total: total ClassifierOutputs
+      - n_parse_failed: count of correct=None entries (judge gave
+                       unparsable response or transport error)
+    """
     score_list = getattr(result, "score", None) or []
     n_total = len(score_list)
     if n_total == 0:
-        return 0.0, 0, 0
-    n_correct = sum(1 for o in score_list if getattr(o, "correct", False))
-    return n_correct / n_total, n_correct, n_total
+        return None, 0, 0, 0
+    n_parse_failed = sum(
+        1 for o in score_list if getattr(o, "correct", None) is None
+    )
+    n_parsed = n_total - n_parse_failed
+    if n_parsed == 0:
+        # Every call failed to parse — the judge never gave us a usable
+        # response. This is an infrastructure failure, not evidence
+        # against the feature. Score=None so the gate fails open.
+        return None, 0, n_total, n_parse_failed
+    n_correct = sum(
+        1 for o in score_list
+        if getattr(o, "correct", None) is True   # explicit True only
+    )
+    return n_correct / n_parsed, n_correct, n_total, n_parse_failed
 
 
 # ── Public entry point ────────────────────────────────────────────────
@@ -500,13 +530,21 @@ def score_descriptions(
     scorer = DetectionScorer(
         client=client,
         verbose=False,
-        # v8.18.1 hotfix: include n_mid_tier in the batch size. Otherwise
-        # records have (n_test + n_mid + n_not_active) samples but Delphi
-        # batches at (n_test + n_not_active), leaving a remainder batch
-        # whose len(predictions) doesn't match self.n_examples_shown,
-        # tripping the assertion at delphi/scorers/classifier/classifier.py:147
-        # ("Parsing selections failed: AssertionError()") for every record.
-        n_examples_shown=n_test + n_mid_tier + n_not_active,
+        # v8.18.14 fix: n_examples_shown=5, matching Delphi's published
+        # detection_prompt few-shots (`[1,0,0,0,1]`-style 5-element
+        # responses). Pre-fix used n_test+n_mid+n_not_active=13, which
+        # was a SHAPE the judge had never been few-shotted on; Sonnet
+        # responded inconsistently (often with 5 elements anyway, or
+        # with prose) and the parser then asserted len==13 and threw
+        # AssertionError, which my code wrongly counted as score=0/13.
+        #
+        # The classifier batches our 15 samples (5 test + 5 mid + 5
+        # nonact = clean multiple of 5) into 3 exact-5-example batches.
+        # Each batch is one judge call returning [x,x,x,x,x] — same
+        # shape as the few-shot. Parse failures are now rare; when
+        # they happen, _accuracy_from_result distinguishes them from
+        # wrong predictions.
+        n_examples_shown=5,
         log_prob=False,
         temperature=0.0,
     )
@@ -570,19 +608,39 @@ def score_descriptions(
         if isinstance(result, tuple) and result and result[0] == "error":
             out[lid_str] = {
                 "score": None, "n_correct": 0, "n_total": 0,
+                "n_parse_failed": 0,
                 "kept": True,  # fail open on transport errors
                 "reason": result[1],
             }
             continue
-        accuracy, n_correct, n_total = _accuracy_from_result(result)
+        accuracy, n_correct, n_total, n_parse_failed = _accuracy_from_result(result)
+        if accuracy is None:
+            # Every call to the judge failed to parse — infrastructure
+            # failure, NOT evidence against the feature. Fail open:
+            # keep the description, log the parse failure rate so the
+            # user sees this happened.
+            out[lid_str] = {
+                "score": None,
+                "n_correct": 0,
+                "n_total": n_total,
+                "n_parse_failed": n_parse_failed,
+                "kept": True,
+                "reason": (
+                    f"parse_failure_all_{n_parse_failed}_of_{n_total}_calls"
+                ),
+            }
+            continue
         kept = accuracy >= threshold
         out[lid_str] = {
             "score": round(float(accuracy), 4),
             "n_correct": n_correct,
             "n_total": n_total,
+            "n_parse_failed": n_parse_failed,
             "kept": bool(kept),
             "reason": (
                 f"score={accuracy:.3f} {'≥' if kept else '<'} {threshold:.2f}"
+                + (f" (with {n_parse_failed}/{n_total} parse failures dropped)"
+                   if n_parse_failed > 0 else "")
             ),
         }
     return out
@@ -873,11 +931,27 @@ def gate_inventory_descriptions(
         for k, s in dropped_with_scores[:10]:
             print(f"    drop L{k} (score={s:.3f}): {descriptions[k][:80]}")
 
+    # v8.18.14: count records where every judge call failed to parse.
+    # Pre-fix these were silently counted as score=0 → wrongly dropped.
+    # Now they fail open (kept=True) and are visible in the summary so
+    # the user can spot infrastructure failures vs real feature issues.
+    n_parse_failed_full = sum(
+        1 for k in score_log
+        if isinstance(score_log[k], dict)
+        and score_log[k].get("score") is None
+        and "parse_failure" in (score_log[k].get("reason") or "")
+    )
+
     # Final summary line — grep-friendly status so the user can verify
     # Delphi actually ran without inspecting JSON.
-    print(f"  [delphi-gate inventory] STATUS=scored "
-          f"kept={len(kept)}/{len(descriptions)} "
-          f"dropped={n_dropped} threshold={threshold:.2f}")
+    summary = (
+        f"  [delphi-gate inventory] STATUS=scored "
+        f"kept={len(kept)}/{len(descriptions)} "
+        f"dropped={n_dropped} threshold={threshold:.2f}"
+    )
+    if n_parse_failed_full > 0:
+        summary += f"  parse_failed_kept_open={n_parse_failed_full}"
+    print(summary)
 
     score_log["_gate_mode"] = "scored"
     score_log["_threshold"] = threshold
