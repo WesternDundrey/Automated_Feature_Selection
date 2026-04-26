@@ -93,9 +93,27 @@ Both modes cache the system prefix + text tokens + token name. Only the feature 
 
 | Mode | Flag | Description |
 |------|------|-------------|
-| **Hybrid** (default) | `--supervision hybrid` | BCE selectivity + cosine direction alignment |
-| MSE | `--supervision mse` | MSE magnitude + direction (with negative supervision) |
-| BCE | `--supervision bce` | Legacy BCE only (no decoder alignment) |
+| **Hinge** (default) | `--supervision hinge` | ReLU + hinge on pre-activations (mentor's principled #1). With frozen decoder default-on (v8.18.25), this is the recommended starting config. |
+| **Gated BCE** | `--supervision gated_bce` | Two-path encoder (gate + magnitude), BCE on gate (mentor's principled #3). Best F1 in v8.12 hinge ablation. |
+| Hinge JumpReLU | `--supervision hinge_jumprelu` | JumpReLU + hinge with learnable per-feature θ (mentor's principled #2). |
+| Hybrid (legacy) | `--supervision hybrid` | BCE selectivity + cosine direction alignment + frozen decoder. Pre-v8.11 default. |
+| MSE (legacy) | `--supervision mse` | MSE magnitude + direction (Makelov-style). |
+| BCE (legacy) | `--supervision bce` | BCE only, no decoder alignment. |
+
+## Catalog & Decoder Defaults (v8.18.25)
+
+| Default | Value | Override |
+|---|---|---|
+| Catalog quality validator | `quarantine` mode | `--catalog-gate-mode {report,hard}` |
+| Catalog flatten (no groups) | on | `--keep-groups` |
+| Scaffold catalog merge | on (33 control features) | `--no-scaffold` |
+| **Delphi inventory gate** | **OFF** (use as audit metadata via `--step delphi-score`) | `--delphi-gate-inventory` to opt in |
+| **Hinge-family frozen decoder** | **ON** (cos=1.0 by construction, FVE~0.30) | `--no-freeze-decoder` to ablate the principled formulation |
+| Target direction method | `mean_shift` | `--target-dir-method {logistic,lda}` |
+
+The flipped defaults (Delphi off, freeze on) reflect audit findings that:
+1. Delphi was nerfing supervised-SAE F1 by source-latent-faithfulness filtering — useful features got dropped because Sonnet couldn't predict their top-K activations crisply enough, even though the unsupervised post-train readout could still classify them.
+2. End-to-end hinge / gated_bce gave decoder cosines ~0.16 (random) and FVE ~0.005 (useless for intervention). Frozen decoder gives cos=1 + FVE ~0.30 at ~0.03 F1 cost vs. linear probe baseline.
 
 ## Gemma-2-2B
 

@@ -95,15 +95,17 @@ def main():
                         help="For --supervision hinge_jumprelu: initial value "
                              "of per-feature θ threshold (default 0.1)")
     parser.add_argument("--no-freeze-decoder", action="store_true",
-                        help="Train decoder columns (legacy modes only). Default: frozen to target_dirs")
+                        help="Train supervised decoder columns end-to-end. "
+                             "v8.18.25: applies to BOTH legacy modes "
+                             "(hybrid/mse/bce) AND hinge family modes "
+                             "(hinge/hinge_jumprelu/gated_bce). Default is "
+                             "frozen for both. Use this when ablating the "
+                             "principled-no-hacks formulation.")
     parser.add_argument("--freeze-decoder", action="store_true",
-                        help="ABLATION ONLY for hinge family modes (hinge, "
-                             "hinge_jumprelu, gated_bce): pin supervised "
-                             "decoder columns at target_dirs and zero their "
-                             "gradient. Off by default — mentor's design is "
-                             "end-to-end. Use this to isolate whether the "
-                             "frozen-decoder hack alone (without BCE + "
-                             "cosine direction loss) recovers F1.")
+                        help="(v8.18.25: now a no-op since default is ON) "
+                             "Pin supervised decoder columns at target_dirs. "
+                             "Kept for backwards compat — was used to opt in "
+                             "when hinge family default was off.")
     parser.add_argument("--selectivity", default=None,
                         choices=["bce", "hinge", "none"],
                         help="Selectivity loss type (default: bce)")
@@ -179,12 +181,18 @@ def main():
     )
     parser.add_argument(
         "--no-delphi-gate-inventory", action="store_true",
-        help="Disable the Delphi detection gate inside --step inventory. "
-             "Default-on as of v8.17 — the gate filters fuzzy descriptions "
-             "BEFORE they enter the catalog so annotation budget is spent "
-             "only on descriptions that can predict their own latent's "
-             "firing. Use this flag to restore pre-v8.17 behavior where "
-             "Delphi was only a post-hoc audit via --step delphi-score.",
+        help="(v8.18.25: now a no-op since default is OFF) Disable the "
+             "Delphi detection gate inside --step inventory. Kept for "
+             "backwards compat — was used to opt out when default was on.",
+    )
+    parser.add_argument(
+        "--delphi-gate-inventory", action="store_true",
+        help="Opt IN to the Delphi detection gate inside --step inventory. "
+             "Off by default as of v8.18.25 (audit found Delphi was nerfing "
+             "supervised-SAE F1 by source-latent-faithfulness filtering "
+             "real features the unsupervised post-train readout could still "
+             "predict; use Delphi as audit metadata via --step delphi-score "
+             "instead).",
     )
     parser.add_argument(
         "--delphi-judge-model", default=None,
@@ -385,6 +393,8 @@ def main():
         overrides["promote_use_delphi_gate"] = False
     if args.no_delphi_gate_inventory:
         overrides["delphi_gate_in_inventory"] = False
+    if args.delphi_gate_inventory:
+        overrides["delphi_gate_in_inventory"] = True
     if args.delphi_judge_model is not None:
         overrides["delphi_judge_model"] = args.delphi_judge_model
     if args.keep_groups:
@@ -406,7 +416,10 @@ def main():
     if args.use_findex:
         overrides["use_findex_suffix"] = True
     if args.no_freeze_decoder:
+        # v8.18.25: turns off freeze for BOTH legacy and hinge family.
+        # Useful for ablating the pure principled formulation.
         overrides["freeze_supervised_decoder"] = False
+        overrides["hinge_freeze_decoder"] = False
     if args.freeze_decoder:
         overrides["hinge_freeze_decoder"] = True
     if args.target_dir_method is not None:

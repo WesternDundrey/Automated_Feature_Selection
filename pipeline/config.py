@@ -144,7 +144,17 @@ class Config:
     # to pin supervised decoder columns at target_dirs and zero their
     # gradient — useful for isolating which hack in hybrid mode (BCE +
     # cosine direction loss + frozen decoder) is doing the F1 work.
-    hinge_freeze_decoder: bool = False
+    # v8.18.25: DEFAULT FLIPPED to True. End-to-end hinge / gated_bce
+    # gave decoder cosines ~0.16 (random) and FVE ~0.005 (useless for
+    # intervention). With frozen decoder you get cos=1.0 by construction
+    # and FVE ~0.30 — the supervised slice gives clean intervention-
+    # ready directions. F1 cost is ~0.03 vs the linear probe baseline,
+    # well worth it for interpretability + causal validity. The mentor's
+    # "no hacks" framework empirically loses 0.13+ F1 to this single
+    # hack at our scale; we accept the hack for the working architecture.
+    # Override with --no-freeze-decoder if you want to test the pure
+    # principled formulation.
+    hinge_freeze_decoder: bool = True
 
     # ── v8.18.20 catalog quality gates + direction ablation ──
     # Catalog quality validator. "report" = compute + write report,
@@ -317,15 +327,18 @@ class Config:
     # runs on small corpora; flip to False for production-scale runs
     # where total wall-clock dominates cold-start.
     vllm_enforce_eager: bool = True
-    # v8.17: whether `--step inventory` runs the Delphi gate between
-    # description generation and organize_hierarchy. Default-on. Set
-    # to False (or pass --no-delphi-gate-inventory at the CLI) to
-    # restore the pre-v8.17 behavior where Delphi was only a post-hoc
-    # audit via `--step delphi-score`. The point of having it on by
-    # default: drop fuzzy descriptions BEFORE they enter the catalog,
-    # so the annotator never spends budget on descriptions that can't
-    # even predict their own latent's firing.
-    delphi_gate_in_inventory: bool = True
+    # v8.18.25: DEFAULT FLIPPED to False. Per audit:
+    # "delphi_gate_in_inventory=True optimizes source-latent
+    # faithfulness, not human-useful supervised features... Use Delphi
+    # as audit metadata, not as the initial catalog gate." The gate
+    # was nerfing supervised-SAE F1 by dropping easy-but-real features
+    # whose top-K activations Sonnet couldn't predict crisply enough,
+    # while the unsupervised post-train readout barely moved. Now the
+    # default is OFF — Delphi runs only via the explicit
+    # --step delphi-score audit (or by setting this flag back to True
+    # via --delphi-gate-inventory). v8.17–v8.18 history of this flag:
+    # introduced default-on, audit-driven flipped to default-off.
+    delphi_gate_in_inventory: bool = False
 
     # Denylist of description patterns. During promote-loop triage, any
     # candidate description (from Sonnet) that contains ANY of these
