@@ -430,6 +430,33 @@ def run(
     rewritten_path.write_text(json.dumps(out_catalog, indent=2))
     print(f"\n  Rewritten catalog written to {rewritten_path}")
 
+    # v8.18.21: re-run the quality validator on the rewritten catalog
+    # (rewrite can introduce broadness, vague exclusions, or "or" in
+    # unexpected ways). Per user's note: "Run the same validator post-
+    # rewrite too, because rewrite can introduce or, broadness, or
+    # vague exclusions." Report-only by default — doesn't overwrite the
+    # rewritten file. User decides whether to drop based on the report.
+    gate_mode = getattr(cfg, "catalog_gate_mode", "quarantine")
+    if gate_mode != "off":
+        try:
+            from .catalog_quality import (
+                apply_catalog_gates, write_quality_report,
+            )
+            print(f"\n  [catalog-quality post-rewrite] applying gates "
+                  f"(mode=report — rewrite output is auditable, not auto-dropped)")
+            _, _, post_records = apply_catalog_gates(
+                out_catalog, cfg=cfg, mode="report",
+                use_llm_crispness=getattr(cfg, "catalog_gate_use_llm", True),
+            )
+            write_quality_report(
+                post_records,
+                cfg.output_dir / "catalog_quality_report_post_rewrite.json",
+                mode="report",
+            )
+        except Exception as e:
+            print(f"  [catalog-quality post-rewrite] error "
+                  f"({type(e).__name__}: {e}); skipping.")
+
     if apply_to_disk:
         backup_path = cfg.output_dir / "feature_catalog.before_rewrite.json"
         if not backup_path.exists():

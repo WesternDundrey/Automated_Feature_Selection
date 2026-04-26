@@ -31,9 +31,11 @@ import re
 from pathlib import Path
 from typing import Optional
 
-# Hard-fail phrases. These are operationally-undefined. No surface
-# variant of "sometimes" should be accepted — there's no token-level
-# yes/no answer to "this feature SOMETIMES fires."
+# Hard-fail phrases — only the genuinely vague / non-operational ones.
+# Per the user's note, "may be" / "might be" / "can be either" are
+# valid hedges for surface variants ("Token can be opening or closing
+# quotation mark"); those go to the soft-flag → LLM crispness path
+# instead of auto-quarantine.
 _HARD_FAIL_PATTERNS = [
     re.compile(r"\bsometimes\b", re.IGNORECASE),
     re.compile(r"\bvarious\b", re.IGNORECASE),
@@ -43,10 +45,7 @@ _HARD_FAIL_PATTERNS = [
     re.compile(r"\bassociated with\b", re.IGNORECASE),
     re.compile(r"\bone of\b", re.IGNORECASE),
     re.compile(r"\band/or\b", re.IGNORECASE),
-    re.compile(r"\bmay (?:be|indicate|refer)\b", re.IGNORECASE),
-    re.compile(r"\bmight (?:be|indicate|refer)\b", re.IGNORECASE),
-    re.compile(r"\bcan be (?:any|either|various)\b", re.IGNORECASE),
-    re.compile(r"\bsuch as\b", re.IGNORECASE),  # introduces non-exhaustive enumeration
+    re.compile(r"\bsuch as\b", re.IGNORECASE),       # non-exhaustive enumeration
     re.compile(r"\bfor example\b", re.IGNORECASE),
     re.compile(r"\bincluding\b", re.IGNORECASE),
     re.compile(r"\betc\.", re.IGNORECASE),
@@ -86,10 +85,26 @@ def _word_count(description: str) -> int:
     return len(description.split())
 
 
+_SOURCE_LATENTS_EXEMPT_ROLES = {"control"}
+_SOURCE_LATENTS_EXEMPT_KINDS = {"scaffold", "manual", "decomposed_atom"}
+
+
+def _is_source_latents_exempt(feature: dict) -> bool:
+    """Per user's note: scaffold / manual / control features are
+    hand-written and don't have source_latents. Don't hard-fail them
+    on this check. Inventory-derived leaves (no role/kind set) MUST
+    have source_latents."""
+    if feature.get("role") in _SOURCE_LATENTS_EXEMPT_ROLES:
+        return True
+    if feature.get("source_kind") in _SOURCE_LATENTS_EXEMPT_KINDS:
+        return True
+    return False
+
+
 def _has_source_latents(feature: dict) -> bool:
+    """Strictly: feature has at least one source latent ID. Returns
+    True for exempt features (caller never reaches the check)."""
     src = feature.get("source_latents")
-    if src is None:
-        return True   # not all features need source_latents (e.g. scaffold)
     return isinstance(src, list) and len(src) > 0
 
 
@@ -147,7 +162,8 @@ def assess_feature_quality(
 
     hard_fail_phrases, soft_flag_phrases = _lexical_scan(description)
     wc = _word_count(description)
-    src_ok = _has_source_latents(feature)
+    is_src_exempt = _is_source_latents_exempt(feature)
+    src_ok = is_src_exempt or _has_source_latents(feature)
     has_pos, has_neg, has_excl = _has_examples_metadata(feature)
 
     # Hard-fail conditions — operationally-undefined or vague phrases
@@ -156,6 +172,9 @@ def assess_feature_quality(
         findings.append(
             f"hard_fail_phrases: {hard_fail_phrases}"
         )
+    # Inventory-derived leaves (no role exemption, no scaffold/manual
+    # provenance) MUST have source_latents per the v8.18 organize_hierarchy
+    # prompt change. Scaffold/manual/control are exempt.
     if not src_ok:
         findings.append("missing_source_latents")
     if wc > _MAX_DESCRIPTION_WORDS:
@@ -242,15 +261,22 @@ def apply_catalog_gates(
     cfg=None,
     mode: str = "quarantine",
     use_llm_crispness: bool = True,
-) -> tuple[dict, list[dict]]:
-    """Apply quality gates to a catalog. Returns (filtered_catalog,
-    per_feature_records).
+) -> tuple[dict, dict, list[dict]]:
+    """Apply quality gates to a catalog. Returns
+    (filtered_catalog, quarantined_catalog, per_feature_records).
 
     `mode`:
-        - "hard":       drop both fail and quarantine
-        - "quarantine": drop fail only (default — never silently
-                        deletes things on a soft flag)
-        - "report":     drop nothing; emit findings only
+        - "hard":       drop both fail and quarantine from filtered;
+                        write all dropped to quarantined_catalog.
+        - "quarantine": drop fail only from filtered; quarantined_catalog
+                        contains the dropped fails.
+        - "report":     drop nothing; quarantined_catalog still lists
+                        anything that would have been quarantined under
+                        "quarantine" mode for visibility.
+
+    The quarantined_catalog is written alongside the main catalog so
+    dropped features are auditable. Per the user's note: "Hard fail
+    lexical patterns should mean quarantine, not irreversible deletion."
     """
     if mode not in ("hard", "quarantine", "report"):
         raise ValueError(f"unknown mode {mode!r}")
@@ -260,24 +286,47 @@ def apply_catalog_gates(
     groups = [f for f in features if f.get("type") != "leaf"]
 
     records: list[dict] = []
+    record_by_id: dict[str, dict] = {}
     for f in leaves:
         rec = assess_feature_quality(
             f, use_llm_crispness=use_llm_crispness, cfg=cfg,
         )
         records.append(rec)
+        record_by_id[rec["id"]] = rec
 
     if mode == "report":
-        kept_leaves = leaves
+        kept_ids = {f["id"] for f in leaves}
     elif mode == "hard":
-        keep_ids = {r["id"] for r in records if r["status"] == "pass"}
-        kept_leaves = [f for f in leaves if f["id"] in keep_ids]
+        kept_ids = {r["id"] for r in records if r["status"] == "pass"}
     else:  # quarantine — drop only fails
-        keep_ids = {r["id"] for r in records if r["status"] != "fail"}
-        kept_leaves = [f for f in leaves if f["id"] in keep_ids]
+        kept_ids = {r["id"] for r in records if r["status"] != "fail"}
 
-    out = dict(catalog)
-    out["features"] = groups + kept_leaves
-    return out, records
+    kept_leaves: list[dict] = []
+    quarantined_leaves: list[dict] = []
+    for f in leaves:
+        rec = record_by_id.get(f["id"], {})
+        # Annotate every feature with its quality status so downstream
+        # tooling can filter on it without re-running the validator.
+        f_with_status = dict(f)
+        f_with_status["quality_status"] = rec.get("status", "unknown")
+        f_with_status["quality_findings"] = rec.get("findings", [])
+        if f["id"] in kept_ids:
+            kept_leaves.append(f_with_status)
+        else:
+            quarantined_leaves.append(f_with_status)
+
+    filtered = dict(catalog)
+    filtered["features"] = groups + kept_leaves
+
+    quarantined = dict(catalog)
+    quarantined["features"] = quarantined_leaves
+    quarantined["_note"] = (
+        "Features dropped by catalog_quality gates. Auditable: "
+        "review quality_findings per feature, manually re-add to the "
+        "main feature_catalog.json if you disagree with the gate."
+    )
+
+    return filtered, quarantined, records
 
 
 def write_quality_report(

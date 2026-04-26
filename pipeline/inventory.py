@@ -1035,9 +1035,11 @@ def run(cfg: Config = None):
 
     # v8.18.20: catalog quality gates. Strict validator + quarantine
     # (per user's design: lexical flags trigger LLM crispness, not
-    # auto-reject). Default mode "quarantine" drops only hard-fail
-    # leaves (operationally-undefined phrases, missing source_latents,
-    # LLM rejects); soft-flagged ones are kept with a written report.
+    # auto-reject; dropped features go to a quarantined catalog file
+    # for auditability, never silently lost). Default mode "quarantine"
+    # drops only hard-fail leaves; soft-flagged ones are kept with a
+    # written report. Scaffold / manual / control features are exempt
+    # from the source_latents check.
     gate_mode = getattr(cfg, "catalog_gate_mode", "quarantine")
     if gate_mode != "off":
         try:
@@ -1045,7 +1047,7 @@ def run(cfg: Config = None):
                 apply_catalog_gates, write_quality_report,
             )
             print(f"\n  [catalog-quality] applying gates (mode={gate_mode})...")
-            catalog, quality_records = apply_catalog_gates(
+            catalog, quarantined, quality_records = apply_catalog_gates(
                 catalog, cfg=cfg, mode=gate_mode,
                 use_llm_crispness=getattr(cfg, "catalog_gate_use_llm", True),
             )
@@ -1054,6 +1056,11 @@ def run(cfg: Config = None):
                 cfg.output_dir / "catalog_quality_report.json",
                 mode=gate_mode,
             )
+            # Write quarantined catalog (auditable dropped features).
+            quarantined_path = cfg.output_dir / "feature_catalog.quarantined.json"
+            quarantined_path.write_text(json.dumps(quarantined, indent=2))
+            print(f"  Quarantined catalog: {quarantined_path}  "
+                  f"({len(quarantined.get('features', []))} dropped leaves)")
         except Exception as e:
             print(f"  [catalog-quality] error "
                   f"({type(e).__name__}: {e}); skipping gate.")

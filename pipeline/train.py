@@ -226,22 +226,79 @@ def compute_target_directions_dispatch(
     x_flat: torch.Tensor, y_flat: torch.Tensor, n_supervised: int, cfg,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dispatch to the right target_dir computation based on
-    cfg.target_dir_method ∈ {'mean_shift', 'logistic', 'lda'}."""
+    cfg.target_dir_method ∈ {'mean_shift', 'logistic', 'lda'}.
+
+    v8.18.21: writes a `target_directions.pt.meta.json` sidecar
+    capturing method + regularization parameters so re-runs with a
+    different method don't silently reuse a stale cache. Caller can
+    detect a method mismatch by reading the sidecar before deciding
+    to reuse the .pt file.
+
+    Per user's note on rare features: LDA / logistic methods fall
+    back to mean-shift directions (zero-fill the row) for features
+    where the per-method computation is unstable (n_pos < 5).
+    """
     method = getattr(cfg, "target_dir_method", "mean_shift")
     print(f"  Computing target_dirs via method={method!r}")
+
     if method == "mean_shift":
-        return compute_target_directions(x_flat, y_flat, n_supervised)
-    if method == "logistic":
-        return compute_target_directions_logistic(
+        dirs, norms, counts = compute_target_directions(
+            x_flat, y_flat, n_supervised,
+        )
+    elif method == "logistic":
+        dirs, norms, counts = compute_target_directions_logistic(
             x_flat, y_flat, n_supervised,
             l2_lambda=float(getattr(cfg, "target_dir_logistic_lambda", 1.0)),
         )
-    if method == "lda":
-        return compute_target_directions_lda(
+    elif method == "lda":
+        dirs, norms, counts = compute_target_directions_lda(
             x_flat, y_flat, n_supervised,
             shrinkage=float(getattr(cfg, "target_dir_lda_shrinkage", 0.1)),
         )
-    raise ValueError(f"unknown target_dir_method {method!r}")
+    else:
+        raise ValueError(f"unknown target_dir_method {method!r}")
+
+    # Rare-feature fallback: per-feature, if the method failed (zero-
+    # row direction), substitute the mean-shift direction. This means
+    # rare features are always represented by SOMETHING usable, never
+    # left as zero vectors that would silently degrade the frozen
+    # decoder.
+    if method != "mean_shift":
+        ms_dirs, ms_norms, ms_counts = compute_target_directions(
+            x_flat, y_flat, n_supervised,
+        )
+        zero_rows = norms < 1e-8
+        n_fallback = int(zero_rows.sum().item())
+        if n_fallback > 0:
+            print(f"    [{method}] fell back to mean_shift for "
+                  f"{n_fallback}/{n_supervised} rare/unstable features")
+            dirs[zero_rows] = ms_dirs[zero_rows]
+            norms[zero_rows] = ms_norms[zero_rows]
+            counts[zero_rows] = ms_counts[zero_rows]
+
+    # Write sidecar capturing the method + regularization so re-runs
+    # with a different method aren't silently fed a stale cache.
+    if hasattr(cfg, "target_dirs_path"):
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            meta_path = _Path(str(cfg.target_dirs_path) + ".meta.json")
+            meta = {
+                "method": method,
+                "n_supervised": int(n_supervised),
+                "logistic_lambda": float(
+                    getattr(cfg, "target_dir_logistic_lambda", 1.0)
+                ),
+                "lda_shrinkage": float(
+                    getattr(cfg, "target_dir_lda_shrinkage", 0.1)
+                ),
+                "shape": list(dirs.shape),
+            }
+            meta_path.write_text(_json.dumps(meta, indent=2))
+        except Exception:
+            pass  # don't fail the pipeline over a sidecar write
+
+    return dirs, norms, counts
 
 
 def mse_supervision_loss(
