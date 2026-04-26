@@ -137,6 +137,14 @@ class Config:
     # Ablation proved frozen = learned on F1/R², but frozen gives
     # cosine=1.0 and 5.7× FVE — strictly better for interventions.
     freeze_supervised_decoder: bool = True
+    # v8.18.19: ABLATION-ONLY for hinge family modes (hinge,
+    # hinge_jumprelu, gated_bce). Opt-in via --freeze-decoder. Off by
+    # default so the mentor's "no hacks" design holds for the standard
+    # `--supervision hinge` / `--supervision gated_bce` runs. Set True
+    # to pin supervised decoder columns at target_dirs and zero their
+    # gradient — useful for isolating which hack in hybrid mode (BCE +
+    # cosine direction loss + frozen decoder) is doing the F1 work.
+    hinge_freeze_decoder: bool = False
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API

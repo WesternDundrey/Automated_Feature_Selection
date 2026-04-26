@@ -95,7 +95,15 @@ def main():
                         help="For --supervision hinge_jumprelu: initial value "
                              "of per-feature θ threshold (default 0.1)")
     parser.add_argument("--no-freeze-decoder", action="store_true",
-                        help="Train decoder columns (legacy). Default: frozen to target_dirs")
+                        help="Train decoder columns (legacy modes only). Default: frozen to target_dirs")
+    parser.add_argument("--freeze-decoder", action="store_true",
+                        help="ABLATION ONLY for hinge family modes (hinge, "
+                             "hinge_jumprelu, gated_bce): pin supervised "
+                             "decoder columns at target_dirs and zero their "
+                             "gradient. Off by default — mentor's design is "
+                             "end-to-end. Use this to isolate whether the "
+                             "frozen-decoder hack alone (without BCE + "
+                             "cosine direction loss) recovers F1.")
     parser.add_argument("--selectivity", default=None,
                         choices=["bce", "hinge", "none"],
                         help="Selectivity loss type (default: bce)")
@@ -369,6 +377,8 @@ def main():
         overrides["use_findex_suffix"] = True
     if args.no_freeze_decoder:
         overrides["freeze_supervised_decoder"] = False
+    if args.freeze_decoder:
+        overrides["hinge_freeze_decoder"] = True
     if args.selectivity:
         overrides["selectivity_loss"] = args.selectivity
 

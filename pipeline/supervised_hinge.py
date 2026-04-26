@@ -563,6 +563,30 @@ def train_hinge_sae(
         theta_init=getattr(cfg, "jumprelu_theta_init", 0.1),
     ).to(cfg.device)
 
+    # v8.18.19 ablation: optional frozen decoder for hinge family.
+    # Mentor's design rejects this — but the user explicitly asked
+    # to test "gated_bce + frozen decoder" to isolate which hack in
+    # legacy hybrid mode (BCE + cosine direction loss + frozen decoder)
+    # is doing the work. Off by default; opt in via --freeze-decoder
+    # (sets cfg.hinge_freeze_decoder=True). When on, supervised decoder
+    # columns are pinned at post_hoc_dirs and their gradient is zeroed,
+    # same pattern as the legacy SupervisedSAE path.
+    if getattr(cfg, "hinge_freeze_decoder", False):
+        print(f"\n  [hinge family ABLATION] freezing supervised decoder "
+              f"columns 0:{n_supervised} at target_dirs (mentor's design "
+              f"rejects this; included for direct ablation comparison).")
+        with torch.no_grad():
+            sae.decoder.weight.data[:, :n_supervised] = post_hoc_dirs.to(
+                device=sae.decoder.weight.device,
+                dtype=sae.decoder.weight.dtype,
+            ).T
+        _frozen_n_sup = n_supervised
+        def _zero_sup_grad(grad):
+            g = grad.clone()
+            g[:, :_frozen_n_sup] = 0
+            return g
+        sae.decoder.weight.register_hook(_zero_sup_grad)
+
     # weight_decay=0: the doc's "no shrinkage bias" rests on MSE alone
     # shaping magnitude. Default AdamW weight_decay=0.01 would impose
     # L2 shrinkage on encoder + decoder weights — that's a different
