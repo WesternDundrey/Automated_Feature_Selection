@@ -1,5 +1,7 @@
 #!/bin/bash
-# One-shot install for vast.ai instances.
+# One-shot install for vast.ai instances. ALWAYS uses uv pip — the user
+# has a durable preference for uv over pip across all install commands
+# in this project (faster, better dep resolution, fewer surprises).
 # Usage: bash install.sh
 #
 # ============================================================
@@ -18,8 +20,33 @@
 # ============================================================
 set -e
 
+# Sanity check: uv must be on PATH. If it isn't, install it via the
+# official one-liner so the user doesn't have to think about it.
+if ! command -v uv > /dev/null 2>&1; then
+    echo "=== uv not found, installing via official installer ==="
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    # The installer puts uv in ~/.local/bin or ~/.cargo/bin depending
+    # on shell; source the env file it writes so the rest of this
+    # script can find it.
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    if ! command -v uv > /dev/null 2>&1; then
+        echo "ERROR: uv install completed but 'uv' still not on PATH."
+        echo "Add ~/.local/bin to PATH manually and re-run install.sh."
+        exit 1
+    fi
+fi
+echo "=== uv: $(uv --version) ==="
+
+# `uv pip` doesn't auto-detect the system Python venv on vast.ai
+# images (it expects a project venv by default). Pass --system so it
+# installs into the active Python environment, matching what plain
+# `pip` did before.
+UV_PIP="uv pip install --system"
+UV_UNINSTALL="uv pip uninstall --system"
+
+echo ""
 echo "=== Compartment 1: sae-lens + transformer-lens (--no-deps) ==="
-pip install --no-deps sae-lens transformer-lens
+$UV_PIP --no-deps sae-lens transformer-lens
 
 echo ""
 echo "=== Compartment 2: pipeline deps (incl. Delphi runtime deps) ==="
@@ -27,7 +54,7 @@ echo "=== Compartment 2: pipeline deps (incl. Delphi runtime deps) ==="
 # Bundled with the v8.15-v8.18.6 Delphi runtime deps so a single
 # bash install.sh covers the whole pipeline including
 # --step delphi-score.
-pip install \
+$UV_PIP \
     datasets \
     huggingface-hub \
     openai \
@@ -70,7 +97,7 @@ pip install \
 
 echo ""
 echo "=== Compartment 3: vllm (--force-reinstall) ==="
-pip install --force-reinstall vllm
+$UV_PIP --force-reinstall vllm
 
 # Recurring vast.ai gotcha: torchcodec gets dragged in by some
 # transformers/datasets module and tries to dlopen libavutil.so.56
@@ -78,7 +105,7 @@ pip install --force-reinstall vllm
 # every pipeline run dies with `Could not load this library:
 # /venv/main/.../libtorchcodec_core4.so`. We don't need video
 # decoding — uninstall it preemptively.
-pip uninstall -y torchcodec 2>/dev/null || true
+$UV_UNINSTALL torchcodec 2>/dev/null || true
 
 # Delphi (EleutherAI) for --step delphi-score and the inventory
 # / promote-loop gates. Cloned alongside the supsae checkout if
@@ -93,7 +120,7 @@ if [ ! -d "$DELPHI_DIR" ]; then
 fi
 echo ""
 echo "=== Installing Delphi as editable package ==="
-pip install -e "$DELPHI_DIR"
+$UV_PIP -e "$DELPHI_DIR"
 
 # Verify
 echo ""
