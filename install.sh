@@ -77,8 +77,24 @@ pip install --force-reinstall vllm
 # at import time. If the image doesn't have FFmpeg 4 system libs,
 # every pipeline run dies with `Could not load this library:
 # /venv/main/.../libtorchcodec_core4.so`. We don't need video
-# decoding — uninstall it preemptively.
-pip uninstall -y torchcodec 2>/dev/null || true
+# decoding — uninstall it preemptively. Run uninstall in a loop
+# in case torchcodec got reinstalled by a transitive dep above
+# (some `transformers` extras pull it in eagerly).
+echo ""
+echo "=== Uninstalling torchcodec (vast.ai dlopen workaround) ==="
+for i in 1 2 3; do
+    pip uninstall -y torchcodec || true
+    if ! pip show torchcodec > /dev/null 2>&1; then
+        echo "  torchcodec successfully removed (pass $i)"
+        break
+    fi
+done
+if pip show torchcodec > /dev/null 2>&1; then
+    echo "  WARNING: torchcodec is still installed after 3 attempts."
+    echo "  This will likely cause Delphi import chain to fail on first run."
+    echo "  Either install FFmpeg 4 (apt install -y ffmpeg) or manually"
+    echo "  remove the package: pip uninstall -y torchcodec"
+fi
 
 # Delphi (EleutherAI) for --step delphi-score and the inventory
 # / promote-loop gates. Cloned alongside the supsae checkout if
