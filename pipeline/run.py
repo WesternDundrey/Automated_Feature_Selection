@@ -128,6 +128,29 @@ def main():
              "is the mean of correct calls.",
     )
     parser.add_argument(
+        "--target-dir-method", default=None,
+        choices=["mean_shift", "logistic", "lda"],
+        help="Target direction method for frozen decoder. mean_shift "
+             "(default, simplest, robust); logistic (ridge LR per "
+             "feature, optimal classifier direction but uses confounds); "
+             "lda (whitened mean-shift, suppresses high-variance junk, "
+             "needs shrinkage at 768d / rare positives).",
+    )
+    parser.add_argument(
+        "--catalog-gate-mode", default=None,
+        choices=["report", "quarantine", "hard"],
+        help="Catalog quality validator mode. report = write findings, "
+             "drop nothing. quarantine (default) = drop hard-fail leaves "
+             "only (lexical hard-fails like 'sometimes', 'various'; "
+             "missing source_latents; LLM crispness rejects). hard = "
+             "also drop soft-flagged leaves (long descriptions, "
+             "soft lexical flags that didn't reach LLM).",
+    )
+    parser.add_argument(
+        "--no-overlap-check", action="store_true",
+        help="Skip the post-annotation pairwise overlap report.",
+    )
+    parser.add_argument(
         "--annotation-gpus", type=int, default=None,
         help="Number of GPUs to use for local annotation. 0 = auto-detect "
              "(CUDA_VISIBLE_DEVICES or torch.cuda.device_count, default), "
@@ -379,6 +402,12 @@ def main():
         overrides["freeze_supervised_decoder"] = False
     if args.freeze_decoder:
         overrides["hinge_freeze_decoder"] = True
+    if args.target_dir_method is not None:
+        overrides["target_dir_method"] = args.target_dir_method
+    if args.catalog_gate_mode is not None:
+        overrides["catalog_gate_mode"] = args.catalog_gate_mode
+    if args.no_overlap_check:
+        overrides["overlap_check_auto"] = False
     if args.selectivity:
         overrides["selectivity_loss"] = args.selectivity
 

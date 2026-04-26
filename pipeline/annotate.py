@@ -1673,6 +1673,24 @@ if not cfg.activations_path.exists():
         f"(+ sidecar {cfg.annotations_meta_path.name})"
     )
 
+    # v8.18.20: post-annotation pairwise overlap report. Computes
+    # IoU + P(A|B) + P(B|A) for every feature pair with sufficient
+    # support. Reports redundant (high IoU) and subset (high one-way
+    # P) relationships. Doesn't auto-drop — user reviews
+    # overlap_check.json and decides.
+    if getattr(cfg, "overlap_check_auto", True):
+        try:
+            from .overlap_check import run_post_annotation_overlap_check
+            run_post_annotation_overlap_check(
+                cfg,
+                iou_threshold=getattr(cfg, "overlap_iou_threshold", 0.8),
+                subset_threshold=getattr(cfg, "overlap_subset_threshold", 0.95),
+                min_support=getattr(cfg, "overlap_min_support", 30),
+            )
+        except Exception as e:
+            print(f"  [overlap-check] error "
+                  f"({type(e).__name__}: {e}); skipping.")
+
     return tokens, activations, annotations
 
 

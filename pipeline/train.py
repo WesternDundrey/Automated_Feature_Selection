@@ -90,6 +90,160 @@ def compute_target_directions(
     return target_dirs, raw_norms, raw_counts
 
 
+def compute_target_directions_logistic(
+    x_flat: torch.Tensor, y_flat: torch.Tensor, n_supervised: int,
+    l2_lambda: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-feature ridge logistic regression weight as the target direction.
+
+    Per the user's framing: "LR will happily use a confound if it helps
+    classification." This is the cost. Versus mean-shift: LR finds the
+    optimal classification hyperplane normal under logistic loss, which
+    is what cleanly separates classes — but it's NOT a "feature
+    direction" in the interpretation sense. Use only as an ablation
+    against mean-shift.
+
+    Implementation: solves per-feature with simple gradient descent
+    (sklearn would be cleaner but we avoid the dep). Returns the
+    unit-normalized weight vector.
+    """
+    import torch.nn.functional as F
+    n_features = n_supervised
+    d_model = x_flat.shape[1]
+    target_dirs = torch.zeros(n_features, d_model, dtype=x_flat.dtype)
+    raw_norms = torch.zeros(n_features, dtype=x_flat.dtype)
+    counts = torch.zeros(n_features, dtype=x_flat.dtype)
+
+    x = x_flat.float()
+    for k in range(n_features):
+        y = y_flat[:, k].float()
+        n_pos = float(y.sum().item())
+        counts[k] = n_pos
+        if n_pos < 5 or n_pos > x.shape[0] - 5:
+            # too rare or too universal for stable LR
+            continue
+        # Train a single-feature ridge logistic regression via Newton's
+        # method (equivalent to sklearn LogisticRegression(C=1/l2_lambda)).
+        # Closed-form-ish: fixed-point iteration on the normal equations.
+        # 50 iterations is enough at this dim.
+        w = torch.zeros(d_model, dtype=x.dtype, device=x.device,
+                        requires_grad=True)
+        opt = torch.optim.LBFGS([w], lr=1.0, max_iter=50, line_search_fn="strong_wolfe")
+        target_y = y.to(x.device)
+
+        def closure():
+            opt.zero_grad()
+            logit = x @ w
+            # BCE with logits + L2
+            loss = F.binary_cross_entropy_with_logits(logit, target_y) \
+                 + 0.5 * l2_lambda * w.pow(2).sum() / x.shape[0]
+            loss.backward()
+            return loss
+        try:
+            opt.step(closure)
+        except Exception:
+            # LBFGS occasionally fails to converge for very rare classes.
+            continue
+        w = w.detach().cpu()
+        norm = w.norm()
+        if norm < 1e-8:
+            continue
+        raw_norms[k] = norm
+        target_dirs[k] = w / norm
+
+    return target_dirs, raw_norms, counts
+
+
+def compute_target_directions_lda(
+    x_flat: torch.Tensor, y_flat: torch.Tensor, n_supervised: int,
+    shrinkage: float = 0.1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Linear discriminant analysis target direction (whitened mean-shift).
+
+    d_k = normalize((Σ + λI)^-1 (μ₁ - μ₀))
+
+    where Σ is the within-class covariance pooled over both classes
+    and λI is shrinkage regularization (Ledoit-Wolf style — at our
+    sample size, full Σ⁻¹ is unstable).
+
+    Per the user's framing: "LDA / whitened mean-shift is more
+    principled for suppressing high-variance junk." Compared to
+    mean-shift, LDA explicitly down-weights directions that have
+    high variance regardless of class membership.
+    """
+    n_features = n_supervised
+    d_model = x_flat.shape[1]
+    target_dirs = torch.zeros(n_features, d_model, dtype=x_flat.dtype)
+    raw_norms = torch.zeros(n_features, dtype=x_flat.dtype)
+    counts = torch.zeros(n_features, dtype=x_flat.dtype)
+
+    x = x_flat.float()
+    mean_all = x.mean(dim=0)
+    # Total covariance computed once (we approximate within-class as
+    # this — at our sample size pooling is roughly equivalent and
+    # avoids a per-class loop).
+    centered = x - mean_all
+    # Σ = (1/N) X^T X  (centered)
+    sigma = (centered.T @ centered) / x.shape[0]
+    # Shrinkage regularizer: λ scaled by trace(Σ)/d so it's dimension-
+    # invariant (Ledoit-Wolf style with fixed coefficient).
+    diag_mean = sigma.diagonal().mean()
+    sigma_reg = sigma + shrinkage * diag_mean * torch.eye(
+        d_model, dtype=sigma.dtype, device=sigma.device,
+    )
+    # Cholesky-solve once: target_dir = Σ⁻¹ (μ₁ - μ₀) per feature
+    # → solve(Σ, M) where M is the matrix of mean-shifts (d_model, n_features).
+    print(f"  [LDA target_dirs] inverting (d_model={d_model}, "
+          f"shrinkage={shrinkage}, trace/d={float(diag_mean):.4f})")
+    try:
+        chol = torch.linalg.cholesky(sigma_reg)
+    except Exception as e:
+        print(f"    Cholesky failed ({e}); falling back to mean-shift.")
+        return compute_target_directions(x_flat, y_flat, n_supervised)
+
+    for k in range(n_features):
+        y = y_flat[:, k].float()
+        n_pos = float(y.sum().item())
+        counts[k] = n_pos
+        if n_pos < 5:
+            continue
+        mean_pos = (y.unsqueeze(1) * x).sum(dim=0) / max(n_pos, 1)
+        diff = mean_pos - mean_all   # (d_model,)
+        try:
+            d_k = torch.cholesky_solve(diff.unsqueeze(1), chol).squeeze(1)
+        except Exception:
+            continue
+        norm = d_k.norm()
+        if norm < 1e-8:
+            continue
+        raw_norms[k] = norm
+        target_dirs[k] = d_k / norm
+
+    return target_dirs, raw_norms, counts
+
+
+def compute_target_directions_dispatch(
+    x_flat: torch.Tensor, y_flat: torch.Tensor, n_supervised: int, cfg,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dispatch to the right target_dir computation based on
+    cfg.target_dir_method ∈ {'mean_shift', 'logistic', 'lda'}."""
+    method = getattr(cfg, "target_dir_method", "mean_shift")
+    print(f"  Computing target_dirs via method={method!r}")
+    if method == "mean_shift":
+        return compute_target_directions(x_flat, y_flat, n_supervised)
+    if method == "logistic":
+        return compute_target_directions_logistic(
+            x_flat, y_flat, n_supervised,
+            l2_lambda=float(getattr(cfg, "target_dir_logistic_lambda", 1.0)),
+        )
+    if method == "lda":
+        return compute_target_directions_lda(
+            x_flat, y_flat, n_supervised,
+            shrinkage=float(getattr(cfg, "target_dir_lda_shrinkage", 0.1)),
+        )
+    raise ValueError(f"unknown target_dir_method {method!r}")
+
+
 def mse_supervision_loss(
     decoder_weight: torch.Tensor,
     sup_acts: torch.Tensor,
@@ -347,8 +501,8 @@ def train_supervised_sae(
     target_dirs = None
     need_dirs = cfg.supervision_mode in ("hybrid", "mse") or cfg.freeze_supervised_decoder
     if need_dirs:
-        target_dirs, raw_norms, dir_counts = compute_target_directions(
-            x_train, y_train, n_supervised,
+        target_dirs, raw_norms, dir_counts = compute_target_directions_dispatch(
+            x_train, y_train, n_supervised, cfg,
         )
         # Report target direction quality
         valid = raw_norms > 1e-6

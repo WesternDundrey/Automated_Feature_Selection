@@ -146,6 +146,44 @@ class Config:
     # cosine direction loss + frozen decoder) is doing the F1 work.
     hinge_freeze_decoder: bool = False
 
+    # ── v8.18.20 catalog quality gates + direction ablation ──
+    # Catalog quality validator. "report" = compute + write report,
+    # don't drop. "quarantine" (default) = drop hard-fail leaves only
+    # (operationally-undefined phrases like "sometimes" / "various" /
+    # "associated with"; missing source_latents). "hard" = also drop
+    # quarantine-flagged leaves (soft flags + over-long descriptions).
+    # The user's design: lexical flags trigger Sonnet crispness check
+    # (not auto-drop), so surface variants like "opening or closing
+    # bracket" survive while "noun or verb" doesn't.
+    catalog_gate_mode: str = "quarantine"
+    # Whether the validator calls Sonnet's crispness judgment on
+    # soft-flagged descriptions. Off = lexical-only (cheap but noisy).
+    catalog_gate_use_llm: bool = True
+    # Auto-run pairwise overlap check after annotation. Reports
+    # redundant pairs (IoU >= iou_threshold) and subset pairs
+    # (max(P(A|B), P(B|A)) >= subset_threshold). Doesn't drop by
+    # default — emits a report the user reviews.
+    overlap_check_auto: bool = True
+    overlap_iou_threshold: float = 0.8
+    overlap_subset_threshold: float = 0.95
+    overlap_min_support: int = 30
+
+    # Target direction method for the freeze-decoder pin and the
+    # in-loss direction supervision (hybrid/mse modes).
+    #   "mean_shift": current default. d = normalize(μ_pos - μ_all).
+    #                 Crude, robust, cleanest interpretation.
+    #   "logistic":   ridge logistic regression weight per feature.
+    #                 Optimal classification direction; uses confounds
+    #                 if they help separation. NOT a "feature direction"
+    #                 in the interpretation sense.
+    #   "lda":        whitened mean-shift, (Σ + λI)^-1 (μ_pos - μ_all),
+    #                 with shrinkage λ. Suppresses high-variance junk.
+    #                 Needs strong shrinkage at our 768d / rare-positive
+    #                 sample size.
+    target_dir_method: str = "mean_shift"
+    target_dir_logistic_lambda: float = 1.0
+    target_dir_lda_shrinkage: float = 0.1
+
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = False   # True = local model, False = API
     local_annotator_model: str = "Qwen/Qwen3-4B-Base"  # base model, no thinking, pure transformer

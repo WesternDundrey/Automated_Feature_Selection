@@ -536,9 +536,12 @@ def train_hinge_sae(
     ).item()
 
     # Compute target_dirs for post-hoc diagnostic + downstream merge/intervention.
-    # NOT used in loss. NOT constrained on the decoder.
-    post_hoc_dirs, raw_norms, raw_counts = compute_target_directions(
-        x_train, y_train, n_supervised,
+    # NOT used in loss (unless --freeze-decoder is on, in which case the
+    # decoder columns are PINNED at these dirs). Dispatched on
+    # cfg.target_dir_method ∈ {"mean_shift", "logistic", "lda"}.
+    from .train import compute_target_directions_dispatch as _compute_dirs
+    post_hoc_dirs, raw_norms, raw_counts = _compute_dirs(
+        x_train, y_train, n_supervised, cfg,
     )
     valid = (raw_counts > 0) & (raw_norms > 1e-6)
     print(f"\n  Post-hoc target_dirs: {valid.sum().item()}/{n_supervised} "

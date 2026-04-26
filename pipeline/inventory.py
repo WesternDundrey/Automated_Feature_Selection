@@ -1033,6 +1033,31 @@ def run(cfg: Config = None):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # v8.18.20: catalog quality gates. Strict validator + quarantine
+    # (per user's design: lexical flags trigger LLM crispness, not
+    # auto-reject). Default mode "quarantine" drops only hard-fail
+    # leaves (operationally-undefined phrases, missing source_latents,
+    # LLM rejects); soft-flagged ones are kept with a written report.
+    gate_mode = getattr(cfg, "catalog_gate_mode", "quarantine")
+    if gate_mode != "off":
+        try:
+            from .catalog_quality import (
+                apply_catalog_gates, write_quality_report,
+            )
+            print(f"\n  [catalog-quality] applying gates (mode={gate_mode})...")
+            catalog, quality_records = apply_catalog_gates(
+                catalog, cfg=cfg, mode=gate_mode,
+                use_llm_crispness=getattr(cfg, "catalog_gate_use_llm", True),
+            )
+            write_quality_report(
+                quality_records,
+                cfg.output_dir / "catalog_quality_report.json",
+                mode=gate_mode,
+            )
+        except Exception as e:
+            print(f"  [catalog-quality] error "
+                  f"({type(e).__name__}: {e}); skipping gate.")
+
     cfg.catalog_path.write_text(json.dumps(catalog, indent=2))
     print(f"Saved feature catalog: {cfg.catalog_path}")
 
