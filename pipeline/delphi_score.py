@@ -151,6 +151,7 @@ def _build_record_from_top_activations(
     n_not_active: int,
     rng_seed: int,
     held_out_skip: int = 0,
+    n_mid_tier: int = 3,
 ):
     """Build a Delphi LatentRecord from our top_activations.json shape and
     cached activations. Returns LatentRecord or None if there's not enough
@@ -211,6 +212,16 @@ def _build_record_from_top_activations(
         except Exception:
             str_tokens = [str(int(t)) for t in ctx_ids]
 
+        # v8.18 audit fix #3: pre-mark the peak-activation token with
+        # <<...>> so the judge focuses on the target token rather than
+        # scoring "does the window contain this concept." Delphi's
+        # default DetectionScorer call path uses highlighted=False, so
+        # we inject the marker into str_tokens directly — _prepare_text
+        # will join them and the judge sees the marker. Same convention
+        # Delphi uses internally when highlighted=True.
+        if 0 <= pos < len(str_tokens):
+            str_tokens[pos] = f"<<{str_tokens[pos]}>>"
+
         activating_examples.append(ActivatingExample(
             tokens=tok,
             activations=act_window,
@@ -220,6 +231,53 @@ def _build_record_from_top_activations(
 
     if len(activating_examples) < n_test:
         return None
+
+    # ── Mid-tier activating examples (v8.18 audit fix #4). Top-K-only
+    # tests peak-case precision: a description that nails the strongest
+    # firings but fails on mid-tier ones still passes. Sample positions
+    # where the latent fires in the 25-75th percentile of nonzero
+    # activations to test full-support recall. The judge labels these
+    # as activating; descriptions that are too narrow ("only fires on X
+    # during Y") will fail recall on these mid-tier examples.
+    n_mid = int(n_mid_tier)
+    flat_acts = activations_for_latent.reshape(-1).cpu().numpy()
+    nonzero_vals = flat_acts[flat_acts > 0]
+    if len(nonzero_vals) >= 8:
+        p25 = float(np.percentile(nonzero_vals, 25))
+        p75 = float(np.percentile(nonzero_vals, 75))
+        mid_mask = (flat_acts > p25) & (flat_acts < p75)
+        mid_positions = np.flatnonzero(mid_mask)
+        if len(mid_positions) >= n_mid:
+            mid_chosen = rng.choice(mid_positions, size=n_mid, replace=False)
+            mid_window_len = (
+                len(used_test[0]["context_ids"]) if used_test[0].get("context_ids") else 21
+            )
+            mid_half = mid_window_len // 2
+            for flat_pos in mid_chosen:
+                n = int(flat_pos // T)
+                t = int(flat_pos % T)
+                start = max(0, t - mid_half)
+                end = min(T, start + mid_window_len)
+                start = max(0, end - mid_window_len)
+                ctx = full_tokens[n, start:end]
+                local_pos = t - start
+                if ctx.shape[0] < 2:
+                    continue
+                try:
+                    str_tokens_mid = [tokenizer.decode([int(x)]) for x in ctx.tolist()]
+                except Exception:
+                    str_tokens_mid = [str(int(x)) for x in ctx.tolist()]
+                if 0 <= local_pos < len(str_tokens_mid):
+                    str_tokens_mid[local_pos] = f"<<{str_tokens_mid[local_pos]}>>"
+                act_window_mid = torch.zeros(ctx.shape[0], dtype=torch.float32)
+                if 0 <= local_pos < ctx.shape[0]:
+                    act_window_mid[local_pos] = float(flat_acts[flat_pos])
+                activating_examples.append(ActivatingExample(
+                    tokens=ctx.long(),
+                    activations=act_window_mid,
+                    str_tokens=str_tokens_mid,
+                    quantile=1,   # 1 = mid-tier marker
+                ))
 
     # ── Non-activating examples — sample N positions where the latent's
     # activation is exactly zero, render a small window of context.
@@ -316,6 +374,7 @@ def score_descriptions(
     judge_model: str | None = None,
     api_key: str | None = None,
     held_out_skip: int | None = None,
+    n_mid_tier: int | None = None,
 ) -> dict[str, dict]:
     """Score each (latent_id → description) pair via Delphi DetectionScorer.
 
@@ -377,9 +436,12 @@ def score_descriptions(
             - int(getattr(cfg, "delphi_held_out_n", 10)),
         )
 
+    if n_mid_tier is None:
+        n_mid_tier = int(getattr(cfg, "delphi_n_mid_tier", 3))
+
     print(f"  [delphi-score] judge={judge_model} threshold={threshold:.2f} "
           f"n_test={n_test} n_not_active={n_not_active} "
-          f"held_out_skip={held_out_skip}")
+          f"held_out_skip={held_out_skip} n_mid_tier={n_mid_tier}")
 
     client = OpenRouter(
         model=judge_model,
@@ -430,6 +492,7 @@ def score_descriptions(
             n_not_active=n_not_active,
             rng_seed=cfg.seed,
             held_out_skip=held_out_skip,
+            n_mid_tier=n_mid_tier,
         )
         if record is None:
             out[lid_str] = {
@@ -518,18 +581,23 @@ def gate_promote_loop_candidates(
 
     if not _bootstrap_delphi():
         msg = _DELPHI_IMPORT_ERROR or "delphi unavailable"
-        print(f"  [delphi-gate promote_loop] skipped: {msg}")
+        print(f"  [delphi-gate promote_loop] STATUS=skipped reason=delphi_unavailable")
+        print(f"    detail: {msg}")
         return crisp_candidates, {
-            f"u{u}": {"score": None, "kept": True, "reason": "delphi_unavailable"}
-            for u, _ in crisp_candidates
+            "_gate_mode": "skipped",
+            "_skip_reason": "delphi_unavailable",
+            **{f"u{u}": {"score": None, "kept": True, "reason": "delphi_unavailable"}
+               for u, _ in crisp_candidates},
         }
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
-        print("  [delphi-gate promote_loop] skipped: OPENROUTER_API_KEY not set")
+        print("  [delphi-gate promote_loop] STATUS=skipped reason=no_api_key")
         return crisp_candidates, {
-            f"u{u}": {"score": None, "kept": True, "reason": "no_api_key"}
-            for u, _ in crisp_candidates
+            "_gate_mode": "skipped",
+            "_skip_reason": "no_api_key",
+            **{f"u{u}": {"score": None, "kept": True, "reason": "no_api_key"}
+               for u, _ in crisp_candidates},
         }
 
     # Compute the per-candidate U-latent activation map.
@@ -587,15 +655,22 @@ def gate_promote_loop_candidates(
 
     n_dropped = len(crisp_candidates) - len(kept)
     if n_dropped > 0:
-        print(f"  [delphi-gate promote_loop] kept {len(kept)} of "
-              f"{len(crisp_candidates)} (dropped {n_dropped} below "
-              f"threshold {threshold:.2f}):")
         for u, desc in crisp_candidates:
             s = log[f"u{u}"]
             if not s.get("kept", True):
                 ssc = s.get("score")
                 ssc_s = f"{ssc:.3f}" if ssc is not None else "?"
                 print(f"    drop u{u} (score={ssc_s}): {desc[:80]}")
+
+    # Final summary line.
+    print(f"  [delphi-gate promote_loop] STATUS=scored "
+          f"kept={len(kept)}/{len(crisp_candidates)} "
+          f"dropped={n_dropped} threshold={threshold:.2f}")
+
+    log["_gate_mode"] = "scored"
+    log["_threshold"] = threshold
+    log["_n_input"]   = len(crisp_candidates)
+    log["_n_kept"]    = len(kept)
     return kept, log
 
 
@@ -639,18 +714,23 @@ def gate_inventory_descriptions(
 
     if not _bootstrap_delphi():
         msg = _DELPHI_IMPORT_ERROR or "delphi unavailable"
-        print(f"  [delphi-gate inventory] skipped: {msg}")
+        print(f"  [delphi-gate inventory] STATUS=skipped reason=delphi_unavailable")
+        print(f"    detail: {msg}")
         return descriptions, {
-            lid: {"score": None, "kept": True, "reason": "delphi_unavailable"}
-            for lid in descriptions
+            "_gate_mode": "skipped",
+            "_skip_reason": "delphi_unavailable",
+            **{lid: {"score": None, "kept": True, "reason": "delphi_unavailable"}
+               for lid in descriptions},
         }
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
-        print("  [delphi-gate inventory] skipped: OPENROUTER_API_KEY not set")
+        print("  [delphi-gate inventory] STATUS=skipped reason=no_api_key")
         return descriptions, {
-            lid: {"score": None, "kept": True, "reason": "no_api_key"}
-            for lid in descriptions
+            "_gate_mode": "skipped",
+            "_skip_reason": "no_api_key",
+            **{lid: {"score": None, "kept": True, "reason": "no_api_key"}
+               for lid in descriptions},
         }
 
     # Subset to descriptions whose keys parse as valid latent indices.
@@ -729,9 +809,6 @@ def gate_inventory_descriptions(
 
     n_dropped = len(descriptions) - len(kept)
     if n_dropped > 0:
-        print(f"  [delphi-gate inventory] kept {len(kept)} of "
-              f"{len(descriptions)} descriptions (dropped {n_dropped} below "
-              f"threshold {threshold:.2f})")
         # Show the worst 10 drops so the user can eyeball
         dropped_with_scores = sorted(
             [(k, score_log[k]["score"]) for k in score_log
@@ -741,10 +818,243 @@ def gate_inventory_descriptions(
         )
         for k, s in dropped_with_scores[:10]:
             print(f"    drop L{k} (score={s:.3f}): {descriptions[k][:80]}")
-    else:
-        print(f"  [delphi-gate inventory] kept all {len(kept)} descriptions")
 
+    # Final summary line — grep-friendly status so the user can verify
+    # Delphi actually ran without inspecting JSON.
+    print(f"  [delphi-gate inventory] STATUS=scored "
+          f"kept={len(kept)}/{len(descriptions)} "
+          f"dropped={n_dropped} threshold={threshold:.2f}")
+
+    score_log["_gate_mode"] = "scored"
+    score_log["_threshold"] = threshold
+    score_log["_n_input"]   = len(descriptions)
+    score_log["_n_kept"]    = len(kept)
     return kept, score_log
+
+
+# ── post-organize_hierarchy gate: score final catalog leaves ─────────
+
+
+def gate_organized_leaves(
+    catalog: dict,
+    sae,
+    activations: torch.Tensor,    # (N, T, d_model) residual stream
+    tokens: torch.Tensor,
+    top_activations: dict[str, list[dict]],
+    tokenizer,
+    cfg: Config,
+    threshold: float | None = None,
+) -> tuple[dict, dict]:
+    """Run Delphi DetectionScorer over the FINAL catalog leaves (after
+    organize_hierarchy). Each leaf must carry `source_latents: [int]` —
+    the latent IDs that contributed to its construction. The gate uses
+    the first source latent's held-out top activations as positive
+    examples for the leaf's (possibly-rewritten) description.
+
+    Why this is needed (v8.18 audit fix #1): organize_hierarchy is allowed
+    to rewrite descriptions, drop them, and (pre-v8.18) invent
+    gap-filled leaves with no source. Pre-v8.18 the gate ran only on
+    raw descriptions — the rewrites and gap-fillers slipped past
+    unscrutinized. v8.18 makes Sonnet declare source_latents per leaf
+    (organize_hierarchy prompt updated) and re-scores the rewritten
+    description against the source latent's actual firing pattern. If
+    the rewrite drifted too far from what predicts the source latent,
+    the leaf is dropped.
+
+    Returns (filtered_catalog, score_log). Drops leaves with empty
+    `source_latents`, leaves whose source latent isn't in
+    `top_activations`, and leaves whose Delphi accuracy is below
+    threshold. Group entries pass through unchanged.
+
+    Fail-open: any infrastructure problem keeps every leaf.
+    """
+    threshold = float(
+        threshold
+        if threshold is not None
+        else getattr(cfg, "delphi_score_threshold", 0.7)
+    )
+
+    if not _bootstrap_delphi():
+        msg = _DELPHI_IMPORT_ERROR or "delphi unavailable"
+        print(f"  [delphi-gate organized] STATUS=skipped reason=delphi_unavailable")
+        print(f"    detail: {msg}")
+        return catalog, {"_gate_mode": "skipped", "_skip_reason": "delphi_unavailable"}
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        print("  [delphi-gate organized] STATUS=skipped reason=no_api_key")
+        return catalog, {"_gate_mode": "skipped", "_skip_reason": "no_api_key"}
+
+    features = catalog.get("features") or []
+    leaves = [f for f in features if f.get("type") == "leaf"]
+    groups = [f for f in features if f.get("type") != "leaf"]
+
+    # Partition: leaves with valid source_latents that exist in top_activations.
+    scoreable: list[dict] = []
+    untraceable: list[dict] = []   # missing or empty source_latents
+    orphaned: list[dict] = []      # source latent not in top_activations
+    for lf in leaves:
+        srcs_raw = lf.get("source_latents") or []
+        srcs: list[int] = []
+        for s in srcs_raw:
+            try:
+                srcs.append(int(s))
+            except (TypeError, ValueError):
+                continue
+        if not srcs:
+            untraceable.append(lf)
+            continue
+        # Keep first source whose top_activations are available.
+        chosen = None
+        for s in srcs:
+            if str(s) in top_activations:
+                chosen = s
+                break
+        if chosen is None:
+            orphaned.append({**lf, "_attempted_sources": srcs})
+            continue
+        scoreable.append({**lf, "_chosen_source": chosen, "_source_latents": srcs})
+
+    print(f"  [delphi-gate organized] {len(scoreable)} leaves traceable, "
+          f"{len(untraceable)} untraceable (no source_latents), "
+          f"{len(orphaned)} orphaned (source not in top_activations)")
+
+    if not scoreable:
+        # All leaves either untraceable or orphaned — keep groups + scoreable
+        # (which is empty here) and drop the unscoreable ones with a log.
+        log = {
+            "threshold": threshold,
+            "n_leaves_in":  len(leaves),
+            "n_leaves_kept": 0,
+            "n_untraceable": len(untraceable),
+            "n_orphaned":    len(orphaned),
+            "untraceable_ids": [lf["id"] for lf in untraceable],
+            "orphaned_ids":    [lf["id"] for lf in orphaned],
+            "scores": {},
+        }
+        # Edge case: keep all leaves anyway (fail-open if nothing scoreable).
+        return catalog, log
+
+    # Encode SAE codes for the chosen source latents.
+    chosen_latents = [int(lf["_chosen_source"]) for lf in scoreable]
+    valid_chosen: list[int] = []
+    valid_lf_idx: list[int] = []
+    for i, lid in enumerate(chosen_latents):
+        if 0 <= lid < sae.d_sae:
+            valid_chosen.append(lid)
+            valid_lf_idx.append(i)
+    if not valid_chosen:
+        print("  [delphi-gate organized] no valid source latents within sae.d_sae range")
+        return catalog, {"reason": "no_valid_sources"}
+
+    if activations.dim() != 3:
+        print(f"  [delphi-gate organized] unexpected activations shape "
+              f"{tuple(activations.shape)}; skipping")
+        return catalog, {"reason": "bad_activations_shape"}
+    N, T, d_model = activations.shape
+    print(f"  [delphi-gate organized] encoding {len(valid_chosen)} source "
+          f"latents through pretrained SAE...")
+    x_flat = activations.reshape(-1, d_model).to(torch.float32)
+    sae_codes = _encode_pretrained_sae_for_latents(
+        sae, x_flat, N, T, valid_chosen, device=cfg.device,
+    )
+
+    # Build pos-keyed descriptions where the description is the FINAL
+    # (possibly-rewritten) leaf description, and top_activations come
+    # from the chosen source latent.
+    pos_keyed_descs = {}
+    pos_keyed_top_acts = {}
+    for stack_pos, lf_i in enumerate(valid_lf_idx):
+        lf = scoreable[lf_i]
+        pos_keyed_descs[str(stack_pos)] = lf["description"]
+        pos_keyed_top_acts[str(stack_pos)] = top_activations.get(
+            str(int(lf["_chosen_source"])), [],
+        )
+
+    print(f"  [delphi-gate organized] scoring {len(pos_keyed_descs)} final "
+          f"leaves against their source-latent firing "
+          f"(threshold={threshold:.2f})")
+
+    pos_scores = score_descriptions(
+        descriptions=pos_keyed_descs,
+        top_activations=pos_keyed_top_acts,
+        full_tokens=tokens,
+        activations=sae_codes,
+        latent_offset=0,
+        tokenizer=tokenizer,
+        cfg=cfg,
+        threshold=threshold,
+    )
+
+    # Reverse-map. Build the filtered catalog.
+    kept_leaves: list[dict] = []
+    score_log: dict = {}
+    for stack_pos, lf_i in enumerate(valid_lf_idx):
+        lf = scoreable[lf_i]
+        s = pos_scores.get(str(stack_pos), {
+            "score": None, "kept": True, "reason": "missing_score",
+        })
+        score_log[lf["id"]] = {
+            **s,
+            "description": lf["description"],
+            "chosen_source": int(lf["_chosen_source"]),
+            "source_latents": list(lf["_source_latents"]),
+        }
+        if s.get("kept", True):
+            # Strip the helper fields before re-emitting.
+            cleaned = {
+                k: v for k, v in lf.items()
+                if not k.startswith("_")
+            }
+            kept_leaves.append(cleaned)
+
+    # Untraceable / orphaned leaves are dropped. Log them.
+    for lf in untraceable:
+        score_log[lf["id"]] = {
+            "score": None, "kept": False, "reason": "no_source_latents",
+            "description": lf.get("description", ""),
+            "chosen_source": None,
+            "source_latents": [],
+        }
+    for lf in orphaned:
+        score_log[lf["id"]] = {
+            "score": None, "kept": False, "reason": "source_not_in_top_activations",
+            "description": lf.get("description", ""),
+            "chosen_source": None,
+            "source_latents": lf.get("_attempted_sources") or [],
+        }
+
+    n_kept = len(kept_leaves)
+    n_drop = len(leaves) - n_kept
+
+    if n_drop > 0:
+        # Print worst-10 (with scores) for eyeball
+        scored_drops = sorted(
+            [(lid, s["score"]) for lid, s in score_log.items()
+             if not s.get("kept", True) and s.get("score") is not None],
+            key=lambda kv: kv[1] if kv[1] is not None else 0.0,
+        )
+        for lid, sc in scored_drops[:10]:
+            print(f"    drop {lid} (score={sc:.3f}): {score_log[lid]['description'][:80]}")
+
+    # Final summary line.
+    print(f"  [delphi-gate organized] STATUS=scored "
+          f"kept={n_kept}/{len(leaves)} "
+          f"dropped={n_drop} (untraceable={len(untraceable)}, "
+          f"orphaned={len(orphaned)}, low_score={n_drop - len(untraceable) - len(orphaned)}) "
+          f"threshold={threshold:.2f}")
+
+    filtered_catalog = dict(catalog)
+    filtered_catalog["features"] = groups + kept_leaves
+    return filtered_catalog, {
+        "_gate_mode":   "scored",
+        "_threshold":   threshold,
+        "n_leaves_in":  len(leaves),
+        "n_leaves_kept": n_kept,
+        "n_untraceable": len(untraceable),
+        "n_orphaned":    len(orphaned),
+        "scores": score_log,
+    }
 
 
 # ── CLI: `--step delphi-score` ──────────────────────────────────────────

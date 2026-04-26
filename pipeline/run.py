@@ -67,7 +67,14 @@ def main():
     parser.add_argument("--full-desc", action="store_true",
                         help="Use full description in suffix instead of F-index (slower but more accurate)")
     parser.add_argument("--flat", action="store_true",
-                        help="Strip group features from catalog, keep only leaves (no hierarchy loss)")
+                        help="(deprecated, default-on as of v8.18) Strip group "
+                             "features from catalog, keep only leaves. "
+                             "Flat catalog is now the default; this flag is a "
+                             "no-op kept for backwards compat. Use --keep-groups to opt out.")
+    parser.add_argument("--keep-groups", action="store_true",
+                        help="Opt out of v8.18's default flat catalog. "
+                             "Preserves the group/leaf hierarchy and enables "
+                             "the hierarchy loss during training.")
     parser.add_argument("--supervision", default=None,
                         choices=["hinge", "hinge_jumprelu", "gated_bce",
                                  "hybrid", "mse", "bce"],
@@ -304,6 +311,8 @@ def main():
         overrides["promote_use_delphi_gate"] = False
     if args.no_delphi_gate_inventory:
         overrides["delphi_gate_in_inventory"] = False
+    if args.keep_groups:
+        overrides["flatten_catalog"] = False
     if args.supervision:
         overrides["supervision_mode"] = args.supervision
     if args.gated_tie_weights:
@@ -425,8 +434,12 @@ def main():
         else:
             print(f"\n  WARNING: scaffold_catalog not found at {scaffold_path}")
 
-    # Flatten catalog if requested (strip groups, keep only leaves)
-    if args.flat and cfg.catalog_path.exists():
+    # Flatten catalog (default-on as of v8.18 per user preference). Pass
+    # --keep-groups to preserve the hierarchy. The hierarchy loss is
+    # automatically a no-op on flat catalogs (no parent-child pairs),
+    # so lambda_hier still works numerically — just contributes 0.
+    _do_flatten = (cfg.flatten_catalog or args.flat) and not args.keep_groups
+    if _do_flatten and cfg.catalog_path.exists():
         import json as _json
         _cat = _json.loads(cfg.catalog_path.read_text())
         _before = len(_cat["features"])
@@ -437,8 +450,8 @@ def main():
         _after = len(_cat["features"])
         if _after < _before:
             cfg.catalog_path.write_text(_json.dumps(_cat, indent=2))
-            print(f"\n  --flat: stripped {_before - _after} group features, "
-                  f"{_after} leaves remain")
+            print(f"\n  Flat catalog: stripped {_before - _after} group "
+                  f"features, {_after} leaves remain")
 
     # Step 2: Annotation
     if args.step is None or args.step == "annotate":

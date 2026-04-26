@@ -70,6 +70,14 @@ class Config:
     # target SAE's typical 30–80 range without hurting supervised F1.
     lambda_sparse: float = 5e-2
     lambda_hier: float = 0.5
+    # v8.18: flat catalog by default (per user preference — "i just don't
+    # like grouping"). Sonnet still emits groups in organize_hierarchy
+    # because the clustering step benefits from grouping during
+    # generation, but the saved feature_catalog.json is post-flattened to
+    # leaves only. With flat catalog, the hierarchy loss has nothing to
+    # do (no parent-child relations), so lambda_hier is auto-zeroed at
+    # train time when flatten_catalog=True. Pass --keep-groups to opt out.
+    flatten_catalog: bool = True
     warmup_steps: int = 500
     train_fraction: float = 0.8
     seed: int = 42
@@ -215,6 +223,12 @@ class Config:
     # Whether `--step promote-loop` runs the Delphi gate between
     # crispness and the mini-prefilter. Default-on as of v8.15.
     promote_use_delphi_gate: bool = True
+    # v8.18: number of mid-tier activating examples to add to the
+    # Delphi gate's test set (in addition to top-K held-out positives).
+    # Mid-tier means activations in the 25-75th percentile of nonzero —
+    # tests recall, not just peak-case precision. Setting to 0 reverts
+    # to peak-only behavior.
+    delphi_n_mid_tier: int = 3
     # v8.17: whether `--step inventory` runs the Delphi gate between
     # description generation and organize_hierarchy. Default-on. Set
     # to False (or pass --no-delphi-gate-inventory at the CLI) to

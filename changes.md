@@ -4,6 +4,114 @@
 
 ---
 
+## [v8.18] — Delphi covers FINAL leaves; flat catalog default; token highlighting; mid-tier examples; visibility
+
+**Date:** 2026-04-26
+
+### Motivation
+
+User audit of v8.17:
+
+> Verdict: It is now a real Delphi integration, but only a narrow one. It scrutinizes raw Sonnet latent descriptions before annotation; it does not fully scrutinize every final catalog feature.
+>
+> 1. **High** — `inventory.py:809` gates raw descriptions, then `inventory.py:647` can rewrite, merge, and add gap-filled leaves afterward. Those final leaves are not Delphi-scored.
+> 2. **Medium** — Negatives are easy. Random zero-activation contexts vs Delphi's neighbour/FAISS hard negatives.
+> 3. **Medium** — Token-level mismatch. DetectionScorer uses unhighlighted whole text by default; annotations are token-level.
+> 4. **Medium** — Tests top held-out activations, not coverage. Peak-case precision, not full-support recall.
+> 5. **Operational** — Fails open on missing Delphi/API. "Delphi scrutinized this catalog" only true if `delphi_scores_inventory.json` has numeric scores.
+
+Plus user request: "also let's make flat default, i just dont like grouping."
+
+### Fixes
+
+#### #1 — Final-leaf Delphi pass (closes high finding)
+
+`organize_hierarchy` prompt updated:
+- **Forbids gap-filling** ("ABSOLUTELY DO NOT add leaves that aren't in the input"). Sonnet can no longer invent siblings.
+- **Requires `source_latents: [int]`** per leaf — the latent IDs whose raw descriptions contributed. Trace from final leaf back to one or more SAE latents.
+
+`pipeline/delphi_score.py` adds `gate_organized_leaves(catalog, sae, activations, tokens, top_activations, tokenizer, cfg, threshold)`:
+- Partitions catalog leaves into `scoreable` (have `source_latents` resolvable in `top_activations`), `untraceable` (empty/missing source_latents — Sonnet didn't obey), and `orphaned` (source latent was already filtered by the raw gate).
+- For each scoreable leaf, encodes the chosen source latent through the pretrained SAE and runs DetectionScorer with the LEAF's (possibly-rewritten) description as the explanation.
+- Drops leaves below threshold + all untraceable + all orphaned.
+
+Wired into `inventory.run` AFTER `organize_hierarchy` (and before catalog-write). Per-leaf scores logged to `pipeline_data/delphi_scores_organized.json`.
+
+The pre-v8.18 path where the rewriter could drift the description and the scorer never noticed is closed.
+
+#### #2 — Flat catalog default (user request)
+
+`Config.flatten_catalog: bool = True` (was opt-in via `--flat`). New flag `--keep-groups` to preserve hierarchy when needed for the hierarchy-loss path. The `--flat` flag still works as a no-op for compat.
+
+Hierarchy loss is automatically a numerical no-op on flat catalogs: `hier_map` is empty, `hierarchy_loss` returns zero. No code change needed in train.py.
+
+`organize_hierarchy` still emits groups (the clustering helps Sonnet's output quality even though we strip them at the end). The `--flat` post-step strips groups + clears `parent` references on leaves before saving.
+
+The v8.10 scaffold catalog's `control` group is also stripped on flat runs; scaffold leaves remain valid with `role="control"`.
+
+#### #3 — Token highlighting in scorer text (closes medium finding)
+
+`_build_record_from_top_activations` now wraps the peak-activation token with `<<...>>` markers in `str_tokens`. When DetectionScorer's `_prepare_text` joins the str_tokens (in its default unhighlighted mode), the markers carry through to the judge prompt. Same convention Delphi uses internally when `highlighted=True`. The judge sees "does THIS token in this context have the property" rather than "does the window contain the concept."
+
+#### #4 — Mid-tier activations in test set (closes medium finding)
+
+In addition to the top-K held-out positives, `_build_record_from_top_activations` now samples up to `cfg.delphi_n_mid_tier=3` positions where the latent fires in the **25-75th percentile** of nonzero activations. These are labeled as activating in the LatentRecord. A description that's spot-on for peak firings but fails on mid-tier ones now gets penalized (recall-tested), not just rewarded for peak-case precision.
+
+Setting `delphi_n_mid_tier=0` reverts to peak-only.
+
+#### #5 — STATUS visibility (closes operational finding)
+
+Every gate now prints a single grep-friendly final-line summary:
+
+```
+[delphi-gate inventory] STATUS=scored kept=73/100 dropped=27 threshold=0.70
+[delphi-gate organized] STATUS=scored kept=58/64 dropped=6 (untraceable=2, orphaned=1, low_score=3) threshold=0.70
+[delphi-gate promote_loop] STATUS=scored kept=8/12 dropped=4 threshold=0.70
+```
+
+When the gate fails open (no API key, import error), the line says `STATUS=skipped reason=<x>`. The score-log JSON also carries top-level `_gate_mode` ("scored" or "skipped") for downstream tooling. You can confirm Delphi actually ran with `grep STATUS=scored` on the inventory output.
+
+### What's still NOT in this integration (honest scope)
+
+- **No FuzzScorer** — only DetectionScorer is wired in. FuzzScorer perturbs examples and re-tests; it would catch broader-but-correct descriptions that DetectionScorer accepts. Adding it is mechanical (same client, different scorer class) but not done in v8.18.
+- **No FAISS hard negatives** — non-activating examples are still random zero-activation positions. Delphi supports neighbour-based negatives via `delphi.latents.constructors`, but that needs precomputed cosine-neighbour graphs of the SAE's decoder, which is a separate setup. Easy negatives means broad descriptions can still pass.
+- **No Delphi LatentCache pipeline** — we build LatentRecords ad-hoc from our pipeline state. Delphi's full cache abstraction (efficient streaming over millions of latents) isn't used; we materialize per-latent activation columns chunked.
+
+This is a Delphi `DetectionScorer` gate over raw descriptions AND final leaves with token highlighting + mid-tier examples. Not full Delphi.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/delphi_score.py` | `gate_organized_leaves` (new); `_build_record_from_top_activations` highlights peak token + adds mid-tier examples; STATUS=scored/skipped final-line summaries; `_gate_mode` in JSON output |
+| `pipeline/inventory.py` | `organize_hierarchy` prompt forbids gap-fill, requires `source_latents`; `gate_organized_leaves` called between `organize_hierarchy` and catalog-write; SAE freed only after second gate completes |
+| `pipeline/config.py` | `flatten_catalog: bool = True`; `delphi_n_mid_tier: int = 3` |
+| `pipeline/run.py` | `--keep-groups` opt-out; `--flat` deprecated as no-op; flat-default conditional |
+| `changes.md` | This entry |
+
+### Run command (unchanged)
+
+```bash
+python -m pipeline.run \
+--layer 9 --sae_id blocks.9.hook_resid_pre \
+--local-annotator --full-desc \
+--n_sequences 1000 \
+--delphi-threshold 0.7
+```
+
+What you'll see in the log:
+
+```
+[delphi-gate inventory] STATUS=scored kept=400/500 dropped=100 threshold=0.70
+... organize_hierarchy runs ...
+[delphi-gate organized] STATUS=scored kept=58/64 dropped=6 (untraceable=2, orphaned=1, low_score=3) threshold=0.70
+Flat catalog: stripped 12 group features, 58 leaves remain
+```
+
+The final feature_catalog.json is flat, has no group entries, and every leaf has been Delphi-scored both as a raw description AND in its final (possibly-rewritten) form.
+
+---
+
 ## [v8.17] — Delphi at the catalog: drop bad descriptions BEFORE annotation
 
 **Date:** 2026-04-26

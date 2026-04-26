@@ -595,9 +595,17 @@ def explain_features(top_activations: dict, tokenizer, cfg: Config) -> dict:
 def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
     """Ask Claude to organize feature descriptions into a hierarchical catalog.
 
-    This is the key step: Claude rewrites descriptions for precision, groups them,
-    fills coverage gaps (symmetry partners, missing family members), and removes
-    vague or redundant features.
+    v8.18 (audit fix): every leaf MUST carry a `source_latents: [int]`
+    field naming the raw-description latent IDs the leaf derives from.
+    Sonnet is no longer allowed to invent gap-filled leaves with no
+    source — the post-organize Delphi pass uses `source_latents` to
+    re-score each final leaf against an actual SAE latent's activation
+    pattern. Without this trace, a final leaf has no testable ground
+    truth and silently bypasses Delphi's quality check.
+
+    Sonnet is still allowed to: cluster into groups, drop redundant
+    descriptions, choose broad leaf IDs, and rewrite descriptions for
+    precision — as long as every leaf names its source(s).
     """
     from .llm import get_client, chat
     client = get_client()
@@ -641,22 +649,35 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
           both a comma AND a list separator, but commas in other contexts aren't.
           Distinguishable patterns, OK to co-occur.
 
-        Target: 8-15 groups, 40-80 total leaves.
+        Target: 8-15 groups, 30-80 total leaves (depends on what survives).
         Each leaf should fire on at least 1 in 200 tokens in diverse web text.
 
         YOUR TASKS:
         1. IDENTIFY broad feature dimensions from the descriptions. Use categorical
            groups where natural (punctuation type, part of speech, semantic domain).
            Use non-exclusive groups where features genuinely co-occur.
-        2. For each group, pick 3-8 BROAD leaves.
+        2. For each group, pick 3-8 BROAD leaves drawn FROM THE INPUT
+           DESCRIPTIONS — do NOT invent leaves with no source. Every leaf
+           must trace back to one or more `latent_<id>` from the input
+           list above.
            "comma" not "comma_contrastive". "politics" not "official_affiliation_adjective".
-        3. FILL GAPS: if one value exists (e.g., "comma" among punctuation), add
-           the other natural values (period, question_mark, etc.).
-        4. REMOVE features that are too narrow (would match fewer than 1 in 200
+        3. REMOVE features that are too narrow (would match fewer than 1 in 200
            tokens), too vague ("general language pattern"), or redundant (always
            co-occur with another feature on the same tokens).
-        5. Each leaf description must be short and operationally testable: a reader
+        4. Each leaf description must be short and operationally testable: a reader
            looks at a token in context and decides yes/no.
+        5. ABSOLUTELY DO NOT add gap-filling leaves that aren't in the
+           input. If only "comma" is in the input among punctuation, do
+           NOT add "period" / "question_mark" — those weren't grounded
+           in any SAE latent's activation pattern, so we have no way to
+           validate them. Stick to what was observed.
+
+        SOURCE TRACE — required field per leaf:
+          - `source_latents`: list of integer latent IDs (matching the
+            `latent_<N>` numbers above) whose descriptions contributed
+            to this leaf. Multiple latents allowed when descriptions
+            cluster. NEVER an empty list — if you can't trace a leaf
+            to any source latent, drop it instead.
 
         OUTPUT FORMAT — reply with ONLY this JSON, no other text:
         {{
@@ -671,12 +692,14 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
               "id": "group_name.value_name",
               "description": "Precise operational description of this value",
               "type": "leaf",
-              "parent": "group_name"
+              "parent": "group_name",
+              "source_latents": [123, 456]
             }}
           ]
         }}
 
-        Every leaf must have a parent group. Groups have type "group" and parent null.
+        Every leaf must have a parent group AND a non-empty source_latents list.
+        Groups have type "group" and parent null.
         Leaf IDs use dot notation: group.value.
     """)
 
@@ -831,12 +854,67 @@ def run(cfg: Config = None):
             print(f"  [delphi-gate inventory] error "
                   f"({type(e).__name__}: {e}); skipping gate.")
 
-    # Free GPU memory before LLM calls
-    del model, sae
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    # Free model only — keep SAE for the post-organize_hierarchy gate.
+    # Model isn't needed for organize_hierarchy or the second Delphi pass;
+    # SAE is. We free SAE after the second gate.
+    try:
+        del model
+    except NameError:
+        pass
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # 5. Organize into hierarchy
     catalog = organize_hierarchy(descriptions, cfg)
+
+    # 5b. (v8.18 audit fix #1) Delphi gate on FINAL leaves. organize_hierarchy
+    # is allowed to rewrite descriptions and drop redundant ones, but each
+    # leaf must declare `source_latents`. We re-score the rewritten
+    # description against the source latent's actual firing pattern. Leaves
+    # that drift too far OR have no source_latents are dropped — closes the
+    # v8.17 hole where rewrites and gap-fill bypassed Delphi.
+    if getattr(cfg, "delphi_gate_in_inventory", True):
+        try:
+            from .delphi_score import gate_organized_leaves, is_available
+            ok, why = is_available()
+            if ok:
+                if cfg.activations_path.exists() and cfg.tokens_path.exists():
+                    activations_full = torch.load(
+                        cfg.activations_path, weights_only=True,
+                    )
+                    tokens_full = torch.load(
+                        cfg.tokens_path, weights_only=True,
+                    )
+                    catalog, organized_score_log = gate_organized_leaves(
+                        catalog=catalog,
+                        sae=sae,
+                        activations=activations_full,
+                        tokens=tokens_full,
+                        top_activations=top_acts,
+                        tokenizer=tokenizer,
+                        cfg=cfg,
+                        threshold=getattr(cfg, "delphi_score_threshold", 0.7),
+                    )
+                    cfg.output_dir.joinpath("delphi_scores_organized.json").write_text(
+                        json.dumps(organized_score_log, indent=2)
+                    )
+                else:
+                    print(f"  [delphi-gate organized] activations.pt/tokens.pt "
+                          f"not yet cached; second gate skipped.")
+            else:
+                print(f"  [delphi-gate organized] {why}")
+        except Exception as e:
+            print(f"  [delphi-gate organized] error "
+                  f"({type(e).__name__}: {e}); skipping gate.")
+
+    # Now safe to free SAE — both gates are done.
+    try:
+        del sae
+    except NameError:
+        pass
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     cfg.catalog_path.write_text(json.dumps(catalog, indent=2))
     print(f"Saved feature catalog: {cfg.catalog_path}")
 
