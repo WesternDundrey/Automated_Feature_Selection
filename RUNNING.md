@@ -11,24 +11,35 @@ The on-start script clones the repo and downloads Qwen3-4B-Base.
 
 ### Install Dependencies
 
-**Do NOT reinstall torch, vllm, or numpy.** The vast.ai image has custom CUDA 13.x builds that don't exist on PyPI. Reinstalling them breaks Blackwell GPU support.
+**Do NOT reinstall torch, vllm, or numpy.** The vast.ai PyTorch CUDA 13.x image ships with Blackwell-custom builds of these. They are NOT on PyPI. Replacing them with PyPI builds (e.g., via `pip install --force-reinstall vllm`) silently breaks Blackwell support — vLLM's EngineCore subprocess hangs during cold start, before model load.
 
 ```bash
 cd /workspace/Automated_Feature_Selection
 
-# Step 1: sae-lens + transformer-lens WITHOUT their deps
-# (they pin numpy<2 which would break vllm)
-uv pip install --system --no-deps sae-lens transformer-lens
+# One command does it all — install.sh installs the whole pipeline +
+# Delphi (clones + pip install -e) + uninstalls torchcodec, all
+# WITHOUT touching the pre-installed vllm/torch/numpy.
+bash install.sh
 
-# Step 2: their actual dependencies (minus torch/numpy/vllm)
-uv pip install --system -r pipeline/requirements.txt
-uv pip install --system babe plotly-express
-
-# Step 3: API key for Sonnet (feature inventory step)
+# API key for Sonnet (feature inventory + Delphi judge).
 export OPENROUTER_API_KEY="sk-or-..."
 ```
 
-pip warnings about numpy/beartype/huggingface-hub version conflicts are safe to ignore — the code works fine with the installed versions.
+`pip` warnings about numpy/beartype/huggingface-hub version conflicts are safe to ignore — the code works fine with the installed versions.
+
+### Verifying the install
+
+`install.sh` prints a verification table at the end:
+
+```
+  vllm                      0.19.x        ← from /venv/main/... (pre-installed)
+  delphi.scorers...         OK
+  faiss-cpu                 1.x
+  ...
+  vllm location:            /venv/main/lib/python3.12/site-packages/vllm
+```
+
+Confirm `vllm location:` points to the system venv (`/venv/main/...`), NOT a user-site location like `/root/.local/...`. If it's the latter, you've clobbered the Blackwell-custom build — fix with `pip uninstall vllm` (uninstalls only the user-site copy, exposes the pre-installed one beneath).
 
 ## Quick Test (Manual Catalog)
 

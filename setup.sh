@@ -2,13 +2,24 @@
 # vast.ai on-start script.
 # URL: https://raw.githubusercontent.com/WesternDundrey/Automated_Feature_Selection/main/setup.sh
 # Set OPENROUTER_API_KEY in vast.ai template env vars.
+#
+# This script runs ONCE on instance start. It does NOT install python
+# packages — that's install.sh's job. This is the lightweight bootstrap:
+# tools, repo clone, model pre-download, Delphi clone.
 
 apt-get update -qq && apt-get install -y -qq curl git tmux > /dev/null 2>&1
 
+# supsae repo
 git clone https://github.com/WesternDundrey/Automated_Feature_Selection.git /workspace/Automated_Feature_Selection
 cd /workspace/Automated_Feature_Selection
 
-# Pre-download annotator model
+# Delphi (EleutherAI). install.sh also clones if missing, but doing it
+# here means the clone is ready before the user runs anything and the
+# heavy uv-pip step doesn't have to download Delphi mid-install.
+git clone https://github.com/EleutherAI/delphi.git /workspace/Automated_Feature_Selection/delphi-eleutherai || true
+
+# Pre-download annotator model so the first vLLM cold-start doesn't
+# include an 8GB download (which looks like a hang).
 python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-4B-Base')" || true
 
 # Git config if provided
@@ -17,6 +28,15 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwe
   git config --global user.email "$GIT_EMAIL"
 
 echo ""
-echo "Ready. Run:"
+echo "==========================================="
+echo "Bootstrap complete. To install python deps:"
+echo "==========================================="
 echo "  cd /workspace/Automated_Feature_Selection"
-echo "  python -m pipeline.run --step validate-annotator --local-annotator --n_sequences 50"
+echo "  bash install.sh        # installs all pipeline + Delphi deps"
+echo "                         # — preserves pre-installed vllm/torch/numpy"
+echo ""
+echo "Then:"
+echo "  export OPENROUTER_API_KEY=sk-or-..."
+echo "  python -m pipeline.run --step validate-annotator \\"
+echo "    --local-annotator --n_sequences 50"
+echo "==========================================="
