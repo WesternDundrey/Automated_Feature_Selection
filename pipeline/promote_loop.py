@@ -103,13 +103,30 @@ def _attach_defaults(cfg: Config) -> None:
     if not hasattr(cfg, "promote_mini_prefilter"):
         cfg.promote_mini_prefilter = True
     if not hasattr(cfg, "promote_mini_prefilter_n_seqs"):
-        cfg.promote_mini_prefilter_n_seqs = 50
+        # v8.14: 50 → 100. The mini-prefilter is the gate that keeps
+        # bad proposals out of full annotation; halving its variance
+        # by doubling the sample size is cheap (Qwen3-4B-Base annotates
+        # at ~600/s on a single 5090) and the v8.13 audit showed several
+        # AUROC scores that were close to 0.70 at n_seqs=50, where one
+        # extra positive flipped the kept/dropped decision. n=100
+        # makes those calls more stable.
+        cfg.promote_mini_prefilter_n_seqs = 100
     if not hasattr(cfg, "promote_mini_prefilter_min_auroc"):
-        cfg.promote_mini_prefilter_min_auroc = 0.70
+        # v8.14: 0.70 → 0.75. AUROC=0.70 is "modest discrimination"; for a
+        # latent we're about to spend annotation + retraining budget on,
+        # we want clearer-than-modest evidence the U latent's score has
+        # signal against the annotator's binary labels. Features that
+        # land between 0.70 and 0.75 are the ones most likely to come
+        # back as low-cal_F1 features needing trim-by-kappa anyway.
+        cfg.promote_mini_prefilter_min_auroc = 0.75
     if not hasattr(cfg, "promote_mini_prefilter_min_support"):
-        # minimum positives on BOTH sides (annotator AND U) for the feature
-        # to be eligible for dropping; below this, route to audit.
-        cfg.promote_mini_prefilter_min_support = 5
+        # v8.14: 5 → 10. minimum positives on BOTH sides (annotator AND U)
+        # for the feature to be eligible for dropping; below this, route
+        # to audit. With 100 sequences and ~256 mid-sequence positions
+        # each, 10 positives is still a low bar (~0.04% positive rate)
+        # but enough to make AUROC a meaningful number rather than a
+        # 5-positive coin flip.
+        cfg.promote_mini_prefilter_min_support = 10
     if not hasattr(cfg, "promote_mini_prefilter_audit_only"):
         # audit-only mode: compute the score but don't drop. Recommended
         # for first few runs to calibrate the AUROC threshold.
@@ -423,12 +440,22 @@ def _crispness_judgment(description: str, cfg: Config) -> tuple[bool, str, str]:
 def _decompose_multi_concept(
     description: str, top_contexts: list[dict], tokenizer, cfg: Config,
     max_atoms: int,
-) -> list[str]:
-    """Ask Sonnet to split a multi-concept description into 2-5 atomic
-    token-level feature hypotheses. Returns the list of atomic description
-    strings (may be fewer than max_atoms if Sonnet thinks there's less).
+) -> list[dict]:
+    """Ask Sonnet to split a multi-concept description into 2-N atomic
+    token-level feature hypotheses. Returns a list of atom dicts:
 
-    Fails closed (returns empty list) on LLM error or parse failure.
+        {"description": str, "positive_examples": [str],
+         "negative_examples": [str], "exclusions": [str]}
+
+    The richer schema mirrors `pipeline.rewrite_catalog`'s atomic format so
+    a decomposed atom that survives downstream gates can flow into the
+    catalog with its grounding examples already attached. Older callers
+    that just want the description string can pull `atom["description"]`.
+
+    Fails closed (returns []) on LLM error or parse failure. Backwards
+    compatible with the old "list of strings" prompt schema: if Sonnet
+    returns plain strings (some models still default to that), each is
+    upgraded to {"description": s, "positive_examples": [], ...}.
     """
     from .llm import get_client, chat
     client = get_client()
@@ -453,33 +480,51 @@ def _decompose_multi_concept(
         is to propose 2-{max_atoms} ATOMIC token-level feature hypotheses
         that might each be a sub-component of the bundle.
 
-        Each atomic hypothesis must:
-          - Name ONE operationally-testable property of a single token.
-          - Be a yes/no question a reader can answer for one token in
-            context without ambiguity.
-          - NOT mix multiple concepts with "or" / "and" / "sometimes".
+        REQUIREMENTS for each atomic hypothesis:
+          - Names ONE operationally-testable property of A SINGLE TOKEN.
+            "Yes/no" must be unambiguously decidable for any single token
+            shown in context, without referring to multiple tokens or to
+            global properties of the sequence.
+          - Specifies WHEN it fires (what kind of token, in what context).
+          - Does NOT mix concepts with "or" / "and" / "sometimes".
+          - Must be DISTINGUISHABLE from the other atoms — atoms whose
+            yes/no answers would always agree on every token are the same
+            atom and should be merged.
+
+        For each atom you propose, you must also produce:
+          - 2-3 POSITIVE example phrases (5-10 words, target token in
+            **bold**) showing where the atom fires.
+          - 2-3 NEGATIVE example phrases — tokens that LOOK similar but
+            should NOT fire, ideally including cases where one of the
+            OTHER atoms in this decomposition fires instead.
+          - 1-2 EXCLUSIONS naming similar concepts this atom must NOT
+            match. Form: "NOT X (because Y)".
 
         ORIGINAL MULTI-CONCEPT DESCRIPTION:
           {description}
 
-        TOP-ACTIVATING EXAMPLES (the marked token is in []):
+        TOP-ACTIVATING EXAMPLES OF THE SOURCE LATENT (target token in []):
         {snippets_block}
 
         Return EXACTLY one JSON object, no other text:
         {{
           "atoms": [
-            "atomic description 1",
-            "atomic description 2",
+            {{
+              "description": "...",
+              "positive_examples": ["...", "..."],
+              "negative_examples": ["...", "..."],
+              "exclusions": ["NOT ... (because ...)"]
+            }},
             ...
           ]
         }}
-        Return 2-{max_atoms} atoms. If the original is actually crisp
-        (not multi-concept after all), return a single-element list
-        with the cleaned-up wording.
+        Return 2-{max_atoms} atoms. If the source is actually crisp (not
+        multi-concept after all), return ONE atom with the cleaned-up
+        wording and its examples.
     """)
 
     try:
-        text = chat(client, cfg.organization_model, prompt, max_tokens=400)
+        text = chat(client, cfg.organization_model, prompt, max_tokens=900)
     except Exception as e:
         print(f"    decompose LLM unreachable: {type(e).__name__}: {e}")
         return []
@@ -489,10 +534,44 @@ def _decompose_multi_concept(
         return []
     try:
         obj = json.loads(m.group(0))
-        atoms = obj.get("atoms") or []
-        return [str(a).strip() for a in atoms if str(a).strip()][:max_atoms]
+        raw_atoms = obj.get("atoms") or []
     except json.JSONDecodeError:
         return []
+
+    out: list[dict] = []
+    for a in raw_atoms[:max_atoms]:
+        # Backwards compat: accept a plain string (old schema).
+        if isinstance(a, str):
+            desc = a.strip()
+            if desc:
+                out.append({
+                    "description": desc,
+                    "positive_examples": [],
+                    "negative_examples": [],
+                    "exclusions": [],
+                })
+            continue
+        if not isinstance(a, dict):
+            continue
+        desc = str(a.get("description", "")).strip()
+        if not desc:
+            continue
+        out.append({
+            "description": desc,
+            "positive_examples": [
+                str(p) for p in (a.get("positive_examples") or [])
+                if str(p).strip()
+            ][:5],
+            "negative_examples": [
+                str(p) for p in (a.get("negative_examples") or [])
+                if str(p).strip()
+            ][:5],
+            "exclusions": [
+                str(p) for p in (a.get("exclusions") or [])
+                if str(p).strip()
+            ][:3],
+        })
+    return out
 
 
 def _semantic_dedup_atoms(
@@ -1280,20 +1359,26 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
             print(f"\n── Decomposition path: {len(multi_concept_u)} "
                   f"multi_concept rejections → atoms ──")
 
-            # 1. Decompose each multi_concept into atoms.
+            # 1. Decompose each multi_concept into atoms. Each atom now
+            # carries pos/neg/exclusion examples alongside the description
+            # so the catalog can absorb a surviving atom as a fully-specified
+            # feature without an extra rewrite-catalog pass.
             decompose_tokenizer = tokenizer_ref  # reuse
             all_atoms_raw: list[dict] = []
             for u, desc in multi_concept_u:
                 top_ctx = all_top_acts.get(str(u), [])
-                atom_descs = _decompose_multi_concept(
+                atom_objs = _decompose_multi_concept(
                     desc, top_ctx, decompose_tokenizer, cfg,
                     max_atoms=cfg.promote_decompose_max_atoms,
                 )
-                for ai, a_desc in enumerate(atom_descs):
+                for ai, atom in enumerate(atom_objs):
                     all_atoms_raw.append({
                         "atom_id": f"u{u}_a{ai}",
                         "source_u": int(u),
-                        "description": a_desc,
+                        "description": atom["description"],
+                        "positive_examples": atom.get("positive_examples", []),
+                        "negative_examples": atom.get("negative_examples", []),
+                        "exclusions": atom.get("exclusions", []),
                     })
             print(f"  decomposed into {len(all_atoms_raw)} raw atomic "
                   f"hypotheses")
@@ -1386,7 +1471,7 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
 
                 for idx_in_kept, atom_idx in enumerate(kept_indices):
                     a = kept_atoms[atom_idx]
-                    atom_proposals.append({
+                    proposal = {
                         "id": f"promoted.{a['atom_id']}_r{iter_idx}",
                         "description": a["description"],
                         "type": "leaf",
@@ -1395,7 +1480,17 @@ def run(cfg: Optional[Config] = None) -> list[dict]:
                         "source_u_local_idx": int(a["source_u"]),
                         "source_kind": "decomposed_atom",
                         "n_pos_at_mini": int(atom_n_pos[idx_in_kept]),
-                    })
+                    }
+                    # Carry pos/neg/exclusion examples through to the catalog
+                    # entry. Empty lists if the decomposer didn't return any
+                    # (older response or string fallback path).
+                    if a.get("positive_examples"):
+                        proposal["positive_examples"] = a["positive_examples"]
+                    if a.get("negative_examples"):
+                        proposal["negative_examples"] = a["negative_examples"]
+                    if a.get("exclusions"):
+                        proposal["exclusions"] = a["exclusions"]
+                    atom_proposals.append(proposal)
                     atom_dirs_list.append(atom_target_dirs[idx_in_kept])
 
                 if atom_proposals:

@@ -4,6 +4,154 @@
 
 ---
 
+## [v8.14] — Catalog/proposal quality upgrade: audit, rewrite, richer atoms, expanded scaffold, stricter mini-prefilter
+
+**Date:** 2026-04-26
+
+### Motivation
+
+Reviewer's prioritized list for the next round of capability:
+
+> 1. Use a strong model to decompose multi-concept U latent descriptions into atomic token-local hypotheses.
+> 2. Add scaffold/control features for obvious artifacts so discovery stops rediscovering them.
+> 3. Evaluate proposals by mini-label AUROC before full annotation.
+> 4. Human-audit 10 positives and 10 negatives for each newly promoted feature.
+>
+> Delphi/Eleuther helps as an initial explainer, but I would not trust it as the catalog source by itself. Use it to surface candidates; use a stronger LLM or human pass to rewrite into crisp, atomic feature definitions.
+
+Items 1–3 were partially in place before v8.14 (`_decompose_multi_concept` since v8.8, scaffold since v8.10, AUROC mini-prefilter since v8.4). Item 4 was the gap and the meta-recommendation to "rewrite into crisp atomic feature definitions" was unaddressed. v8.14 closes both and tightens the surrounding pieces.
+
+The unifying frame: **catalog quality is the headline-F1 ceiling**. v8.13 quantified this via κ (annotator self-disagreement on fuzzy descriptions); v8.14 attacks the upstream cause (fuzzy descriptions) and adds the human-audit verification step that lets us TRUST the rewrite.
+
+### `pipeline/audit_feature.py` — `--step audit-feature` (NEW; closes reviewer #4)
+
+Per-feature TP / FP / FN markdown dump for manual review. Given a feature_id (or a batch threshold), reads `tokens.pt`, `annotations.pt`, `activations.pt`, `supervised_sae.pt`, and `evaluation.json`, runs the SAE forward pass on the test split, and writes a markdown file under `pipeline_data/audits/`.
+
+Each example shows ~20 tokens of context with the target token wrapped in `**>>token<<**`, the SAE pre-activation score, and a `[ ] match  [ ] not_match` checkbox the auditor flips by hand. Three buckets:
+
+- **TP** — annotator says yes AND SAE fires above the calibrated threshold. These should clearly match the description; if they don't, the description is fuzzy.
+- **FP** — SAE fires but annotator says no. If they LOOK like the description, the annotator missed positives (annotator-recall problem). If not, the SAE is over-firing.
+- **FN** — annotator says yes but SAE doesn't fire. If they LOOK like the description, the SAE is under-firing. If not, the annotator over-fired (annotator-precision problem).
+
+This explicit pos / FP / FN separation is what makes a single audit pass measure BOTH the SAE's precision/recall AND the annotator's precision — a noisy annotator and a confused SAE are easy to confuse without it.
+
+Each bucket is sampled by SCORE (not uniformly): the highest-confidence calls in each direction are most informative for moving the threshold or fixing the description.
+
+#### CLI
+
+- `--feature-id <id>` — audit one specific feature
+- `--audit-cal-f1-below <float>` — batch-audit every feature below this cal_F1 (sorted worst-first into a single `audit_batch.md`)
+- `--audit-n <int>` — examples per bucket (default 10)
+
+Single-feature mode writes `audit_<feature_id>.md`; batch mode writes `audit_batch.md`.
+
+### `pipeline/rewrite_catalog.py` — `--step rewrite-catalog` (NEW; closes the meta-rec)
+
+Strict-rewrite of `feature_catalog.json` into atomic descriptions with explicit positive / negative / exclusion examples. For each leaf:
+
+1. **Atomic description** — single-token-property clause; no "or" / "and" / "sometimes"; specifies WHEN the feature fires.
+2. **Positive examples** — 3–5 short phrases with target token in `**bold**` showing where the feature fires.
+3. **Negative examples** — 3–5 phrases that look similar but should NOT fire (sibling-feature territory, ambiguous boundary, etc.).
+4. **Exclusions** — 1–3 short clauses of the form "NOT X (because Y)" naming similar features the description must distinguish from.
+
+The Sonnet prompt is grounded by:
+- The parent group's description
+- A listing of sibling leaves (so the rewrite is forced to distinguish from them)
+- Up to 5 annotator-positive contexts sampled from `annotations.pt` (if available — falls back to description-only if not)
+
+Output: `feature_catalog.rewritten.json` under `cfg.output_dir`. Each rewritten leaf has the original description preserved in `description_legacy` and the new atomic version under both `description` (active for downstream pipelines) and `description_atomic` (explicit field for tooling).
+
+Optional `--apply-rewrite`: replaces `feature_catalog.json` (after backing up the original to `feature_catalog.before_rewrite.json`). After applying, downstream `annotations.pt` is stale (the annotator scored against the OLD descriptions); user must delete + re-run `--step annotate` for the rewrite to take effect.
+
+`--rewrite-skip-existing`: skip features that already carry rewritten metadata (`positive_examples` + `description_atomic`), so partial reruns are cheap.
+
+### `_decompose_multi_concept` — richer atom schema (closes reviewer #1 more thoroughly)
+
+The atom decomposer (used by promote-loop when a U latent's description is rejected as `multi_concept`) now returns each atom as a dict with the SAME schema as the rewrite step:
+
+```
+{
+  "description": "...",
+  "positive_examples": ["...", "..."],
+  "negative_examples": ["...", "..."],
+  "exclusions": ["NOT ... (because ...)"]
+}
+```
+
+Sonnet's atom prompt now requires per-atom positive examples (where the atom fires), negative examples (that LOOK similar but should NOT fire — ideally cases where ANOTHER atom in this decomposition fires instead), and exclusions. This forces the decomposer to spell out the boundary instead of returning vaguely-distinct strings that all overlap.
+
+Backwards compatible: a Sonnet response that returns plain strings (older API behavior) is upgraded into the new dict shape with empty examples lists. Every existing call site keeps working; a surviving atom carries its examples through into the catalog as a fully-specified feature, removing the need for a follow-up `--step rewrite-catalog` pass.
+
+### `pipeline/scaffold_catalog.json` — 12 new artifact features (closes reviewer #2 more thoroughly)
+
+Expanded from 21 to 33 control features. New entries (all `role: "control"`, never counted in headline metrics):
+
+| New feature | Captures |
+|---|---|
+| `control.newline_character` | Single newline tokens (not multi-whitespace runs) |
+| `control.code_keyword` | Reserved keywords in isolation: def, class, return, import, etc. |
+| `control.abbreviation_period` | Periods in 'Dr.', 'vs.', 'e.g.', 'Inc.', etc. |
+| `control.markdown_emphasis_marker` | `*` / `_` adjacent to text for italic/bold |
+| `control.markdown_header_mark` | `#`/`##`/`###` at line start with following space |
+| `control.markdown_link_bracket` | `[`/`]`/`(` in `[text](url)` link shape |
+| `control.markdown_table_pipe` | `|` as table column delimiter |
+| `control.tld_or_url_tail` | `.com`/`.org`/`.net`/`.gov`/`.edu`/`.io`/etc. |
+| `control.unit_suffix` | Unit-of-measure tokens after numerics (km/kg/MB/%/etc.) |
+| `control.citation_marker` | `[1]`/`[12]`/`[^1]`/`(Smith, 2020)` shapes |
+| `control.date_or_time_numeric` | Digits inside date or time formats (3:45, 12/25/2024) |
+| `control.sentence_initial_capital` | First word of a sentence (post `.`/`?`/`!` + space) |
+
+These are exactly the directions that v8.13 audits showed the unsupervised slice burning capacity on across multiple promote-loop runs. Seeding them as `role: "control"` makes the U slice spend its ΔR² capacity on something the discovery loop hasn't already named, while keeping headline `mean_f1_discovery` clean.
+
+### Mini-prefilter rigor bump (reviewer #3)
+
+In `promote_loop._attach_defaults`:
+
+| Parameter | Old | New | Why |
+|---|---|---|---|
+| `promote_mini_prefilter_n_seqs` | 50 | **100** | Halve the variance of the AUROC estimate. Local annotator runs at ~600 dec/s; doubling the sample is ~30s/iteration, negligible. |
+| `promote_mini_prefilter_min_auroc` | 0.70 | **0.75** | 0.70 is "modest discrimination"; for an annotation-+-retrain budget commitment we want clearer-than-modest evidence. Borderline-0.70-AUROC features were the bulk of the v8.13 trim list anyway. |
+| `promote_mini_prefilter_min_support` | 5 | **10** | At n_seqs=100 with ~256 positions/seq, 10 positives is still ~0.04% — but enough to make AUROC meaningful instead of a 5-positive coin flip. |
+
+CLI help in `run.py` updated to reflect the new defaults (`--promote-mini-prefilter-n`, `--promote-mini-prefilter-min-auroc`).
+
+### Recommended workflow
+
+```
+# (Option A) One-shot rewrite for an existing catalog you've already run.
+python -m pipeline.run --step rewrite-catalog
+# inspect feature_catalog.rewritten.json by eye
+
+python -m pipeline.run --step rewrite-catalog --apply-rewrite
+rm pipeline_data/annotations.pt pipeline_data/annotations_meta.json
+python -m pipeline.run --step annotate --layer 9 --sae_id blocks.9.hook_resid_pre --local-annotator
+python -m pipeline.run --step train    --layer 9 --sae_id blocks.9.hook_resid_pre --local-annotator
+python -m pipeline.run --step evaluate --layer 9 --sae_id blocks.9.hook_resid_pre --local-annotator
+
+# (Option B) Audit suspect features before deciding whether to keep them.
+python -m pipeline.run --step audit-feature --audit-cal-f1-below 0.4 --audit-n 10
+# read pipeline_data/audits/audit_batch.md, flip checkboxes by hand
+# decide which ones to drop (--step trim-by-kappa) or rewrite (--step rewrite-catalog)
+
+# (Option C) Audit a single feature in detail.
+python -m pipeline.run --step audit-feature --feature-id syntactic_construction.relative_clause --audit-n 15
+```
+
+The promote-loop automatically uses the new richer atom schema and stricter mini-prefilter from this version forward; no flag changes required for the existing `--step promote-loop` invocation.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `pipeline/audit_feature.py` | **NEW** — TP/FP/FN per-feature markdown dump |
+| `pipeline/rewrite_catalog.py` | **NEW** — atomic description rewrite + pos/neg/exclusion examples |
+| `pipeline/promote_loop.py` | `_decompose_multi_concept` returns richer atom dicts; mini-prefilter defaults bumped (n=100, AUROC=0.75, support=10); atom proposals carry pos/neg/exclusion fields |
+| `pipeline/scaffold_catalog.json` | +12 surface artifact features (now 33 total) |
+| `pipeline/run.py` | `--step audit-feature`, `--step rewrite-catalog`, associated CLI flags; mini-prefilter help text |
+| `changes.md` | This entry |
+
+---
+
 ## [v8.13] — Catalog trim by annotator κ (`--step trim-by-kappa`)
 
 **Date:** 2026-04-25

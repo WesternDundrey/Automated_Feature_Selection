@@ -147,6 +147,90 @@
       "parent": "control",
       "role": "control",
       "description": "Token is a standalone separator rule used between sections: a line of 5+ consecutive '=', '-', '_', '—', or '*' characters."
+    },
+    {
+      "id": "control.newline_character",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a single newline character ('\\n') OR a token whose decoded form starts with '\\n' followed by some text. Models spend significant residual-stream capacity tracking line boundaries; this absorbs that without polluting headline metrics. Does NOT include 'whitespace_run' (multi-whitespace) — those go to that feature instead."
+    },
+    {
+      "id": "control.code_keyword",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a programming-language reserved keyword in isolation: 'def', 'class', 'return', 'import', 'from', 'if', 'else', 'elif', 'for', 'while', 'try', 'except', 'function', 'var', 'let', 'const', 'public', 'private', 'static', 'void'. Includes leading-space variants (' def', ' return'). Does NOT include identifiers that happen to look like keywords."
+    },
+    {
+      "id": "control.abbreviation_period",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a period (or token ending in a period) used as part of an abbreviation, NOT a sentence terminator. Examples: 'Dr.', 'Mr.', 'Mrs.', 'Ms.', 'Prof.', 'Inc.', 'Corp.', 'Ltd.', 'Co.', 'etc.', 'vs.', 'e.g.', 'i.e.', 'St.', 'Ave.'. The period is followed by a non-sentence-ending context (next token is lowercase / continuation)."
+    },
+    {
+      "id": "control.markdown_emphasis_marker",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a markdown emphasis marker used for italic or bold: a single or doubled '*' or '_' immediately adjacent to text without surrounding whitespace ('*word*', '**bold**', '_emph_'). Does NOT include math operators (control.math_operator) or list bullets (control.list_bullet_or_asterisk)."
+    },
+    {
+      "id": "control.markdown_header_mark",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is one or more '#' characters used as a markdown header marker at the start of a line, followed by a space then header text. Examples: '#', '##', '###'. Does NOT include hashtags ('#word' with no following space — that's control.hashtag_fragment)."
+    },
+    {
+      "id": "control.markdown_link_bracket",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is part of markdown link/image syntax: an opening '[' followed shortly by a ']' then '(' (link-text-then-target shape) OR the '!' immediately before such a bracket pair (image syntax). Does NOT include plain bracket usage in body text."
+    },
+    {
+      "id": "control.markdown_table_pipe",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a vertical bar '|' used as a markdown/text-table column separator. Distinguishable by repeated '|' tokens on the same line at regular intervals. Does NOT include programming OR-operators (those fire on control.math_operator)."
+    },
+    {
+      "id": "control.tld_or_url_tail",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a top-level domain fragment immediately preceded by '.': '.com', '.org', '.net', '.gov', '.edu', '.io', '.co', '.uk', '.us', '.de', '.fr', '.jp', '.cn'. Includes ' .com'-style space-prefixed variants. Does NOT include the leading bare period in plain prose."
+    },
+    {
+      "id": "control.unit_suffix",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a unit-of-measure suffix that immediately follows a numeric token. Examples (with or without space-prefix): 'km', 'm', 'cm', 'mm', 'kg', 'g', 'mg', 'lb', 'oz', 'ft', 'in', 'mph', 'kmh', 'mb', 'gb', 'tb', 'kb', 'hz', 'mhz', 'ghz', '°c', '°f', '%', 'pm', 'am'. Must be PRECEDED by a numeric token in the current sequence."
+    },
+    {
+      "id": "control.citation_marker",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is part of a citation/footnote marker: a numeric in '[1]'/'[12]' brackets, a superscript-style '[^1]', or part of an inline '(Smith, 2020)' citation. The defining context is bracket-or-paren on both sides plus a year-or-number-or-author-name pattern."
+    },
+    {
+      "id": "control.date_or_time_numeric",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is a numeric value that is part of a date or time format: digits flanked by colons (3:45 PM), slashes (12/25/2024), or hyphens in the YYYY-MM-DD shape (2024-01-15). Does NOT include plain integers in body text."
+    },
+    {
+      "id": "control.sentence_initial_capital",
+      "type": "leaf",
+      "parent": "control",
+      "role": "control",
+      "description": "Token is the FIRST word of a sentence (capitalized, immediately preceded by a sentence-ending '.', '?', '!' followed by space, OR at the very start of a paragraph). Captures sentence-boundary capacity. Does NOT include capitalized proper nouns mid-sentence."
     }
   ],
   "groups": [

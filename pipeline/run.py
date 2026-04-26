@@ -89,8 +89,39 @@ def main():
                  "splitting", "circuit", "intervention", "amplify",
                  "weaknesses", "siphoning", "discover", "discover-loop",
                  "composition", "layer-sweep", "promote-loop", "usweep",
-                 "hinge-ablation", "trim-by-kappa"],
+                 "hinge-ablation", "trim-by-kappa",
+                 "audit-feature", "rewrite-catalog"],
         help="Run only this step",
+    )
+    parser.add_argument(
+        "--feature-id", default=None,
+        help="For --step audit-feature: catalog id of the feature to audit. "
+             "Empty string + --audit-cal-f1-below batch-audits every feature "
+             "below that cal_F1 threshold.",
+    )
+    parser.add_argument(
+        "--audit-n", type=int, default=10,
+        help="For --step audit-feature: examples per bucket (TP/FP/FN). Default 10.",
+    )
+    parser.add_argument(
+        "--audit-cal-f1-below", type=float, default=None,
+        help="For --step audit-feature in batch mode: audit every feature "
+             "whose test cal_F1 is below this threshold (e.g., 0.4). Skipped "
+             "when --feature-id is set to a specific id.",
+    )
+    parser.add_argument(
+        "--apply-rewrite", action="store_true",
+        help="For --step rewrite-catalog: replace feature_catalog.json with "
+             "the rewritten version (after backing up to "
+             "feature_catalog.before_rewrite.json). Without this flag, the "
+             "rewritten catalog is written to feature_catalog.rewritten.json "
+             "but the active catalog is left alone.",
+    )
+    parser.add_argument(
+        "--rewrite-skip-existing", action="store_true",
+        help="For --step rewrite-catalog: skip features that already carry "
+             "rewritten metadata (positive_examples, negative_examples). "
+             "Default re-rewrites everything.",
     )
     parser.add_argument(
         "--kappa-threshold", type=float, default=0.4,
@@ -153,9 +184,9 @@ def main():
     parser.add_argument("--promote-no-mini-prefilter", action="store_true",
                         help="Skip mini-annotation prefilter (always do full annotation)")
     parser.add_argument("--promote-mini-prefilter-n", type=int, default=None,
-                        help="Sequences for mini-prefilter annotation (default 50)")
+                        help="Sequences for mini-prefilter annotation (default 100, was 50 pre-v8.14)")
     parser.add_argument("--promote-mini-prefilter-min-auroc", type=float, default=None,
-                        help="Mini-prefilter AUROC floor (default 0.70). "
+                        help="Mini-prefilter AUROC floor (default 0.75, was 0.70 pre-v8.14). "
                              "The v8.3 --min-f1 flag is deprecated — the real gate has been AUROC since v8.4.")
     parser.add_argument("--promote-mini-prefilter-min-f1", type=float, default=None,
                         help=argparse.SUPPRESS)  # deprecated; retained for backwards compat only
@@ -608,6 +639,35 @@ def main():
             run_causal=not args.sweep_skip_causal,
         )
         print(f"Layer sweep completed in {time.time() - t0:.1f}s")
+
+    # Per-feature human audit dump (TP / FP / FN markdown)
+    if args.step == "audit-feature":
+        print("\n" + "=" * 70)
+        print("FEATURE AUDIT — TP / FP / FN dump for manual review")
+        print("=" * 70)
+        t0 = time.time()
+        from .audit_feature import run as run_audit
+        run_audit(
+            cfg,
+            feature_id=args.feature_id or "",
+            audit_n=args.audit_n,
+            cal_f1_below=args.audit_cal_f1_below,
+        )
+        print(f"Audit completed in {time.time() - t0:.1f}s")
+
+    # Strict-rewrite catalog (richer descriptions: pos/neg/exclusion examples)
+    if args.step == "rewrite-catalog":
+        print("\n" + "=" * 70)
+        print("CATALOG REWRITE — atomic descriptions + pos/neg/exclusion examples")
+        print("=" * 70)
+        t0 = time.time()
+        from .rewrite_catalog import run as run_rewrite
+        run_rewrite(
+            cfg,
+            apply_to_disk=args.apply_rewrite,
+            skip_existing=args.rewrite_skip_existing,
+        )
+        print(f"Rewrite completed in {time.time() - t0:.1f}s")
 
     # Annotator validation on trivial features
     if args.step == "validate-annotator":
