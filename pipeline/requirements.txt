@@ -1,8 +1,16 @@
 # Step 1: pip install --no-deps sae-lens transformer-lens
 # Step 2: pip install -r pipeline/requirements.txt
+# Step 3: pip install --force-reinstall vllm
 #
 # Two steps because transformer-lens pins numpy<2 which breaks vllm.
 # --no-deps skips that pin. This file has their real deps (minus torch/numpy/vllm).
+#
+# ALTERNATIVE for Delphi-related deps: clone Delphi locally then
+# `pip install -e ./delphi-eleutherai/` after step 2. That uses
+# Delphi's own pyproject.toml and pulls every Delphi dep including
+# any future additions we don't know about. Recommended approach
+# since Delphi evolves; the explicit deps below are a safety net for
+# people who don't want to install Delphi as a package.
 
 datasets
 huggingface-hub
@@ -31,10 +39,21 @@ typing-extensions
 transformers
 transformers-stream-generator
 pandas
-# v8.15: needed by Delphi (agentic-delphi/) for `--step delphi-score`.
-# blobfile + orjson are imported at module-load time in delphi.latents.latents
-# even though we only use the dataclasses; without them, `import delphi` fails.
-# httpx is the OpenRouter client transport.
+# v8.15-v8.18.6: Delphi runtime deps. Even though we only use the
+# scorer + LatentRecord dataclasses, Delphi's __init__ paths import
+# the full graph (latents/cache, latents/neighbours uses faiss,
+# latents/loader uses sentence_transformers, etc.) so all of these
+# must be present for `import delphi` to succeed.
+# Source: agentic-delphi/pyproject.toml (eai-delphi v0.1.1).
 orjson
 blobfile
 httpx
+faiss-cpu
+sentence-transformers
+aiofiles
+anyio>=4.8.0
+asyncer>=0.0.8
+fire
+flask
+eai-sparsify
+bitsandbytes
