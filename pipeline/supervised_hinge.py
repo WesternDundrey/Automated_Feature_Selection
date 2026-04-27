@@ -624,7 +624,10 @@ def train_hinge_sae(
     print(f"  n_supervised={n_supervised}  n_unsupervised={cfg.n_unsupervised}")
     print(f"  lambda_sup={cfg.lambda_sup}  lambda_sparse={cfg.lambda_sparse}  "
           f"lambda_hier={cfg.lambda_hier}")
-    print(f"  decoder: NOT FROZEN (end-to-end training)")
+    if getattr(cfg, "hinge_freeze_decoder", False):
+        print(f"  decoder: FROZEN supervised columns 0:{n_supervised} at target_dirs (cos=1.0 by construction)")
+    else:
+        print(f"  decoder: NOT FROZEN (end-to-end training)")
     print(f"  baseline_mse={baseline_mse:.6f}")
 
     step = 0

@@ -447,23 +447,6 @@ def _format_annotator_context(token_strs: list[str], target_pos: int) -> str:
     return "".join(parts)
 
 
-def _configure_vllm_runtime_env() -> None:
-    """Set conservative vLLM defaults for single-GPU local annotation.
-
-    Vast.ai images have repeatedly hung in vLLM V1 EngineCore before model
-    weight loading (parallel_state/NCCL init, ~1GB VRAM used). These defaults
-    are process-local, only apply if the user has not explicitly set an env
-    override, and are safe for the tensor_parallel_size=1 annotation path.
-    """
-    import os
-
-    os.environ.setdefault("VLLM_USE_V1", "0")
-    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    os.environ.setdefault("NCCL_P2P_DISABLE", "1")
-    os.environ.setdefault("NCCL_IB_DISABLE", "1")
-    os.environ.setdefault("NCCL_SHM_DISABLE", "1")
-
-
 def annotate_local(
     tokens: torch.Tensor,
     features: list[dict],
@@ -493,7 +476,6 @@ def annotate_local(
         all_token_strs.append(strs)
 
     try:
-        _configure_vllm_runtime_env()
         from vllm import LLM, SamplingParams
         if cfg.batch_positions:
             return _annotate_local_vllm_batch(
@@ -758,21 +740,12 @@ def _annotate_local_vllm_pertoken(
     gc.collect()
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # v8.18.3 hotfix: enforce_eager=True. Without it, vLLM silently
-    # compiles CUDA graphs at cold start (max_cudagraph_capture_size=512
-    # default → ~512 graph variants), which on vast.ai's newer vLLM
-    # builds takes 15-25 minutes silently between parallel-state init
-    # and the first annotation log line. The throughput cost in eager
-    # mode is ~10-20% per token; the cold-start savings are >20×.
-    # Override with --no-enforce-eager-vllm if you want graph
-    # compilation back.
     llm = LLM(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=computed_max_len,
-        gpu_memory_utilization=0.80,
-        enforce_eager=getattr(cfg, "vllm_enforce_eager", True),
+        gpu_memory_utilization=0.9,
     )
     # Base model: no thinking, no chat template. Just completes text.
     # allowed_token_ids forces "0" or "1" — safe on base models.
@@ -917,7 +890,6 @@ def _annotate_local_vllm_batch(
         dtype="auto",
         enable_prefix_caching=True,
         max_model_len=2048,
-        enforce_eager=getattr(cfg, "vllm_enforce_eager", True),
     )
     # Generous output for JSON with position lists
     max_out = max(500, n_features * 30)
@@ -1211,17 +1183,9 @@ annotations = annotate_local(tokens, features, tokenizer, cfg)
 torch.save(annotations, {str(out_path)!r})
 """
         env = os.environ.copy()
-        env.setdefault("VLLM_USE_V1", "0")
-        env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-        env.setdefault("NCCL_P2P_DISABLE", "1")
-        env.setdefault("NCCL_IB_DISABLE", "1")
-        env.setdefault("NCCL_SHM_DISABLE", "1")
         env["SUPSAE_LOCAL_ANNOTATION_SUBPROCESS"] = "1"
         print("  Running local vLLM annotation in subprocess "
               "(isolates vLLM EngineCore from parent CUDA/import state)...")
-        print("  vLLM subprocess env: "
-              f"VLLM_USE_V1={env.get('VLLM_USE_V1')}  "
-              f"VLLM_WORKER_MULTIPROC_METHOD={env.get('VLLM_WORKER_MULTIPROC_METHOD')}")
         subprocess.run([sys.executable, "-c", script], check=True, env=env)
         return torch.load(out_path, weights_only=True)
 
@@ -1324,11 +1288,6 @@ torch.save(annotations, {str(shard_out)!r})
 """
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-            env.setdefault("VLLM_USE_V1", "0")
-            env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-            env.setdefault("NCCL_P2P_DISABLE", "1")
-            env.setdefault("NCCL_IB_DISABLE", "1")
-            env.setdefault("NCCL_SHM_DISABLE", "1")
             env["SUPSAE_LOCAL_ANNOTATION_SUBPROCESS"] = "1"
             env["SUPSAE_SHARD_ID"] = str(gpu_idx)
 

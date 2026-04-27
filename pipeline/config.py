@@ -281,12 +281,6 @@ class Config:
     # --no-scaffold to opt out.
     scaffold_catalog: str = "pipeline/scaffold_catalog.json"
 
-    # v8.18.3: skip vLLM CUDA-graph compilation on cold start.
-    # Cold-start speedup: ~20× (15-25 min → ~1 min) at the cost of
-    # ~10-20% per-token throughput. Worth it for one-shot annotation
-    # runs on small corpora; flip to False for production-scale runs
-    # where total wall-clock dominates cold-start.
-    vllm_enforce_eager: bool = True
     # v8.18.26: Delphi REMOVED entirely. The fields delphi_*,
     # promote_use_delphi_gate, delphi_gate_in_inventory, etc. are
     # gone. Delphi was nerfing supervised-SAE F1 by source-latent
