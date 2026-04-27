@@ -117,12 +117,31 @@ def _word_count(description: str) -> int:
 _SOURCE_LATENTS_EXEMPT_ROLES = {"control"}
 _SOURCE_LATENTS_EXEMPT_KINDS = {"scaffold", "manual", "decomposed_atom"}
 
+# Boundary-discipline thresholds (v8.18.28 — required for every
+# inventory-generated leaf so the annotator has explicit boundary
+# cases to disambiguate at label time).
+_MIN_POSITIVE_EXAMPLES = 3
+_MIN_NEGATIVE_EXAMPLES = 3
+_MIN_EXCLUSIONS = 1
+
 
 def _is_source_latents_exempt(feature: dict) -> bool:
     """Per user's note: scaffold / manual / control features are
     hand-written and don't have source_latents. Don't hard-fail them
     on this check. Inventory-derived leaves (no role/kind set) MUST
     have source_latents."""
+    if feature.get("role") in _SOURCE_LATENTS_EXEMPT_ROLES:
+        return True
+    if feature.get("source_kind") in _SOURCE_LATENTS_EXEMPT_KINDS:
+        return True
+    return False
+
+
+def _is_boundary_discipline_exempt(feature: dict) -> bool:
+    """Scaffold / control / manual features are hand-curated; they
+    pre-date the boundary-discipline contract and shouldn't be
+    silently dropped by it. Same exemption set as source_latents.
+    Inventory-derived leaves and discovered atoms must comply."""
     if feature.get("role") in _SOURCE_LATENTS_EXEMPT_ROLES:
         return True
     if feature.get("source_kind") in _SOURCE_LATENTS_EXEMPT_KINDS:
@@ -145,6 +164,38 @@ def _has_examples_metadata(feature: dict) -> tuple[bool, bool, bool]:
         bool(feature.get("negative_examples")),
         bool(feature.get("exclusions")),
     )
+
+
+def _boundary_discipline_findings(feature: dict) -> list[str]:
+    """Check that a non-exempt leaf has the required boundary metadata.
+    Returns findings strings (empty if all checks pass).
+
+    Boundary discipline = positive_examples + negative_examples +
+    exclusions. The annotator suffix uses `exclusions` directly to
+    disambiguate at label time; positive/negative examples seed the
+    crispness story so Sonnet has to articulate the boundary instead
+    of leaving it implicit. Without these, "Token is a period" gets
+    labeled inconsistently across abbreviation/decimal/sentence-end
+    cases and the SAE learns a smeared concept.
+    """
+    findings: list[str] = []
+    pos = feature.get("positive_examples") or []
+    neg = feature.get("negative_examples") or []
+    excl = feature.get("exclusions") or []
+    n_pos, n_neg, n_excl = len(pos), len(neg), len(excl)
+    if n_pos < _MIN_POSITIVE_EXAMPLES:
+        findings.append(
+            f"insufficient_positive_examples ({n_pos}/{_MIN_POSITIVE_EXAMPLES})"
+        )
+    if n_neg < _MIN_NEGATIVE_EXAMPLES:
+        findings.append(
+            f"insufficient_negative_examples ({n_neg}/{_MIN_NEGATIVE_EXAMPLES})"
+        )
+    if n_excl < _MIN_EXCLUSIONS:
+        findings.append(
+            f"missing_exclusions ({n_excl}/{_MIN_EXCLUSIONS})"
+        )
+    return findings
 
 
 def assess_feature_quality(
@@ -192,6 +243,7 @@ def assess_feature_quality(
     hard_fail_phrases, soft_flag_phrases = _lexical_scan(description)
     wc = _word_count(description)
     is_src_exempt = _is_source_latents_exempt(feature)
+    is_bd_exempt = _is_boundary_discipline_exempt(feature)
     src_ok = is_src_exempt or _has_source_latents(feature)
     has_pos, has_neg, has_excl = _has_examples_metadata(feature)
 
@@ -208,6 +260,14 @@ def assess_feature_quality(
         findings.append("missing_source_latents")
     if wc > _MAX_DESCRIPTION_WORDS:
         findings.append(f"description_too_long ({wc} words)")
+
+    # Boundary discipline (v8.18.28). Inventory-derived leaves must
+    # have positive_examples + negative_examples + exclusions so the
+    # annotator has explicit boundary cases. Scaffold/manual/control
+    # exempt — those are user-curated and grandfathered.
+    if not is_bd_exempt:
+        bd_findings = _boundary_discipline_findings(feature)
+        findings.extend(bd_findings)
 
     # Soft flags + LLM crispness (v8.18.24 corrected logic per audit).
     # Pre-fix: soft-flag finding was added BEFORE the LLM verdict, so
@@ -274,6 +334,9 @@ def assess_feature_quality(
         or f.startswith("crispness_judgment_fail")
         or f == "missing_source_latents"
         or f == "empty_description"
+        or f.startswith("insufficient_positive_examples")
+        or f.startswith("insufficient_negative_examples")
+        or f.startswith("missing_exclusions")
         for f in findings
     )
     has_quarantine_finding = any(

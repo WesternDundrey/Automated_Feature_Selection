@@ -719,6 +719,38 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
             cluster. NEVER an empty list — if you can't trace a leaf
             to any source latent, drop it instead.
 
+        BOUNDARY DISCIPLINE — required for every leaf:
+
+        A description is only crisp if you can articulate the BOUNDARY:
+        which tokens look like positives but ARE NOT. If you cannot
+        articulate the boundary, the feature isn't crisp enough — drop it.
+
+        For each leaf, also produce these fields:
+
+        - `positive_examples`: 3-5 short token-level examples showing what
+          fires. Format: brief context with the target token marked as
+          >>token<<. Make the diversity show the feature's true scope.
+          Example for "Token is a sentence-final period":
+            ["The cat sat>>.<<", "She left>>.<< Then it rained.",
+             "I agree>>.<< Wait, on second thought..."]
+
+        - `negative_examples`: 3-5 BOUNDARY-CASE tokens that share the
+          surface form / context cue with positives but DO NOT fire.
+          These are the disambiguating cases. If you can't think of
+          three boundary cases, the feature has no real boundary →
+          drop it.
+          Example for "Token is a sentence-final period":
+            ["Dr>>.<< Smith arrived",         (abbreviation period)
+             "3>>.<<14 is approximate",       (decimal point)
+             "U.S>>.<<A. is the country",     (initialism period)
+             "etc>>.<<", "i.e>>.<<"]          (Latin abbreviation)
+
+        - `exclusions`: 1-3 short noun phrases naming what's excluded,
+          one phrase per semantic boundary. Used directly in the
+          annotator prompt to disambiguate at label time.
+          Example: ["abbreviation periods", "decimal points",
+                    "initialism periods (U.S.A.)"]
+
         OUTPUT FORMAT — reply with ONLY this JSON, no other text:
         {{
           "features": [
@@ -733,13 +765,24 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
               "description": "Precise operational description of this value",
               "type": "leaf",
               "parent": "group_name",
-              "source_latents": [123, 456]
+              "source_latents": [123, 456],
+              "positive_examples": ["...>>tok<<...", "...>>tok<<...", "...>>tok<<..."],
+              "negative_examples": ["...>>tok<<...", "...>>tok<<...", "...>>tok<<..."],
+              "exclusions": ["short boundary phrase", "another boundary"]
             }}
           ]
         }}
 
-        Every leaf must have a parent group AND a non-empty source_latents list.
-        Groups have type "group" and parent null.
+        Every leaf must have:
+          - parent group
+          - non-empty source_latents
+          - at least 3 positive_examples
+          - at least 3 negative_examples (boundary cases)
+          - at least 1 exclusion
+        Leaves missing ANY of these will be rejected. If you cannot
+        produce all of these for a leaf, drop the leaf — it isn't crisp.
+
+        Groups have type "group" and parent null and no examples/exclusions.
         Leaf IDs use dot notation: group.value.
     """)
 
