@@ -1,185 +1,181 @@
 {
-  "_comment": "Flat test catalog with boundary-discipline schema (v8.18.28). 8 features, no groups. Each leaf carries description + positive_examples + negative_examples (boundary cases) + exclusions. Exclusions flow into the annotator suffix (', NOT X, NOT Y') so the labeler can disambiguate. The schema mirrors what inventory.organize_hierarchy now demands of every Sonnet-generated leaf.",
+  "_comment": "Prefix-decidable test catalog (v8.18.29). Every feature is decidable from the token surface alone — no syntactic role, no sentence-finality, no semantic context. Annotator answers yes/no by inspecting the token string and at most one BPE leading space. Headline metric: mean F1 at sup_pre>0 on held-out test, vs probe_logits>0, vs pretrained-SAE readout>0. Calibrated/oracle F1 are diagnostics not headlines.",
   "features": [
     {
-      "id": "comma",
-      "description": "Token is a comma",
+      "id": "comma_char",
+      "description": "Token surface is exactly ',' (optionally with a single BPE leading-space prefix). Surface match only.",
       "type": "leaf",
       "parent": null,
       "positive_examples": [
-        "red>>,<< blue, and green",
-        "She said>>,<< 'wait'",
-        "John>>,<< Mary>>,<< and Sue",
-        "First>>,<< then second"
+        "',' (just the comma)",
+        "' ,' (comma with BPE leading space)",
+        "(GPT-2 tokens 11 and 837 are typical instances)"
       ],
       "negative_examples": [
-        "10>>.<<5 percent",
-        "etc>>.<<",
-        "John>>'<<s book",
-        "Hello>>;<< goodbye"
+        "';' (semicolon — different character)",
+        "'.' (period — different character)",
+        "',\"' (comma + quote merged into one token)",
+        "'apple,' (comma fused with letters into one token)"
       ],
       "exclusions": [
         "semicolons",
-        "apostrophes",
-        "periods"
+        "tokens that contain a comma plus other characters"
       ]
     },
     {
-      "id": "period",
-      "description": "Token is a sentence-final period (the period that ends a complete sentence)",
+      "id": "period_char",
+      "description": "Token surface is exactly '.' (optionally with a single BPE leading-space prefix). Surface match only — sentence role is irrelevant.",
       "type": "leaf",
       "parent": null,
       "positive_examples": [
-        "The cat sat>>.<< Then it left",
-        "She arrived>>.<< She left",
-        "I agree>>.<< Wait, on second thought"
+        "'.' (just the period)",
+        "' .' (period with BPE leading space)",
+        "(GPT-2 tokens 13 and 764 are typical instances)"
       ],
       "negative_examples": [
-        "Dr>>.<< Smith arrived",
-        "3>>.<<14 is approximate",
-        "U>>.<<S>>.<<A>>.<< is the country",
-        "etc>>.<<",
-        "i>>.<<e>>.<<"
+        "',' (comma — different character)",
+        "':' (colon — different character)",
+        "'...' (three dots — multi-character)",
+        "'etc.' (period fused with letters)",
+        "'3.14' (period inside a number)"
       ],
       "exclusions": [
-        "abbreviation periods",
-        "decimal points",
-        "initialism periods"
+        "ellipsis tokens",
+        "tokens that contain a period plus other characters"
       ]
     },
     {
-      "id": "preposition",
-      "description": "Token is a preposition introducing a prepositional phrase (in, on, at, of, for, with, to, from, by)",
+      "id": "digit_only",
+      "description": "Every visible character of the token is in 0-9; an optional BPE leading space is allowed.",
       "type": "leaf",
       "parent": null,
       "positive_examples": [
-        "sat >>on<< the chair",
-        "letter >>from<< Paris",
-        "fight >>for<< freedom",
-        "made >>by<< hand"
+        "'3'",
+        "'42'",
+        "' 2024' (with BPE leading space)",
+        "'007'"
       ],
       "negative_examples": [
-        "want >>to<< leave",
-        "I went >>to<< sleep",
-        "going >>to<< school as a goal",
-        "She tried >>to<< help"
+        "'1st' (digit + letters)",
+        "'3.14' (digit + period)",
+        "'$5' (symbol + digit)",
+        "'twenty' (no digits)"
       ],
       "exclusions": [
-        "infinitive marker 'to'",
-        "particle 'to' in phrasal verbs"
-      ]
-    },
-    {
-      "id": "pronoun",
-      "description": "Token is a personal pronoun functioning as subject or object (he, she, it, they, we, I, you, him, her, them, us, me)",
-      "type": "leaf",
-      "parent": null,
-      "positive_examples": [
-        ">>She<< arrived early",
-        "I told >>him<< the truth",
-        ">>They<< left quickly",
-        "between you and >>me<<"
-      ],
-      "negative_examples": [
-        ">>His<< book is here",
-        ">>My<< friend left",
-        ">>Their<< house burned",
-        ">>Itself<< was unusual"
-      ],
-      "exclusions": [
-        "possessive determiners (his, her, my, your, their)",
-        "reflexive pronouns (himself, herself)"
-      ]
-    },
-    {
-      "id": "determiner",
-      "description": "Token is a definite/indefinite article or demonstrative determiner immediately preceding a noun (the, a, an, this, that, these, those)",
-      "type": "leaf",
-      "parent": null,
-      "positive_examples": [
-        ">>The<< cat sat",
-        ">>An<< apple a day",
-        ">>This<< book is mine",
-        ">>Those<< trees are tall"
-      ],
-      "negative_examples": [
-        ">>That<< he came was surprising",
-        ">>This<< is mine (predicative pronoun)",
-        ">>The<< more, the merrier (correlative)",
-        ">>A<< (the letter A as a token)"
-      ],
-      "exclusions": [
-        "demonstrative pronouns",
-        "complementizer 'that'",
-        "letter-name 'a'"
-      ]
-    },
-    {
-      "id": "capitalized",
-      "description": "Token's first alphabetic character is uppercase and at least one subsequent character is lowercase (mixed-case word, not an all-caps acronym)",
-      "type": "leaf",
-      "parent": null,
-      "positive_examples": [
-        ">>John<< went home",
-        ">>Paris<< is a city",
-        ">>Monday<< morning",
-        ">>The<< cat (sentence-initial)"
-      ],
-      "negative_examples": [
-        ">>NASA<< launched (all caps)",
-        ">>USA<< is large",
-        ">>iPhone<< (lowercase first)",
-        ">>123<< Main Street (digit)"
-      ],
-      "exclusions": [
-        "all-caps acronyms",
-        "tokens starting with non-letter",
-        "lowercase-first compound names"
-      ]
-    },
-    {
-      "id": "digit",
-      "description": "Token consists entirely of digits 0-9 (a pure number, not a word containing digits)",
-      "type": "leaf",
-      "parent": null,
-      "positive_examples": [
-        "year >>2024<<",
-        "page >>3<<",
-        "section >>12<<",
-        "1>>2<<3 sequence"
-      ],
-      "negative_examples": [
-        ">>1st<< place (ordinal)",
-        ">>3D<< printer (alphanumeric)",
-        ">>USB-C<< (mixed)",
-        ">>15th<< floor"
-      ],
-      "exclusions": [
-        "ordinals (1st, 2nd, 3rd)",
         "alphanumeric mixed tokens",
-        "tokens containing letters"
+        "tokens with a decimal point or comma"
       ]
     },
     {
-      "id": "short",
-      "description": "Token is exactly 1 or 2 characters long, counting any leading space as part of BPE tokenization but not toward length",
+      "id": "starts_uppercase",
+      "description": "First alphabetic character of the token (after optional BPE leading space) is in A-Z.",
       "type": "leaf",
       "parent": null,
       "positive_examples": [
-        ">>I<< went",
-        ">> a<< cat",
-        ">>is<< ready",
-        ">>of<< it"
+        "'The'",
+        "' John' (BPE space then 'J')",
+        "'NASA'",
+        "'IP'"
       ],
       "negative_examples": [
-        ">>the<< (3 chars)",
-        ">>and<< (3 chars)",
-        ">> cat<< (3 letters)",
-        ">>123<< (3 digits)"
+        "'the' (lowercase first letter)",
+        "' cat' (BPE space then lowercase)",
+        "'iPhone' (lowercase 'i')",
+        "'123' (no letters)",
+        "',' (no letters)"
       ],
       "exclusions": [
-        "tokens with 3+ alphanumeric characters",
-        "punctuation tokens (count separately)"
+        "tokens whose first letter is lowercase",
+        "tokens that contain no alphabetic characters"
+      ]
+    },
+    {
+      "id": "leading_space",
+      "description": "Token's first character is a literal space (the BPE word-boundary marker).",
+      "type": "leaf",
+      "parent": null,
+      "positive_examples": [
+        "' the'",
+        "' cat'",
+        "' .' (punctuation can carry a leading space)",
+        "' 42'"
+      ],
+      "negative_examples": [
+        "'the' (no leading space)",
+        "'ing' (suffix continuation)",
+        "'.' (punctuation without leading space)",
+        "'<|endoftext|>' (special token)"
+      ],
+      "exclusions": [
+        "word-internal continuation tokens",
+        "tokens that begin with any non-space character"
+      ]
+    },
+    {
+      "id": "single_visible_char",
+      "description": "Token has exactly one non-whitespace character; an optional BPE leading space does not count.",
+      "type": "leaf",
+      "parent": null,
+      "positive_examples": [
+        "'a' (one letter)",
+        "',' (one punctuation)",
+        "' I' (BPE space + one letter)",
+        "'?'"
+      ],
+      "negative_examples": [
+        "'th' (two letters)",
+        "'42' (two digits)",
+        "' the' (three letters after space)",
+        "'...' (three punctuation chars)"
+      ],
+      "exclusions": [
+        "tokens with two or more visible characters",
+        "pure whitespace runs"
+      ]
+    },
+    {
+      "id": "all_lowercase_word",
+      "description": "Token has at least one alphabetic character AND every alphabetic character is in a-z.",
+      "type": "leaf",
+      "parent": null,
+      "positive_examples": [
+        "'the'",
+        "' cat'",
+        "'ing' (suffix)",
+        "\"don't\" (apostrophe non-alpha, ignored)"
+      ],
+      "negative_examples": [
+        "'The' (capital T)",
+        "'NASA' (all uppercase)",
+        "'iPhone' (mixed case)",
+        "'123' (no letters)",
+        "',' (no letters)"
+      ],
+      "exclusions": [
+        "tokens containing any uppercase letter",
+        "tokens with no alphabetic characters at all"
+      ]
+    },
+    {
+      "id": "contains_hyphen",
+      "description": "Token contains the hyphen-minus character '-' anywhere in its surface form.",
+      "type": "leaf",
+      "parent": null,
+      "positive_examples": [
+        "'-'",
+        "'co-op'",
+        "'self-aware'",
+        "' state-of'"
+      ],
+      "negative_examples": [
+        "'—' (em-dash, different Unicode)",
+        "'_' (underscore)",
+        "'cat' (no hyphen)",
+        "'minus' (the word, no character)"
+      ],
+      "exclusions": [
+        "em-dashes and en-dashes",
+        "underscores"
       ]
     }
   ]
