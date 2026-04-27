@@ -69,6 +69,27 @@ _HARD_FAIL_PATTERNS = [
     re.compile(r"\b(?:semantic|text)[_ -]?(?:domain|register|genre)\b", re.IGNORECASE),
     re.compile(r"\bdiscourse[_ -]?function\b", re.IGNORECASE),
     re.compile(r"\b(?:formal|informal|conversational|argumentative|expository|scientific|technical)\s+(?:text|prose|register|writing|tone)\b", re.IGNORECASE),
+    # Right-context dependence (v8.18.32): the annotator sees only
+    # the prefix ending at the target token. Features that require
+    # future tokens, full-sentence parse, or syntactic role decisions
+    # cannot be answered prefix-decidably. The "preferred"-form list
+    # in the inventory prompt covers the positive guidance; this is
+    # the regex backstop for cases where Sonnet violates it.
+    re.compile(r"\bfollowed by\b", re.IGNORECASE),
+    re.compile(r"\bpreceding\b", re.IGNORECASE),
+    re.compile(r"\bintroduc(?:e|ing|es) (?:a|an|the)\b", re.IGNORECASE),
+    re.compile(r"\bbefore (?:a|an|the|its?|his|her|their|noun|verb|adj|sentence|clause)\b", re.IGNORECASE),
+    re.compile(r"\b(?:sentence|clause)[- ]final\b", re.IGNORECASE),
+    re.compile(r"\b(?:sentence|clause)[- ]ending\b", re.IGNORECASE),
+    re.compile(r"\b(?:subject|object|predicate|complement|modifier|head|specifier|determiner) of\b", re.IGNORECASE),
+    re.compile(r"\bnamed entity\b", re.IGNORECASE),
+    re.compile(r"\b(?:sarcas(?:m|tic)|iron(?:y|ic))\b", re.IGNORECASE),
+    # Document-level positional predicate: "Token ... in a X article",
+    # "Token ... in the politics paragraph", etc. The existing
+    # text-level regex above only fires when the doc-noun is the
+    # subject; this catches the case where it's the prepositional
+    # object (i.e. position-conditioned on document content).
+    re.compile(r"\bin (?:a|an|the)\s+[^.]{0,40}?(?:text|article|document|paragraph|passage|essay|post|email|review)\b", re.IGNORECASE),
 ]
 
 # Soft-flag patterns. Trigger a Sonnet crispness call (which may pass

@@ -162,22 +162,31 @@ _PROMPT_TEMPLATE = textwrap.dedent("""\
     said this feature fires; the target token is **bolded**):
     {positives}
 
-    STRICT TOKEN-LEVEL CONSTRAINT:
+    STRICT PREFIX-DECIDABLE CONSTRAINT:
 
     The description must be a YES/NO question about ONE specific
-    token. The SAE annotates one token at a time. Predicate is the
-    TOKEN, never the text/sentence/paragraph/context/document/
-    topic/register/genre/domain. Reformulate as a token-local
-    property or skip.
+    token, decidable from ONLY the target token and the tokens
+    BEFORE it (left context). The downstream annotator sees only
+    the prefix ending at the target token — it does NOT see
+    future tokens.
 
-    REJECT (predicate is wrong unit):
-      - "Text is about politics"
-      - "Sentence is in past tense"
-      - "Context belongs to news"
-      - "Register is informal"
-    ACCEPT (predicate is the token):
-      - "Token is the comma immediately after a person's surname"
-      - "Token is the verb in a quote-attribution clause"
+    REJECT (wrong unit, future-context, full-parse, or document-level):
+      - "Text is about politics"                   (document-level)
+      - "Sentence is in past tense"                (document-level)
+      - "Token is a sentence-final period"         (needs future tokens)
+      - "Token is a determiner before a noun"      (needs future tokens)
+      - "Token introduces a prepositional phrase"  (needs future tokens)
+      - "Token is the subject of a clause"         (full parse)
+      - "Token is part of a named entity"          (entity span)
+      - "Token is the verb in a quote-attribution" (needs future tokens)
+      - "Token is a comma in a list separator"     (needs future tokens)
+    ACCEPT (decidable from target + left context):
+      - "Token is a comma"                                 (surface)
+      - "Token is all lowercase"                           (surface)
+      - "Token contains a digit"                           (surface)
+      - "Token is the word 'said' after a quoted phrase"   (left context)
+      - "Token immediately follows a comma"                (left context)
+      - "Token appears after 'Mr.' or 'Dr.'"               (left context)
 
     YOUR JOB — produce all four:
 
