@@ -152,6 +152,17 @@ def main():
         help="Skip the post-annotation pairwise overlap report.",
     )
     parser.add_argument(
+        "--min-support", type=int, default=None,
+        help="After annotation, drop features whose annotated positive "
+             "count is below this threshold. Features with n_pos < N "
+             "have AUROC near random and contribute pure noise to mean "
+             "F1. Dropped features are appended to "
+             "feature_catalog.quarantined.json with reason "
+             "'min_support<N'. Backup of the pre-filter catalog goes to "
+             "feature_catalog.unfiltered.json. 0 (default) disables. "
+             "Recommended: 30 for 1000-sequence runs, 100 for 5000+.",
+    )
+    parser.add_argument(
         "--annotation-gpus", type=int, default=None,
         help="Number of GPUs to use for local annotation. 0 = auto-detect "
              "(CUDA_VISIBLE_DEVICES or torch.cuda.device_count, default), "
@@ -411,6 +422,8 @@ def main():
         overrides["catalog_gate_strict"] = True
     if args.no_overlap_check:
         overrides["overlap_check_auto"] = False
+    if args.min_support is not None:
+        overrides["min_support"] = args.min_support
     if args.selectivity:
         overrides["selectivity_loss"] = args.selectivity
 
@@ -542,6 +555,29 @@ def main():
         from .annotate import run as run_annotate
         run_annotate(cfg)
         print(f"Step 2 completed in {time.time() - t0:.1f}s")
+
+    # Step 2.5: Min-support filter (post-annotation, pre-train).
+    # Drops features whose annotated positive count < cfg.min_support.
+    # No-op if cfg.min_support == 0. Filtered features go to the
+    # quarantine file; pre-filter catalog backed up to
+    # feature_catalog.unfiltered.json. Rebuilds annotations.pt and
+    # annotations_meta.json in place.
+    if (args.step is None or args.step in ("annotate", "filter-catalog")) \
+            and getattr(cfg, "min_support", 0) > 0:
+        print("\n" + "=" * 70)
+        print(f"STEP 2.5: MIN-SUPPORT FILTER (n_pos < {cfg.min_support})")
+        print("=" * 70)
+        t0 = time.time()
+        from .catalog_quality import apply_min_support_filter
+        apply_min_support_filter(
+            catalog_path=cfg.catalog_path,
+            annotations_path=cfg.annotations_path,
+            annotations_meta_path=cfg.annotations_meta_path,
+            min_support=cfg.min_support,
+            quarantine_path=cfg.output_dir / "feature_catalog.quarantined.json",
+            backup_unfiltered_path=cfg.output_dir / "feature_catalog.unfiltered.json",
+        )
+        print(f"Step 2.5 completed in {time.time() - t0:.1f}s")
 
     # Step 3: Training
     if args.step is None or args.step == "train":

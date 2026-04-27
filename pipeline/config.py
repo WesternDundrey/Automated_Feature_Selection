@@ -185,6 +185,17 @@ class Config:
     overlap_subset_threshold: float = 0.95
     overlap_min_support: int = 30
 
+    # Post-annotation min-support filter (v8.18.33). After annotation,
+    # any feature with positive count strictly less than this threshold
+    # gets dropped from the catalog before training. n_pos < min_support
+    # features have AUROC near random and contribute pure noise to the
+    # mean F1; they're below the statistical floor where supervised
+    # learning can extract a clean classifier. Dropped features are
+    # appended to feature_catalog.quarantined.json with reason
+    # "min_support<N" so the audit trail is preserved. Set to 0 (default)
+    # to disable. Pass --min-support N to enable.
+    min_support: int = 0
+
     # Target direction method for the freeze-decoder pin and the
     # in-loss direction supervision (hybrid/mse modes).
     #   "mean_shift": current default. d = normalize(μ_pos - μ_all).

@@ -514,3 +514,220 @@ def write_quality_report(
             print(f"    {r['id']:<48}  {r['status']:<10}  {findings_str[:80]}")
 
     return summary
+
+
+# ════════════════════════════════════════════════════════════════════
+# Post-annotation min-support filter (v8.18.33)
+# ════════════════════════════════════════════════════════════════════
+
+
+def filter_by_min_support(
+    catalog: dict,
+    annotations,
+    annotations_meta: dict,
+    min_support: int,
+) -> tuple[dict, "torch.Tensor", list[dict]]:
+    """Drop features whose annotated positive count is below `min_support`.
+
+    Features with too few positives in the annotated corpus have AUROC
+    near random and contribute pure noise to mean-F1 metrics. They sit
+    below the floor where supervised learning extracts a clean
+    classifier. Dropping them is methodologically clean: no silent
+    deletion — dropped features are returned in `dropped_records` for
+    appending to feature_catalog.quarantined.json with reason
+    "min_support<N".
+
+    Args:
+        catalog: dict with "features" list (groups + leaves)
+        annotations: tensor (n_seq, n_pos, n_features) — order MUST
+            match annotations_meta["feature_ids"]
+        annotations_meta: dict with "feature_ids" listing the feature
+            ID order along the last axis
+        min_support: drop leaves with positive count < this. 0 disables.
+
+    Returns:
+        filtered_catalog: catalog with surviving leaves (and groups
+            whose at least one leaf survived)
+        filtered_annotations: tensor sliced to surviving columns
+        dropped_records: list of dicts {id, n_pos, reason} for each
+            dropped feature
+    """
+    import torch
+
+    if min_support <= 0:
+        return catalog, annotations, []
+
+    feature_ids = annotations_meta.get("feature_ids") or []
+    n_axis = annotations.shape[-1]
+
+    if len(feature_ids) != n_axis:
+        # Sidecar missing or stale — fall back to leaf order in catalog.
+        leaf_ids_in_order = [
+            f["id"] for f in catalog.get("features", [])
+            if f.get("type") == "leaf"
+        ]
+        if len(leaf_ids_in_order) == n_axis:
+            feature_ids = leaf_ids_in_order
+        else:
+            raise ValueError(
+                f"min_support filter cannot proceed: annotations have "
+                f"{n_axis} columns but catalog has {len(leaf_ids_in_order)} "
+                f"leaves and annotations_meta['feature_ids'] has "
+                f"{len(feature_ids)}. Re-annotate before filtering."
+            )
+
+    # Per-feature support: positive-label count along (n_seq, n_pos).
+    support_tensor = annotations.reshape(-1, n_axis).sum(dim=0).long()
+    support_per_id = {fid: int(support_tensor[i].item()) for i, fid in enumerate(feature_ids)}
+
+    # Decide which to keep. Leaves only — groups inherit fate from their leaves.
+    keep_ids: set[str] = set()
+    dropped_records: list[dict] = []
+    for fid in feature_ids:
+        n_pos = support_per_id.get(fid, 0)
+        if n_pos < min_support:
+            dropped_records.append({
+                "id": fid,
+                "n_pos": n_pos,
+                "reason": f"min_support<{min_support}",
+            })
+        else:
+            keep_ids.add(fid)
+
+    # Filter catalog: keep leaves that survive + groups with surviving leaves.
+    surviving_leaves: list[dict] = []
+    leaf_parents_alive: set[str] = set()
+    for f in catalog.get("features", []):
+        if f.get("type") == "leaf" and f.get("id") in keep_ids:
+            surviving_leaves.append(f)
+            parent = f.get("parent")
+            if parent:
+                leaf_parents_alive.add(parent)
+
+    surviving_groups: list[dict] = [
+        f for f in catalog.get("features", [])
+        if f.get("type") == "group" and f.get("id") in leaf_parents_alive
+    ]
+
+    filtered_catalog = {
+        **{k: v for k, v in catalog.items() if k != "features"},
+        "features": surviving_groups + surviving_leaves,
+    }
+
+    # Slice annotations to surviving columns.
+    keep_indices = [i for i, fid in enumerate(feature_ids) if fid in keep_ids]
+    filtered_annotations = annotations[..., keep_indices].contiguous()
+
+    return filtered_catalog, filtered_annotations, dropped_records
+
+
+def apply_min_support_filter(
+    catalog_path: Path,
+    annotations_path: Path,
+    annotations_meta_path: Path,
+    min_support: int,
+    quarantine_path: Path,
+    backup_unfiltered_path: Optional[Path] = None,
+) -> dict:
+    """End-to-end: load → filter → save → audit-trail. Returns summary
+    dict with kept/dropped counts.
+
+    No-op if min_support <= 0. Idempotent: a second run computes
+    n_pos on the already-filtered annotations, so all surviving
+    features pass and nothing changes.
+    """
+    import shutil
+    import torch
+
+    if min_support <= 0:
+        return {"min_support": 0, "skipped": True}
+
+    if not catalog_path.exists() or not annotations_path.exists():
+        raise FileNotFoundError(
+            f"min_support filter needs both {catalog_path} and "
+            f"{annotations_path} to exist (run inventory + annotate first)."
+        )
+
+    catalog = json.loads(catalog_path.read_text())
+    annotations = torch.load(annotations_path, weights_only=True)
+    if annotations_meta_path.exists():
+        meta = json.loads(annotations_meta_path.read_text())
+    else:
+        meta = {}
+
+    n_leaves_before = sum(
+        1 for f in catalog.get("features", []) if f.get("type") == "leaf"
+    )
+
+    filtered_catalog, filtered_annotations, dropped = filter_by_min_support(
+        catalog, annotations, meta, min_support,
+    )
+
+    n_leaves_after = sum(
+        1 for f in filtered_catalog.get("features", []) if f.get("type") == "leaf"
+    )
+
+    if not dropped:
+        # All features already meet threshold. No-op.
+        print(f"  [min-support] STATUS=noop kept={n_leaves_after}/{n_leaves_before} threshold={min_support}")
+        return {
+            "min_support": min_support,
+            "n_leaves_before": n_leaves_before,
+            "n_leaves_after": n_leaves_after,
+            "n_dropped": 0,
+            "skipped": False,
+        }
+
+    # Backup the pre-filter catalog if not already backed up.
+    if backup_unfiltered_path is not None and not backup_unfiltered_path.exists():
+        shutil.copy(catalog_path, backup_unfiltered_path)
+
+    # Save filtered catalog (overwrites; backup above preserves the pre-state).
+    catalog_path.write_text(json.dumps(filtered_catalog, indent=2))
+
+    # Save filtered annotations.
+    torch.save(filtered_annotations, annotations_path)
+
+    # Update annotations_meta with the filtered feature_ids order.
+    new_feature_ids = [
+        f["id"] for f in filtered_catalog.get("features", [])
+        if f.get("type") == "leaf"
+    ]
+    new_meta = {**meta, "feature_ids": new_feature_ids}
+    annotations_meta_path.write_text(json.dumps(new_meta, indent=2))
+
+    # Append dropped features to the quarantine file (auditability).
+    if quarantine_path.exists():
+        quarantine = json.loads(quarantine_path.read_text())
+    else:
+        quarantine = {"features": []}
+    for d in dropped:
+        quarantine["features"].append({
+            "id": d["id"],
+            "type": "leaf",
+            "_drop_reason": d["reason"],
+            "_n_pos": d["n_pos"],
+            "_dropped_at": "min_support_filter",
+        })
+    quarantine_path.write_text(json.dumps(quarantine, indent=2))
+
+    print(f"\n  [min-support] STATUS=filtered "
+          f"kept={n_leaves_after}/{n_leaves_before} dropped={len(dropped)} "
+          f"threshold={min_support}")
+    print(f"  Backup: {backup_unfiltered_path}")
+    print(f"  Quarantine: {quarantine_path}")
+
+    # Show a few dropped to make the action visible.
+    for d in dropped[:8]:
+        print(f"    DROP  {d['id']:<48}  n_pos={d['n_pos']}")
+    if len(dropped) > 8:
+        print(f"    ... +{len(dropped) - 8} more")
+
+    return {
+        "min_support": min_support,
+        "n_leaves_before": n_leaves_before,
+        "n_leaves_after": n_leaves_after,
+        "n_dropped": len(dropped),
+        "dropped": dropped,
+        "skipped": False,
+    }
