@@ -233,6 +233,13 @@ def main():
     parser.add_argument("--widths", default=None,
                         help="Comma-separated n_unsupervised values for "
                              "--step usweep (default: 256,512,1024)")
+    parser.add_argument("--usweep-skip-promote", action="store_true",
+                        help="In --step usweep, skip the promote-loop "
+                             "triage at each width and only run train + "
+                             "evaluate. Use for fixed catalogs (e.g. "
+                             "test_catalog) where U→S discovery isn't "
+                             "the question — you just want R² / t=0 F1 "
+                             "/ FVE as a function of n_unsupervised.")
     parser.add_argument("--promote-top-k", type=int, default=None,
                         help="K U latents considered per promote-loop round (default 20)")
     parser.add_argument("--promote-max-iters", type=int, default=None,
@@ -726,7 +733,7 @@ def main():
             widths = tuple(int(x.strip()) for x in args.widths.split(",") if x.strip())
         else:
             widths = (256, 512, 1024)
-        run_usweep(cfg, widths=widths)
+        run_usweep(cfg, widths=widths, skip_promote_loop=args.usweep_skip_promote)
         print(f"U-width sweep completed in {time.time() - t0:.1f}s")
 
     # Promote loop — residual-ranked U→S promotion

@@ -97,7 +97,21 @@ def _read_metrics(sub_dir: Path, n_unsupervised: int) -> dict:
         out["delta_r2_supervised"] = recon.get("delta_r2_supervised")
         pre = ev.get("pretrained_reconstruction") or {}
         out["pretrained_r2"] = pre.get("r2") if pre else None
-        out["val_promo_mean_f1"] = ev.get("mean_f1")  # fallback
+        # Supervised SAE F1 — both t=0 (the headline geometry-honest
+        # number) and calibrated (oracle-like, signal-in-representation).
+        out["sup_t0_f1"] = ev.get("mean_f1")
+        out["sup_cal_f1"] = ev.get("cal_mean_f1")
+        out["sup_auroc"] = ev.get("mean_auroc")
+        # Baselines at t=0 — what closes-the-gap looks like.
+        probe = ev.get("probe_baseline") or {}
+        out["probe_t0_f1"] = probe.get("mean_f1")
+        out["probe_cal_f1"] = probe.get("mean_f1_cal")
+        post = ev.get("posttrain_baseline") or {}
+        out["post_t0_f1"] = post.get("mean_f1")
+        out["post_cal_f1"] = post.get("mean_f1_cal")
+        # Compatibility: keep the val_promo_mean_f1 key the existing
+        # promote-loop summary block consumes.
+        out["val_promo_mean_f1"] = ev.get("mean_f1")
         mse_metrics = ev.get("mse_supervision_metrics") or {}
         out["mean_fve"] = mse_metrics.get("mean_fve")
         # Prefer val-promo (honest) if present
@@ -142,6 +156,7 @@ def _read_metrics(sub_dir: Path, n_unsupervised: int) -> dict:
 def run(
     cfg: Config = None,
     widths: tuple[int, ...] = (256, 512, 1024),
+    skip_promote_loop: bool = False,
 ) -> list[dict]:
     if cfg is None:
         cfg = Config()
@@ -200,17 +215,24 @@ def run(
 
         # Promote-loop in triage-only mode (no decomposition, no merge).
         # Just measure how many multi_concept vs crisp we get at this width.
-        sub_cfg.promote_triage_only = True
-        sub_cfg.promote_decompose_multi_concept = False
-        sub_cfg.promote_max_iters = 1
-        sub_cfg.promote_min_kept = 10**6  # force triage-only termination
-        # Keep budget + batch size from base_cfg (default 100 / 20).
-        print(f"\n── promote-loop triage-only @ n_unsup={n_unsup} ──")
-        try:
-            run_promote_loop(sub_cfg)
-        except Exception as e:
-            print(f"  promote-loop error at n_unsup={n_unsup}: "
-                  f"{type(e).__name__}: {e}")
+        # Skipped for fixed catalogs (test_catalog etc.) where there's no
+        # U→S discovery question — the user just wants train+eval metrics
+        # as a function of n_unsupervised.
+        if skip_promote_loop:
+            print(f"\n── promote-loop SKIPPED @ n_unsup={n_unsup} "
+                  f"(--usweep-skip-promote) ──")
+        else:
+            sub_cfg.promote_triage_only = True
+            sub_cfg.promote_decompose_multi_concept = False
+            sub_cfg.promote_max_iters = 1
+            sub_cfg.promote_min_kept = 10**6  # force triage-only termination
+            # Keep budget + batch size from base_cfg (default 100 / 20).
+            print(f"\n── promote-loop triage-only @ n_unsup={n_unsup} ──")
+            try:
+                run_promote_loop(sub_cfg)
+            except Exception as e:
+                print(f"  promote-loop error at n_unsup={n_unsup}: "
+                      f"{type(e).__name__}: {e}")
 
         m = _read_metrics(sub_dir, n_unsup)
         results.append(m)
@@ -224,18 +246,33 @@ def run(
     print("\n" + "=" * 70)
     print("U-WIDTH SWEEP SUMMARY")
     print("=" * 70)
-    cols = [
-        ("n_unsupervised", "n_unsup"),
-        ("r2", "R²"),
-        ("pretrained_r2", "R²(P)"),
-        ("mean_fve", "FVE"),
-        ("val_promo_mean_f1", "val_F1"),
-        ("spent", "spent"),
-        ("n_crisp", "crisp"),
-        ("crisp_per_100", "crisp%"),
-        ("multi_concept_rate", "mcRate"),
-        ("nuisance_rate", "nuisRate"),
-    ]
+    if skip_promote_loop:
+        # Train+eval-only mode: focus on reconstruction parity + the
+        # three F1 numbers at t=0 (the headline geometry-honest read).
+        cols = [
+            ("n_unsupervised", "n_unsup"),
+            ("r2", "R²"),
+            ("pretrained_r2", "R²(P)"),
+            ("delta_r2_supervised", "ΔR²(S)"),
+            ("mean_fve", "FVE"),
+            ("sup_t0_f1", "supT0"),
+            ("probe_t0_f1", "prbT0"),
+            ("post_t0_f1", "ptT0"),
+            ("sup_cal_f1", "supCal"),
+        ]
+    else:
+        cols = [
+            ("n_unsupervised", "n_unsup"),
+            ("r2", "R²"),
+            ("pretrained_r2", "R²(P)"),
+            ("mean_fve", "FVE"),
+            ("val_promo_mean_f1", "val_F1"),
+            ("spent", "spent"),
+            ("n_crisp", "crisp"),
+            ("crisp_per_100", "crisp%"),
+            ("multi_concept_rate", "mcRate"),
+            ("nuisance_rate", "nuisRate"),
+        ]
     header = "  " + "  ".join(f"{h:>9}" for _, h in cols)
     print(header)
     print("-" * len(header))
