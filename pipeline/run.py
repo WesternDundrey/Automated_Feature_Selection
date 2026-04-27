@@ -247,6 +247,16 @@ def main():
                              "test_catalog) where U→S discovery isn't "
                              "the question — you just want R² / t=0 F1 "
                              "/ FVE as a function of n_unsupervised.")
+    parser.add_argument("--upstream-dir", default=None,
+                        help="In --step usweep, directory holding the "
+                             "shared upstream artifacts (tokens.pt, "
+                             "activations.pt, annotations.pt, "
+                             "feature_catalog.json). Defaults to "
+                             "--output_dir. Pass this when you want "
+                             "sweep results in a separate dir from the "
+                             "annotation cache, e.g. "
+                             "--upstream-dir pipeline_data "
+                             "--output_dir pipeline_data/sweep_A.")
     parser.add_argument("--promote-top-k", type=int, default=None,
                         help="K U latents considered per promote-loop round (default 20)")
     parser.add_argument("--promote-max-iters", type=int, default=None,
@@ -742,7 +752,11 @@ def main():
             widths = tuple(int(x.strip()) for x in args.widths.split(",") if x.strip())
         else:
             widths = (256, 512, 1024)
-        run_usweep(cfg, widths=widths, skip_promote_loop=args.usweep_skip_promote)
+        run_usweep(
+            cfg, widths=widths,
+            skip_promote_loop=args.usweep_skip_promote,
+            upstream_dir=Path(args.upstream_dir) if args.upstream_dir else None,
+        )
         print(f"U-width sweep completed in {time.time() - t0:.1f}s")
 
     # Promote loop — residual-ranked U→S promotion

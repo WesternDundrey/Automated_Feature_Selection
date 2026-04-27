@@ -157,6 +157,7 @@ def run(
     cfg: Config = None,
     widths: tuple[int, ...] = (256, 512, 1024),
     skip_promote_loop: bool = False,
+    upstream_dir: Path | None = None,
 ) -> list[dict]:
     if cfg is None:
         cfg = Config()
@@ -165,15 +166,23 @@ def run(
     sweep_root = main_output / "usweep"
     sweep_root.mkdir(parents=True, exist_ok=True)
 
-    # Sanity: the shared artifacts must already exist in main_output.
+    # Where to find upstream artifacts (tokens/activations/annotations/
+    # feature_catalog). Defaults to cfg.output_dir but can be split off
+    # via --upstream-dir so multiple sweeps with the same upstream data
+    # can write to different output_dirs without re-staging every file.
+    artifacts_source = Path(upstream_dir) if upstream_dir is not None else main_output
+
+    # Sanity: the shared artifacts must already exist in artifacts_source.
     required = ["tokens.pt", "activations.pt", "annotations.pt",
                 "feature_catalog.json"]
     for name in required:
-        if not (main_output / name).exists():
+        if not (artifacts_source / name).exists():
             raise FileNotFoundError(
-                f"usweep requires {main_output / name}. Run the main "
+                f"usweep requires {artifacts_source / name}. Run the main "
                 f"pipeline (inventory + annotate) first so the sweep has "
-                f"something to train against."
+                f"something to train against. Pass --upstream-dir to point "
+                f"at where these artifacts live if it is different from "
+                f"--output_dir."
             )
 
     # Deferred imports so the module is cheap to import.
@@ -195,7 +204,7 @@ def run(
 
         sub_dir = sweep_root / f"u{n_unsup}"
         sub_dir.mkdir(parents=True, exist_ok=True)
-        _link_shared(main_output, sub_dir)
+        _link_shared(artifacts_source, sub_dir)
 
         sub_cfg = _derive_cfg(cfg, n_unsup, sub_dir)
 
