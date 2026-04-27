@@ -582,10 +582,17 @@ def train_supervised_sae(
         if save_checkpoint:
             torch.save(target_dirs.cpu(), cfg.target_dirs_path)
 
-    # Class-balanced pos_weight for BCE (used when use_mse_supervision=False)
+    # Class-balanced pos_weight for BCE (used when use_mse_supervision=False).
+    # Set cfg.use_pos_weight=False (--no-pos-weight) to disable; with hinge
+    # selectivity + margin=0 this gives the literal mentor formula
+    # `max(0, -(2y-1) z_i)` with no class balancing.
     pos_counts = y_train.sum(dim=0).clamp(min=1.0)
     neg_counts = y_train.shape[0] - pos_counts
-    pos_weight = (neg_counts / pos_counts).clamp(max=100.0).to(cfg.device)
+    if getattr(cfg, "use_pos_weight", True):
+        pos_weight = (neg_counts / pos_counts).clamp(max=100.0).to(cfg.device)
+    else:
+        pos_weight = torch.ones_like(pos_counts).to(cfg.device)
+        print("  pos_weight: DISABLED (literal-formula run, no class balancing)")
 
     # Hierarchy
     hier_map = build_hierarchy_map(features)

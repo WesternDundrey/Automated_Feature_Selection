@@ -100,6 +100,12 @@ class Config:
     direction_loss_weight: float = 1.0  # α: decoder direction alignment (hybrid/mse)
     magnitude_loss_weight: float = 0.5  # β: activation magnitude alignment (mse only)
     selectivity_loss: str = "bce"       # "bce", "hinge", or "none"
+    use_pos_weight: bool = True         # class-balanced pos_weight in BCE/hinge.
+                                        # Set False (--no-pos-weight) for the
+                                        # literal mentor hinge formula
+                                        # `max(0, -(2y-1) z_i)` with no
+                                        # imbalance reweighting. Useful for
+                                        # ablating threshold-geometry effects.
     hinge_margin: float = 1.0           # margin for hinge selectivity loss.
                                         # Also used by the free-decoder
                                         # hinge-family modes (v8.11+): set to

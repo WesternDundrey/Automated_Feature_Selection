@@ -230,6 +230,13 @@ def main():
         help="Use squared hinge: violation² / 2 instead of violation. "
              "Smoother gradient, more push on large violations.",
     )
+    parser.add_argument(
+        "--no-pos-weight", action="store_true",
+        help="Disable class-balanced pos_weight in BCE/hinge supervision. "
+             "Combined with --hinge-margin 0, this is the literal mentor "
+             "formula `max(0, -(2y-1) z_i)` from supervised_saes_hinge_loss.md "
+             "with no margin shaping and no class reweighting.",
+    )
     parser.add_argument("--widths", default=None,
                         help="Comma-separated n_unsupervised values for "
                              "--step usweep (default: 256,512,1024)")
@@ -371,6 +378,8 @@ def main():
         overrides["hinge_margin"] = args.hinge_margin
     if args.hinge_squared:
         overrides["hinge_squared"] = True
+    if args.no_pos_weight:
+        overrides["use_pos_weight"] = False
     if args.no_mse:
         overrides["supervision_mode"] = "bce"
     if args.full_desc:

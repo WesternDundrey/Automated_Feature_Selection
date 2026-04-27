@@ -550,9 +550,16 @@ def train_hinge_sae(
         torch.save(post_hoc_dirs.cpu(), cfg.target_dirs_path)
 
     # Per-feature pos_weight: same policy as the legacy BCE path.
-    pos_counts = y_train.sum(dim=0).clamp(min=1.0)
-    neg_counts = y_train.shape[0] - pos_counts
-    pos_weight = (neg_counts / pos_counts).clamp(max=100.0).to(cfg.device)
+    # Set cfg.use_pos_weight=False (--no-pos-weight) to disable
+    # class-balanced reweighting and recover the literal mentor
+    # formula `max(0, -(2y-1) z)` with margin=0.
+    if getattr(cfg, "use_pos_weight", True):
+        pos_counts = y_train.sum(dim=0).clamp(min=1.0)
+        neg_counts = y_train.shape[0] - pos_counts
+        pos_weight = (neg_counts / pos_counts).clamp(max=100.0).to(cfg.device)
+    else:
+        pos_weight = None
+        print("  pos_weight: DISABLED (literal mentor hinge formula)")
 
     hier_map = build_hierarchy_map(features)
 
