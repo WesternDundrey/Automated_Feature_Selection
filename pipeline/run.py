@@ -163,6 +163,29 @@ def main():
              "Recommended: 30 for 1000-sequence runs, 100 for 5000+.",
     )
     parser.add_argument(
+        "--legacy-prompts", action="store_true",
+        help="v8.10-style relaxed inventory prompts. Drops the v8.18.32 "
+             "prefix-decidable contract from explain_features and "
+             "organize_hierarchy, downgrades the prefix-decidable regex "
+             "backstop in catalog_quality.py from hard-fail to soft-flag "
+             "(LLM-judged), and exempts non-control leaves from the "
+             "v8.18.28 boundary-discipline metadata requirement. "
+             "Produces broader, richer catalogs at the cost of letting "
+             "some right-context-dependent / syntactic-role descriptions "
+             "through. Pair with --no-exclusions-in-suffix for full "
+             "v8.10-mode (recovers ~2-3x annotation throughput).",
+    )
+    parser.add_argument(
+        "--no-exclusions-in-suffix", action="store_true",
+        help="Don't append exclusions ('NOT semicolons, NOT periods') "
+             "to the annotator's per-feature suffix. Recovers ~2-3x "
+             "annotation throughput at the cost of less explicit "
+             "boundary cues at label time. Sonnet's exclusions metadata "
+             "is still kept in the catalog for human audit; only the "
+             "annotator prompt strips them. v8.10 didn't have suffix "
+             "exclusions; this restores that behavior.",
+    )
+    parser.add_argument(
         "--annotation-gpus", type=int, default=None,
         help="Number of GPUs to use for local annotation. 0 = auto-detect "
              "(CUDA_VISIBLE_DEVICES or torch.cuda.device_count, default), "
@@ -424,6 +447,10 @@ def main():
         overrides["overlap_check_auto"] = False
     if args.min_support is not None:
         overrides["min_support"] = args.min_support
+    if args.legacy_prompts:
+        overrides["legacy_prompts"] = True
+    if args.no_exclusions_in_suffix:
+        overrides["exclusions_in_annotator_suffix"] = False
     if args.selectivity:
         overrides["selectivity_loss"] = args.selectivity
 

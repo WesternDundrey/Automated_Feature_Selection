@@ -196,6 +196,22 @@ class Config:
     # to disable. Pass --min-support N to enable.
     min_support: int = 0
 
+    # v8.10-style relaxed prompts (v8.18.34). The strict
+    # prefix-decidable contract (v8.18.32) plus boundary-discipline
+    # schema (v8.18.28) plus exclusions-in-annotator-suffix (also
+    # v8.18.28) collectively narrowed the catalog and roughly tripled
+    # annotation time per decision. For workflows where the strict
+    # contract isn't load-bearing (broader catalogs, faster iteration),
+    # legacy_prompts=True drops the prefix-decidable enforcement from
+    # the inventory prompts and turns its regex backstop into a soft
+    # flag (LLM-judged) instead of a hard fail. exclusions_in_annotator_
+    # suffix=False additionally keeps Sonnet's exclusions metadata for
+    # human audit but doesn't append them to the annotator's suffix,
+    # recovering ~2-3x annotation throughput. Pass --legacy-prompts to
+    # set both at once.
+    legacy_prompts: bool = False
+    exclusions_in_annotator_suffix: bool = True
+
     # Target direction method for the freeze-decoder pin and the
     # in-loss direction supervision (hybrid/mse modes).
     #   "mean_shift": current default. d = normalize(μ_pos - μ_all).

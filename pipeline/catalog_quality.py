@@ -69,12 +69,20 @@ _HARD_FAIL_PATTERNS = [
     re.compile(r"\b(?:semantic|text)[_ -]?(?:domain|register|genre)\b", re.IGNORECASE),
     re.compile(r"\bdiscourse[_ -]?function\b", re.IGNORECASE),
     re.compile(r"\b(?:formal|informal|conversational|argumentative|expository|scientific|technical)\s+(?:text|prose|register|writing|tone)\b", re.IGNORECASE),
-    # Right-context dependence (v8.18.32): the annotator sees only
-    # the prefix ending at the target token. Features that require
-    # future tokens, full-sentence parse, or syntactic role decisions
-    # cannot be answered prefix-decidably. The "preferred"-form list
-    # in the inventory prompt covers the positive guidance; this is
-    # the regex backstop for cases where Sonnet violates it.
+    # Document-level positional predicate: "Token ... in a politics
+    # article", "in the scientific paragraph". Always doc-conditional
+    # regardless of mode — there's no token-local way to decide what
+    # the surrounding document is about.
+    re.compile(r"\bin (?:a|an|the)\s+[^.]{0,40}?(?:text|article|document|paragraph|passage|essay|post|email|review)\b", re.IGNORECASE),
+]
+
+# v8.18.32 prefix-decidable backstops. These are the patterns that
+# require future tokens, full-sentence parse, or syntactic role
+# decisions — uncalculable for an annotator that sees only the prefix
+# up to the target token. Always-on by default (strict mode); skipped
+# when cfg.legacy_prompts=True (relaxed mode allows these for richer
+# catalogs at the cost of some annotator-noisy features).
+_PREFIX_DECIDABLE_HARD_FAIL = [
     re.compile(r"\bfollowed by\b", re.IGNORECASE),
     re.compile(r"\bpreceding\b", re.IGNORECASE),
     re.compile(r"\bintroduc(?:e|ing|es) (?:a|an|the)\b", re.IGNORECASE),
@@ -84,12 +92,6 @@ _HARD_FAIL_PATTERNS = [
     re.compile(r"\b(?:subject|object|predicate|complement|modifier|head|specifier|determiner) of\b", re.IGNORECASE),
     re.compile(r"\bnamed entity\b", re.IGNORECASE),
     re.compile(r"\b(?:sarcas(?:m|tic)|iron(?:y|ic))\b", re.IGNORECASE),
-    # Document-level positional predicate: "Token ... in a X article",
-    # "Token ... in the politics paragraph", etc. The existing
-    # text-level regex above only fires when the doc-noun is the
-    # subject; this catches the case where it's the prepositional
-    # object (i.e. position-conditioned on document content).
-    re.compile(r"\bin (?:a|an|the)\s+[^.]{0,40}?(?:text|article|document|paragraph|passage|essay|post|email|review)\b", re.IGNORECASE),
 ]
 
 # Soft-flag patterns. Trigger a Sonnet crispness call (which may pass
@@ -115,15 +117,32 @@ _SOFT_FLAG_PATTERNS = [
 _MAX_DESCRIPTION_WORDS = 30  # over this length is almost always over-broad
 
 
-def _lexical_scan(description: str) -> tuple[list[str], list[str]]:
+def _lexical_scan(
+    description: str,
+    legacy_prompts: bool = False,
+) -> tuple[list[str], list[str]]:
     """Return (hard_fail_phrases, soft_flag_phrases) found in the
-    description. The caller decides what to do with each list."""
+    description. The caller decides what to do with each list.
+
+    legacy_prompts=True relaxes the v8.18.32 prefix-decidable backstop:
+    those patterns become soft flags (LLM-judged) instead of hard fails.
+    Document-level / vague-phrase hard-fails always apply regardless.
+    """
     hard: list[str] = []
     soft: list[str] = []
     for pat in _HARD_FAIL_PATTERNS:
         m = pat.search(description)
         if m:
             hard.append(m.group(0))
+    # v8.18.32 prefix-decidable patterns: hard-fail in strict mode,
+    # soft-flag (LLM-judged) in legacy mode.
+    for pat in _PREFIX_DECIDABLE_HARD_FAIL:
+        m = pat.search(description)
+        if m:
+            if legacy_prompts:
+                soft.append(m.group(0))
+            else:
+                hard.append(m.group(0))
     for pat in _SOFT_FLAG_PATTERNS:
         m = pat.search(description)
         if m:
@@ -261,10 +280,16 @@ def assess_feature_quality(
             "crispness_category": None,
         }
 
-    hard_fail_phrases, soft_flag_phrases = _lexical_scan(description)
+    legacy_prompts = bool(getattr(cfg, "legacy_prompts", False)) if cfg is not None else False
+    hard_fail_phrases, soft_flag_phrases = _lexical_scan(
+        description, legacy_prompts=legacy_prompts,
+    )
     wc = _word_count(description)
     is_src_exempt = _is_source_latents_exempt(feature)
-    is_bd_exempt = _is_boundary_discipline_exempt(feature)
+    # In legacy mode, boundary-discipline metadata is NOT required from
+    # Sonnet (the inventory prompt doesn't ask for it). All features
+    # become BD-exempt as a result.
+    is_bd_exempt = legacy_prompts or _is_boundary_discipline_exempt(feature)
     src_ok = is_src_exempt or _has_source_latents(feature)
     has_pos, has_neg, has_excl = _has_examples_metadata(feature)
 

@@ -48,7 +48,7 @@ _NOT_PREFIX_RE = re.compile(r"^not\s+", re.IGNORECASE)
 _PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
 
-def _format_feature_for_annotator(f: dict, max_exclusions: int = 2) -> str:
+def _format_feature_for_annotator(f: dict, max_exclusions: int = 2, include_exclusions: bool = True) -> str:
     """Build the description string the annotator actually sees for a
     feature. When the catalog entry carries `exclusions` (set by
     --step rewrite-catalog or by promote-loop's atom decomposer), they
@@ -84,6 +84,12 @@ def _format_feature_for_annotator(f: dict, max_exclusions: int = 2) -> str:
     auditor but noise to the annotator).
     """
     desc = (f.get("description") or "").rstrip(".").strip()
+    if not include_exclusions:
+        # v8.18.34 throughput mode: keep exclusions in catalog metadata
+        # for human audit but don't append them to the annotator's
+        # suffix. Recovers v8.10-era throughput (~2-3x speedup) at the
+        # cost of less explicit boundary cues at label time.
+        return desc
     excl_raw = f.get("exclusions") or []
     if not excl_raw or not desc:
         return desc
@@ -620,9 +626,11 @@ def _annotate_local_vllm_pertoken(
     #   suffix = feature question only                                  (NOT cached)
     # F-index suffix: "F3? " (~3 tok).  Full-desc suffix: "description? " (~8-10 tok)
     use_findex = cfg.use_findex_suffix
+    include_excl = getattr(cfg, "exclusions_in_annotator_suffix", True)
     if use_findex:
         feat_defs = "\n".join(
-            f"F{i}: {_format_feature_for_annotator(f)}" for i, f in enumerate(features)
+            f"F{i}: {_format_feature_for_annotator(f, include_exclusions=include_excl)}"
+            for i, f in enumerate(features)
         )
         SYS_STR = (
             f'Answer 0 (no) or 1 (yes).\n\n'
@@ -688,7 +696,7 @@ def _annotate_local_vllm_pertoken(
     else:
         feat_suffix_list = [
             tuple(ann_tokenizer.encode(
-                f'{_format_feature_for_annotator(f)}? ',
+                f'{_format_feature_for_annotator(f, include_exclusions=include_excl)}? ',
                 add_special_tokens=False,
             ))
             for f in features
@@ -988,10 +996,11 @@ def _annotate_local_hf(
     print(f"Annotating: {n_features} features x {N} sequences x {T} tokens "
           f"= {total_decisions:,} decisions (HF transformers, no prefix caching)")
 
+    include_excl = getattr(cfg, "exclusions_in_annotator_suffix", True)
     for fi, feat in enumerate(features):
         feat_prefix = (
             "You are a feature annotator. "
-            f"Feature: {_format_feature_for_annotator(feat)}\n"
+            f"Feature: {_format_feature_for_annotator(feat, include_exclusions=include_excl)}\n"
             "Output only 0 or 1. 1 if the feature activates at the LAST token.\n\n"
         )
 

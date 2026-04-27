@@ -531,6 +531,7 @@ def explain_features(top_activations: dict, tokenizer, cfg: Config) -> dict:
 
     batch_size = cfg.features_per_explanation_batch
 
+    legacy_prompts = bool(getattr(cfg, "legacy_prompts", False))
     for i in tqdm(range(0, len(latent_indices), batch_size), desc="Explaining"):
         batch = latent_indices[i : i + batch_size]
 
@@ -542,50 +543,69 @@ def explain_features(top_activations: dict, tokenizer, cfg: Config) -> dict:
             "For EACH latent, write a precise 1-2 sentence description of what "
             "the latent detects. The description must be a TOKEN-LEVEL "
             "property — a yes/no question a reader can answer for ONE specific "
-            "token using only the target token and its LEFT context (tokens "
-            "up to and including the target token).\n\n"
-            "PREFIX-DECIDABLE ONLY. The downstream annotator labels one token "
-            "at a time and sees only the prefix ending at that token. Every "
-            "feature must be decidable from:\n"
-            "  - the target token's surface string\n"
-            "  - tokens before the target token (left context)\n"
-            "  - the feature description\n"
-            "Do NOT propose features that require future tokens, whole-sentence "
-            "parse, document topic, genre, register, or semantic domain. "
-            "If a feature requires seeing tokens AFTER the target token, drop "
-            "the latent.\n\n"
-            "PREFER: surface/token-form, local left-context, punctuation, "
-            "immediate predecessor, short fixed lexical classes, BPE / "
-            "tokenization features.\n\n"
-            "ACCEPT (decidable from target token + left context):\n"
-            "  - 'Token is a comma'\n"
-            "  - 'Token is all lowercase'\n"
-            "  - 'Token starts with uppercase'\n"
-            "  - 'Token contains a digit'\n"
-            "  - 'Token is a leading-space word token'\n"
-            "  - 'Token is a quote mark'\n"
-            "  - 'Token is the word said after a quoted phrase'   (left context)\n"
-            "  - 'Token immediately follows a comma'              (left context)\n"
-            "  - 'Token appears after Mr. or Dr.'                 (left context)\n\n"
-            "REJECT (requires right context, full parse, or document-level):\n"
-            "  - 'Token is a sentence-final period'         (needs future tokens)\n"
-            "  - 'Token is a determiner before a noun'      (needs future tokens)\n"
-            "  - 'Token introduces a prepositional phrase'  (needs future tokens)\n"
-            "  - 'Token is the subject of a clause'         (needs full parse)\n"
-            "  - 'Token is part of a named entity'          (needs entity span)\n"
-            "  - 'Token is the verb in a quote-attribution' (needs future tokens)\n"
-            "  - 'Token appears in a sarcastic sentence'    (needs full sentence)\n"
-            "  - 'Token is in a politics article'           (document-level)\n"
-            "  - 'Text is about politics'                   (predicate = text)\n\n"
-            "If the latent's top contexts only support a right-context-dependent "
-            "or syntactic-role description, output 'LATENT <idx>: SKIP' instead "
-            "of forcing a description.\n\n"
+            "token (using surrounding context as evidence about THAT token).\n\n"
+        ]
+        if not legacy_prompts:
+            prompt_parts.append(
+                "PREFIX-DECIDABLE ONLY. The downstream annotator labels one token "
+                "at a time and sees only the prefix ending at that token. Every "
+                "feature must be decidable from:\n"
+                "  - the target token's surface string\n"
+                "  - tokens before the target token (left context)\n"
+                "  - the feature description\n"
+                "Do NOT propose features that require future tokens, whole-sentence "
+                "parse, document topic, genre, register, or semantic domain. "
+                "If a feature requires seeing tokens AFTER the target token, drop "
+                "the latent.\n\n"
+                "PREFER: surface/token-form, local left-context, punctuation, "
+                "immediate predecessor, short fixed lexical classes, BPE / "
+                "tokenization features.\n\n"
+            )
+        if not legacy_prompts:
+            prompt_parts.append(
+                "ACCEPT (decidable from target token + left context):\n"
+                "  - 'Token is a comma'\n"
+                "  - 'Token is all lowercase'\n"
+                "  - 'Token starts with uppercase'\n"
+                "  - 'Token contains a digit'\n"
+                "  - 'Token is a leading-space word token'\n"
+                "  - 'Token is a quote mark'\n"
+                "  - 'Token is the word said after a quoted phrase'   (left context)\n"
+                "  - 'Token immediately follows a comma'              (left context)\n"
+                "  - 'Token appears after Mr. or Dr.'                 (left context)\n\n"
+                "REJECT (requires right context, full parse, or document-level):\n"
+                "  - 'Token is a sentence-final period'         (needs future tokens)\n"
+                "  - 'Token is a determiner before a noun'      (needs future tokens)\n"
+                "  - 'Token introduces a prepositional phrase'  (needs future tokens)\n"
+                "  - 'Token is the subject of a clause'         (needs full parse)\n"
+                "  - 'Token is part of a named entity'          (needs entity span)\n"
+                "  - 'Token is the verb in a quote-attribution' (needs future tokens)\n"
+                "  - 'Token appears in a sarcastic sentence'    (needs full sentence)\n"
+                "  - 'Token is in a politics article'           (document-level)\n"
+                "  - 'Text is about politics'                   (predicate = text)\n\n"
+                "If the latent's top contexts only support a right-context-dependent "
+                "or syntactic-role description, output 'LATENT <idx>: SKIP' instead "
+                "of forcing a description.\n\n"
+            )
+        else:
+            prompt_parts.append(
+                "STRICTLY FORBIDDEN: descriptions whose predicate is the text, "
+                "the sentence, the paragraph, the context, the document, the "
+                "article, the passage, the topic, the register, the genre, or "
+                "the domain. Those are NOT token-level — the SAE annotates one "
+                "token at a time. Reformulate as a token-local property or "
+                "skip the latent.\n\n"
+                "ALLOWED: descriptions that use surrounding context as EVIDENCE "
+                "about a specific token, like 'Token is the verb in a quote-"
+                "attribution clause' or 'Token is a comma in a list separator'.\n\n"
+            )
+        prompt_parts.append(
             "Do NOT say 'this latent detects...'. Just state what the feature is, "
             "starting with 'Token is...' or 'Token immediately follows...'.\n\n"
             "Reply in this exact format (one per line, no blank lines):\n"
             "LATENT <idx>: <description>\n\n"
             "Here are the latents:\n"
-        ]
+        )
 
         for lat_idx in batch:
             examples = top_activations[lat_idx][:cfg.top_k_examples]
@@ -645,6 +665,73 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
         f"- latent_{k}: {v}" for k, v in sorted(descriptions.items(), key=lambda x: int(x[0]))
     )
 
+    legacy_prompts = bool(getattr(cfg, "legacy_prompts", False))
+
+    if legacy_prompts:
+        scope_block = (
+            "STRICT TOKEN-LEVEL CONSTRAINT:\n\n"
+            "Every leaf description must be a YES/NO QUESTION ABOUT ONE\n"
+            "SPECIFIC TOKEN, using surrounding context as evidence about\n"
+            "THAT token. The SAE annotates one token at a time. A feature\n"
+            "whose predicate is the text/sentence/paragraph/context/\n"
+            "document/topic/register/genre/domain HAS NO TOKEN-LEVEL\n"
+            "ANSWER and must be excluded.\n\n"
+            "REJECT (predicate is wrong unit, not a token):\n"
+            "  - \"Text is about politics\"            (predicate = text)\n"
+            "  - \"Sentence is in past tense\"         (predicate = sentence)\n"
+            "  - \"Context belongs to scientific...\"  (predicate = context)\n"
+            "  - \"Document discusses healthcare\"     (predicate = document)\n"
+            "  - \"register / genre / domain of X\"    (predicate = register)\n"
+            "  - \"semantic_domain.politics\"          (predicate = context)\n\n"
+            "ACCEPT (predicate is THIS token, context is evidence):\n"
+            "  - \"Token is a comma in a list separator\"\n"
+            "  - \"Token is the verb in a quote-attribution clause\"\n"
+            "  - \"Token immediately follows a person's surname in a byline\"\n"
+            "  - \"Token is a capitalized first word of a sentence\"\n"
+            "  - \"Token is 'said' or 'told' in a news quote attribution\"\n"
+        )
+    else:
+        scope_block = (
+            "STRICT PREFIX-DECIDABLE TOKEN-LEVEL CONSTRAINT:\n\n"
+            "Every leaf description must be a YES/NO QUESTION ABOUT ONE\n"
+            "SPECIFIC TOKEN, decidable from ONLY the target token and the\n"
+            "tokens before it (left context). The downstream annotator\n"
+            "sees the prefix up to and including the target token; it\n"
+            "does NOT see tokens after the target.\n\n"
+            "REJECT (predicate is wrong unit, OR requires right-context /\n"
+            "full parse / document-level):\n"
+            "  - \"Text is about politics\"                    (document-level)\n"
+            "  - \"Sentence is in past tense\"                 (document-level)\n"
+            "  - \"Context belongs to scientific...\"          (document-level)\n"
+            "  - \"Document discusses healthcare\"             (document-level)\n"
+            "  - \"register / genre / domain of X\"            (document-level)\n"
+            "  - \"text_register.informal_web\"                (document-level)\n"
+            "  - \"semantic_domain.politics\"                  (document-level)\n"
+            "  - \"Token is a sentence-final period\"          (needs future tokens)\n"
+            "  - \"Token is a determiner before a noun\"       (needs future tokens)\n"
+            "  - \"Token introduces a prepositional phrase\"   (needs future tokens)\n"
+            "  - \"Token is the subject of a clause\"          (needs full parse)\n"
+            "  - \"Token is part of a named entity\"           (needs entity span)\n"
+            "  - \"Token is the verb in a quote-attribution\"  (needs future tokens)\n"
+            "  - \"Token is a comma in a list separator\"      (needs future tokens)\n"
+            "  - \"Token appears in a sarcastic sentence\"     (needs full sentence)\n\n"
+            "ACCEPT (decidable from target token + left context only):\n"
+            "  - \"Token is a comma\"                                 (surface)\n"
+            "  - \"Token is all lowercase\"                           (surface)\n"
+            "  - \"Token starts with uppercase\"                      (surface)\n"
+            "  - \"Token contains a digit\"                           (surface)\n"
+            "  - \"Token is a leading-space word token\"              (surface, BPE)\n"
+            "  - \"Token is a quote mark\"                            (surface)\n"
+            "  - \"Token is a hyphenated subword fragment\"           (surface, BPE)\n"
+            "  - \"Token is the word 'said' after a quoted phrase\"   (left context)\n"
+            "  - \"Token immediately follows a comma\"                (left context)\n"
+            "  - \"Token appears after 'Mr.' or 'Dr.'\"               (left context)\n"
+            "  - \"Token is a capitalized word at sentence start\"    (left context — prior period)\n\n"
+            "PREFER: surface / token-form properties, local left-context\n"
+            "cues, punctuation, immediate predecessor, short fixed lexical\n"
+            "classes, BPE / tokenization features.\n"
+        )
+
     prompt = textwrap.dedent(f"""\
         You are building a supervised feature dictionary for a sparse autoencoder
         trained on {cfg.model_name}, layer {cfg.target_layer}.
@@ -656,49 +743,7 @@ def organize_hierarchy(descriptions: dict, cfg: Config) -> dict:
         INITIAL DESCRIPTIONS:
         {desc_lines}
 
-        STRICT PREFIX-DECIDABLE TOKEN-LEVEL CONSTRAINT:
-
-        Every leaf description must be a YES/NO QUESTION ABOUT ONE
-        SPECIFIC TOKEN, decidable from ONLY the target token and the
-        tokens before it (left context). The downstream annotator
-        sees the prefix up to and including the target token; it
-        does NOT see tokens after the target.
-
-        REJECT (predicate is wrong unit, OR requires right-context /
-        full parse / document-level):
-          - "Text is about politics"                    (document-level)
-          - "Sentence is in past tense"                 (document-level)
-          - "Context belongs to scientific..."          (document-level)
-          - "Document discusses healthcare"             (document-level)
-          - "register / genre / domain of X"            (document-level)
-          - "text_register.informal_web"                (document-level)
-          - "semantic_domain.politics"                  (document-level)
-          - "Token is a sentence-final period"          (needs future tokens)
-          - "Token is a determiner before a noun"       (needs future tokens)
-          - "Token introduces a prepositional phrase"   (needs future tokens)
-          - "Token is the subject of a clause"          (needs full parse)
-          - "Token is part of a named entity"           (needs entity span)
-          - "Token is the verb in a quote-attribution"  (needs future tokens)
-          - "Token is a comma in a list separator"      (needs future tokens)
-          - "Token appears in a sarcastic sentence"     (needs full sentence)
-
-        ACCEPT (decidable from target token + left context only):
-          - "Token is a comma"                                 (surface)
-          - "Token is all lowercase"                           (surface)
-          - "Token starts with uppercase"                      (surface)
-          - "Token contains a digit"                           (surface)
-          - "Token is a leading-space word token"              (surface, BPE)
-          - "Token is a quote mark"                            (surface)
-          - "Token is a hyphenated subword fragment"           (surface, BPE)
-          - "Token is the word 'said' after a quoted phrase"   (left context)
-          - "Token immediately follows a comma"                (left context)
-          - "Token appears after 'Mr.' or 'Dr.'"               (left context)
-          - "Token is a capitalized word at sentence start"    (left context — prior period)
-
-        PREFER: surface / token-form properties, local left-context
-        cues, punctuation, immediate predecessor, short fixed lexical
-        classes, BPE / tokenization features.
-
+        {scope_block}
         STRUCTURE RULES:
 
         Use CATEGORICAL groups where features are natural alternatives:
