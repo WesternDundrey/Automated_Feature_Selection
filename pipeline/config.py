@@ -212,6 +212,13 @@ class Config:
     legacy_prompts: bool = False
     exclusions_in_annotator_suffix: bool = True
 
+    # When true, --step extend-corpus saves a permanent immutable
+    # snapshot of the pre-extension annotations.pt + tokens.pt at
+    # `_pre_extend_<n_old>seqs/` before extending. Lets you compare
+    # extended-vs-old or restore manually if anything's wrong post-hoc.
+    # Costs ~one annotations.pt of disk space per extension.
+    extend_clone_pre: bool = False
+
     # Target direction method for the freeze-decoder pin and the
     # in-loss direction supervision (hybrid/mse modes).
     #   "mean_shift": current default. d = normalize(μ_pos - μ_all).

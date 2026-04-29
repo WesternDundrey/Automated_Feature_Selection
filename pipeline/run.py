@@ -118,7 +118,8 @@ def main():
                  "weaknesses", "siphoning", "discover", "discover-loop",
                  "composition", "layer-sweep", "promote-loop", "usweep",
                  "hinge-ablation", "trim-by-kappa",
-                 "audit-feature", "rewrite-catalog"],
+                 "audit-feature", "rewrite-catalog",
+                 "extend-corpus"],
         help="Run only this step",
     )
     parser.add_argument(
@@ -161,6 +162,17 @@ def main():
              "'min_support<N'. Backup of the pre-filter catalog goes to "
              "feature_catalog.unfiltered.json. 0 (default) disables. "
              "Recommended: 30 for 1000-sequence runs, 100 for 5000+.",
+    )
+    parser.add_argument(
+        "--extend-clone-pre", action="store_true",
+        help="In --step extend-corpus, copy the pre-extension tokens.pt "
+             "+ activations.pt + annotations.pt + their sidecars into a "
+             "permanent _pre_extend_<n_old>seqs/ subdir before any "
+             "writes. Doubles the disk footprint of those artifacts but "
+             "preserves the old run-state for paranoia / forensics. The "
+             "transactional .bak.extend backups already cover within-run "
+             "rollback; this flag is for keeping the pre-extension state "
+             "indefinitely for comparison.",
     )
     parser.add_argument(
         "--legacy-prompts", action="store_true",
@@ -447,6 +459,8 @@ def main():
         overrides["overlap_check_auto"] = False
     if args.min_support is not None:
         overrides["min_support"] = args.min_support
+    if args.extend_clone_pre:
+        overrides["extend_clone_pre"] = True
     if args.legacy_prompts:
         overrides["legacy_prompts"] = True
     if args.no_exclusions_in_suffix:
