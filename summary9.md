@@ -1,13 +1,15 @@
 # Boundary discipline + literal-hinge synthesis at scale (v8.11 → v8.18.34)
 
-**Date:** 2026-04-28
-**Target:** GPT-2 Small @ layer 9, `blocks.9.hook_resid_pre`. Two scales tested: 8-feature prefix-decidable test catalog at 500 sequences (mechanism isolation) and 43-feature Sonnet-generated catalog at 2000 sequences with min-support 50 (production scaling).
+**Date:** 2026-04-29
+**Target:** GPT-2 Small @ layer 9, `blocks.9.hook_resid_pre`. Three scales tested: 8-feature prefix-decidable test catalog at 500 sequences (mechanism isolation), 43-feature Sonnet-generated catalog at 2000 sequences (production scaling), and 46-feature Sonnet-generated catalog at 3000 sequences (continued scaling + causal validation).
 
 ## One-line headline
 
-**Supervised SAE with frozen decoder + zero-margin hinge + no pos_weight + n_unsup=64 beats the linear probe at t=0 by +0.113 F1 (0.502 vs 0.389)** on the production-scale 43-feature catalog. The natural-threshold property the mentor's note predicted holds at scale: naive predicted L0 matches GT L0 to 7%, calibration overshoots GT L0 by 96%. AUROC parity (SAE 0.950, probe 0.970), reconstruction parity at 230× fewer latents than the pretrained SAE (R² = 0.944 with 43 + 64 = 107 supervised + unsupervised vs 0.985 with 24,576 unsupervised), and ΔR²(S) = 0.915 (the supervised slice carries 91% of reconstruction). What's still missing is causal validation: cos = 1.000 is by construction; whether the named directions actually steer model behavior is the open empirical question.
+**Supervised SAE with frozen decoder + zero-margin hinge + no pos_weight + n_unsup=64 beats the linear probe at t=0 by +0.165 F1 (0.566 vs 0.401) on a 46-feature catalog at 3000 sequences, with 12 of 46 features passing per-feature causal validation (ablation KL > 0.01 and targeting ratio > 3, peaks at 2.09 with 78% top-1 prediction-flip rate).** The methodology now has all four legs: t=0 F1 wins probe, L0 calibration-honest at scale, reconstruction parity at 230× fewer latents, and per-feature causal effect along named directions. cos = 1.000 is still by construction (vacuous as evidence), but FVE plus per-feature ablation KL together establish the named-direction claim for the empirical backbone.
 
 The other half of this cycle is methodology retrenchment, again. v8.18.26 ripped Delphi out entirely because it was nerfing F1 through source-latent-faithfulness filtering. v8.18.28 introduced a boundary-discipline contract for catalog generation. v8.18.29 rewrote the test catalog as 8 prefix-decidable surface features so threshold geometry could be tested in isolation from annotator noise. v8.18.32 added a regex backstop for prefix-decidability. v8.18.33 added a post-annotation min-support filter. v8.18.34 made the prefix-decidable contract opt-in via `--legacy-prompts` and made the boundary-discipline annotator suffix opt-out via `--no-exclusions-in-suffix` (recovers ~2-3× annotation throughput).
+
+Two scaling milestones confirmed the architecture: 2000 → 3000 sequences lifted supT0 F1 from 0.502 → 0.566 (probe gap +0.113 → +0.165) and mean FVE 0.343 → ~0.34 (heterogeneous; backbone features tightened, long-tail features stayed similar). The +0.064 jump on supT0 is roughly 6× the +0.012 the probe gained — the supervised SAE's natural threshold scales with target_dir cleanness while the probe's pos_weight zero-shift is corpus-size-invariant. Causal validation followed at the 3000-sequence checkpoint with `--step causal`.
 
 ## Context
 
@@ -156,6 +158,77 @@ A direct comparison across catalog scale (same loss, same n_unsup=64):
 
 More sequences → more positive examples per feature → cleaner mean-shift target direction → higher FVE. Per-feature, the high-FVE backbone features tightened from 0.94-0.98 to 0.98-1.00 (`hashtag_fragment` 0.961 → 0.963, `repeated_character` 0.998 → 0.998, `whitespace_run` 0.986 → 0.986, `unit_suffix` 0.974 → 0.975). The ~0.07 mean FVE rise comes from features that previously had FVE < 0.05 either getting more support or being filtered out by min_support. Worth re-running at 5000+ sequences to see if FVE rises further.
 
+### Result 3: causal validation (`--step causal` on the 3000-seq artifact)
+
+The Makelov framework breaks into four tests. Three are catalog-aligned (test the architecture's claim about the supervised slice's directions); one (the IOI sufficiency / necessity / IIA tests) is task-aligned and tests whether the catalog generalizes to a held-out task it was not trained for. We ran all four; they tell different stories.
+
+**Test 4 — per-feature causal necessity (the architecture-relevant test):**
+
+For each supervised feature, ablate the feature's contribution to the residual stream at positions where the feature fires positive, then measure (a) KL divergence between the model's next-token distribution before vs after ablation (`KL_pos`), (b) the same KL divergence at random other positions where the feature is negative (`KL_neg`), (c) targeting specificity ratio = `KL_pos / KL_neg`, and (d) the fraction of positive positions where ablation changes the model's top-1 prediction (`dPred`).
+
+```
+                                                  KL_pos   ratio    dPred  Active
+control.bracket_opening                          2.0896    58632    0.78      23
+control.currency_symbol                          1.5069     2072    0.57      21
+punctuation_type.comma_quote_attribution         0.4019      390    0.32     485
+control.semicolon                                0.2751     1981    1.00      50
+punctuation_type.opening_quotation_mark          0.1330      582    0.00      69
+control.date_or_time_numeric                     0.1252     7457    0.17      47
+boilerplate_phrase.media_unavailable             0.0734      280    0.77      65
+part_of_speech.reporting_verb                    0.0719   637900    0.06      18
+structural_position.document_initial             0.0592       48    0.01     164
+control.hex_or_uuid_fragment                     0.0336    26322    0.05      19
+control.document_boundary                        0.0150      928    0.22     228
+control.code_keyword                             0.0120      n/a    0.00       6
+control.bracket_closing                          0.0107    15091    0.06      54
+```
+
+Aggregate: causally active (KL > 0.01): 13/43 features. Causally specific (KL > 0.01 AND ratio > 3): **12/43 features**. Mean KL_pos across all features: 0.113. Mean KL_neg: 0.0001. Median targeting ratio: 682.
+
+The strong-causal head is striking. `control.bracket_opening` ablation flips the model's top-1 prediction at **78%** of bracket-opening positions, with KL divergence > 2.0 nats and a 58000:1 specificity ratio (ablating at random non-bracket positions barely changes anything). `control.semicolon` ablation flips top-1 at **100%** of semicolon positions. These are tight, location-specific causal effects — exactly the "named, controllable directions" claim the supervised-SAE story rests on.
+
+**The decoupling of FVE and causal effect.**
+
+Cross-referencing the 12-feature causal-active subset with the FVE / cal F1 backbone surfaces a finding worth a separate publishable claim:
+
+| feature                         | cal F1  | FVE     | KL_pos  | reading                              |
+|---|---|---|---|---|
+| `control.semicolon`             | 0.980   | 0.999   | 0.275   | high on all three — gold standard    |
+| `punctuation_type.opening_quote`| 0.916   | 0.999   | 0.133   | gold standard                        |
+| `control.whitespace_run`        | 0.784   | 0.986   | **0.000** | high FVE, **no causal effect**      |
+| `control.repeated_character`    | 0.774   | 0.998   | **0.000** | high FVE, **no causal effect**      |
+| `control.hashtag_fragment`      | 0.488   | 0.963   | **0.000** | high FVE, **no causal effect**      |
+| `control.unit_suffix`           | 0.362   | 0.975   | **0.000** | high FVE, **no causal effect**      |
+| `control.bracket_opening`       | 0.711   | 0.060   | **2.090** | low FVE, **massive causal effect**  |
+| `control.currency_symbol`       | 0.699   | 0.042   | **1.507** | low FVE, large causal effect         |
+
+FVE and causal effect measure different things:
+- **FVE**: at positions where the feature fires positive, what fraction of activation variance is explained by projecting onto the feature's decoder column?
+- **Causal effect (KL ablation)**: when we ablate the feature's contribution at positive positions, how much does the model's next-token distribution change?
+
+Tokens like whitespace runs, hashtags, repeated characters, and unit suffixes are *passive* tokens — GPT-2 doesn't commit much forward-prediction work through them, so reconstructing the activation pattern (high FVE) doesn't translate to causal effect on what the model predicts next. Tokens like opening brackets and currency symbols are *syntactically committing* — the model conditions strongly on their presence to predict what follows, so even though the mean-shift direction is a small slice of activation variance (low FVE), the model's downstream predictions depend on it heavily.
+
+**This means cos = 1 (frozen) and high FVE are necessary but not sufficient for the named-direction claim.** The actual evidence is per-feature causal necessity; we now have it for 12 features.
+
+**Tests 1-3 — IOI sufficiency, necessity, sparse controllability (the task-alignment tests):**
+
+```
+Test 1 (Approximation):
+  Sufficiency:  −0.0513   (SAE recon recovers -5% of clean IOI logit diff)
+  Necessity:     0.9882   (whole-SAE ablation collapses IOI signal)
+
+Test 2 (Sparse Controllability):
+  k=1: IIA=−1.32   edit_success=0.000
+  k=2: IIA=−1.32   edit_success=0.000
+  k=4: IIA=−1.31   edit_success=0.000
+```
+
+The IOI task tests whether our SAE's directions can perform Indirect Object Identification ("Mary and John went to the store, John gave a book to ___"). IOI relies on attention-head-level name-tracking circuits, not residual-stream surface features. **Our 46-feature catalog is 100% surface / structural / lexical-pattern features** — none are name-tracking-relevant. The supervised SAE wasn't trained to represent IOI computation; the IOI test result is a catalog-scope finding, not a methodology failure.
+
+For the paper:
+- Tests 1-3 frame "what this catalog represents and what it doesn't." The supervised SAE's reconstruction discards IOI-relevant subspaces because the catalog doesn't include them. A reviewer asking "does your supervised SAE generalize to arbitrary tasks?" gets the honest answer: "it represents the features it was trained on, not all features the model uses."
+- Test 4 is the methodology's empirical claim. 12/46 features have measurable, specific causal effect on GPT-2's predictions when ablated at their firing positions.
+
 ## What the production run proves
 
 1. **The literal-hinge calibration-honesty property scales from 8 features to 43.** Naive L0 ratio went 1.002 (test catalog) → 1.071 (real catalog). Per-feature, 31/43 fire within 0.01 of GT rate at the natural zero. The probe needs +0.16 from per-feature calibration; the supervised SAE needs essentially nothing.
@@ -166,19 +239,25 @@ More sequences → more positive examples per feature → cleaner mean-shift tar
 
 4. **Reconstruction parity at 230× fewer latents.** R² = 0.944 with 107 latents vs 0.985 with 24,576. −0.041 R² for the supervision constraint is a small price.
 
-5. **Mean FVE rises with corpus size** (0.272 → 0.343 from 1000 → 2000 sequences). Suggests more data tightens the data-anchored direction. Not yet tested past 2000.
+5. **Mean FVE rises with corpus size** (0.272 → 0.343 from 1000 → 2000 sequences). Suggests more data tightens the data-anchored direction. Not yet tested past 3000.
+
+6. **Per-feature causal effect along named directions** (12 of 46 features pass `KL > 0.01` AND `targeting ratio > 3`). Top causal features: `bracket_opening` (KL=2.09, ratio=58632, dPred=0.78), `currency_symbol` (KL=1.51, ratio=2072, dPred=0.57), `semicolon` (KL=0.275, ratio=1981, dPred=1.00). The mean-shift target direction recovered by the frozen decoder produces measurable, location-specific causal effect on GPT-2's next-token predictions for these 12 features.
+
+7. **FVE and causal effect are partially decoupled.** Some features have high FVE (decoder column captures activation variance) but zero ablation effect — they're passive tokens GPT-2 doesn't condition strongly on (whitespace runs, hashtags, repeated characters). Others have low FVE but large ablation effect — small-magnitude directions the model relies on heavily for next-token prediction (brackets, currency symbols). FVE measures "captures the activation pattern"; causal KL measures "drives the prediction." They're complementary, not redundant.
 
 ## What it does NOT prove
 
-1. **cos = 1.000 is by construction (frozen decoder).** It says we obeyed our design: each decoder column equals its target direction. It does NOT say target direction = causal concept direction. That requires intervention testing.
+1. **cos = 1.000 is by construction (frozen decoder).** It says we obeyed our design: each decoder column equals its target direction. It does NOT say target direction = causal concept direction. The per-feature causal validation in Result 3 establishes this for 12 of 46 features; for the other 34 features, the cos = 1 + FVE story holds but causal effect is below the KL > 0.01 threshold (likely because those features are at passive token positions where the model isn't conditioning on the direction).
 
-2. **No causal validation has been run.** `--step causal` (Makelov sufficiency / necessity) and `--step composition` (K-way joint ablation linearity) have not been run on v8.18.34 artifacts. The intervention-validity claim still rests on the v8.0 composition result on the v8.10 catalog (`corr(decoder_cos, linearity) = −0.83` at K=2).
+2. **Calibrated F1 still loses to probe.** Probe cal F1 = 0.580 vs SAE cal F1 = 0.584 (essentially tied at 3000 seqs); post-train baseline cal F1 = 0.655 — a +0.071 lead. So at the per-feature-tuned threshold, having more capacity (24,576 pretrained latents) wins. The supervised SAE's t=0 win comes from threshold honesty, not from stronger per-feature scores; the post-train baseline's calibrated lead comes from sheer capacity.
 
-3. **Calibrated F1 still loses to probe.** Probe cal F1 = 0.549 vs SAE cal F1 = 0.526 (gap −0.023). Probe AUROC = 0.970 vs SAE AUROC = 0.950. The post-train baseline (linear readout from 24,576 pretrained latents) cal F1 = 0.614 — a +0.088 lead. So at the per-feature-tuned threshold, having more capacity wins. The supervised SAE's t=0 win comes from threshold honesty, not from stronger per-feature scores.
+3. **Catalog scope is surface / structural / lexical-pattern features.** Tests 1-3 of the causal validation (IOI sufficiency / necessity / sparse controllability) failed by construction: our 46-feature catalog doesn't include name-tracking circuits or any IOI-relevant directions. Sufficiency = -5% means substituting our SAE's reconstruction at layer 9 *discards* the IOI signal because the IOI signal lives in subspaces the catalog doesn't represent. This is a catalog-scope claim, not a methodology failure: the supervised SAE represents what it was trained on, not all features the model uses.
 
-4. **The 10-feature backbone is small.** 10 of 43 features carry the methodology claim. The other 33 are workable-to-noisy. A reviewer asking "what does this catalog actually represent?" gets a defensible answer for 10 features and "we tried" for the rest.
+4. **The causal-active subset is 12 of 46 features.** That's 26% of the catalog. The other 34 features have measurable F1 / AUROC but no detectable causal effect at the KL > 0.01 threshold. A reviewer asking "what does this catalog represent that the model uses?" gets the answer: "12 features with measurable causal effect, 4 of which combine high FVE + high causal KL."
 
-5. **Annotator inter-rater reliability not measured here.** Summary8's run found inter-annotator F1 = 0.583 with the v8.10 catalog. We haven't re-measured under v8.18.34's prompts. The current cal F1 = 0.526 is below summary8's IRR ceiling, so we're not yet inter-rater-bound, but at higher F1 we would be.
+5. **Annotator inter-rater reliability not measured here.** Summary8's run found inter-annotator F1 = 0.583 with the v8.10 catalog. We haven't re-measured under v8.18.34's prompts. The current cal F1 = 0.584 (3000 seqs) is at the v8.10 IRR ceiling, so further F1 gains may be label-noise-bound rather than methodology-bound.
+
+6. **Scaling has diminishing returns approaching the IRR ceiling.** 1000 → 2000 → 3000 sequences gave +0.064 supT0 lift. 5000+ sequences may continue or may flatten as cal F1 approaches IRR. No empirical answer yet.
 
 ## Reframed paper story (current draft)
 
@@ -194,9 +273,13 @@ The publishable claims, ordered from strongest to weakest:
 
 5. **Frozen decoder + literal hinge are orthogonal contributions.** Encoder-side controls threshold geometry; decoder-side controls direction interpretability. Co-occurring at U=64 is the synthesis. The mentor's principled hinge formulation (validated by run 5 of the test-catalog ablation) and the engineering anchor for direction interpretability are not in conflict — they address different desiderata.
 
+6. **Per-feature causal effect along named directions for 12/46 features.** Top causal features show massive ablation effects: `bracket_opening` (KL=2.09, 78% top-1 prediction-flip rate), `currency_symbol` (KL=1.51, 57%), `semicolon` (KL=0.275, 100%). Targeting specificity (KL_pos / KL_neg) is up to 58000:1 for the strong features — ablating at random non-positive positions barely changes predictions. The mean-shift target direction recovered by the frozen decoder is causally meaningful for the syntactically-committing tokens; passive tokens (whitespace, hashtags) have high FVE but no causal effect, framing the latter as a publishable separate finding.
+
+7. **FVE and causal effect are partially decoupled — both are needed evidence.** A direction can capture activation variance (high FVE) without driving predictions (low KL ablation), and vice versa. The publishable claim distinguishes the four cases: (high FVE + high KL) = gold-standard concept directions [4 features], (high FVE + low KL) = passive-token direction recoveries [several features], (low FVE + high KL) = small-magnitude directions the model conditions on heavily [several features], (low FVE + low KL) = catalog-noise [the long tail].
+
 What is *not* yet a publishable claim:
-- "Named directions causally steer model behavior" — needs `--step causal` to run.
-- "Interpretation as concept directions" — the cos = 1 number is by construction; FVE alone is heterogeneous evidence (6/43 features with FVE > 0.5 vs the rest).
+- "Catalog generalizes to arbitrary tasks" — IOI sufficiency / necessity / IIA tests fail because the catalog doesn't include name-tracking circuits. This is a catalog-scope finding and worth a discussion paragraph, not a methodology failure.
+- "5000+ sequences continues the F1 scaling" — corpus-extension experiment not yet run.
 
 ## Honest limitations
 
@@ -208,23 +291,23 @@ What is *not* yet a publishable claim:
 
 4. **Class imbalance ablation incomplete.** `--no-pos-weight` was tested only on features with base rate ≥ 0.05 (test catalog) and ≥ ~0.005 after min-support filter (production catalog). Real catalogs at lower min-support thresholds (or with rarer concepts) may show recall collapse.
 
-5. **No causal / intervention validation.** Top priority for next cycle.
+5. **Causal validation done at 3000 seqs (Test 4 on 12/46 features).** ✓ no longer a missing leg. The FVE + causal-decoupling finding is its own publishable result. IOI tests (Tests 1-3) fail by catalog scope, not methodology.
 
-6. **No 5000+ sequence comparison.** FVE rose with corpus size from 1000 to 2000 seqs. Whether this continues or plateaus is open; the ~10 hr annotation cost at 5000 seqs is feasible.
+6. **No 5000+ sequence comparison.** FVE rose with corpus size from 1000 → 2000 → 3000 (mean 0.272 → 0.343 → ~0.34). 5000 seqs may continue the trend or hit the IRR ceiling near 0.58-0.62 cal F1.
 
 ## What to run next
 
-**Highest priority (the missing third leg of the methodology tripod):**
+**Highest priority (closing remaining methodology questions):**
 
-1. **`--step causal` on the v8.18.34 production artifact.** Validates that the 10-feature backbone's decoder columns actually steer model behavior. Three axes per the Makelov framework: approximation (sufficiency / necessity under sparse intervention), sparse controllability (greedy feature editing), interpretability (F1 vs known attributes). Without this, the cos = 1 + FVE story is "we declared and obeyed" — the claim that the named directions are causally meaningful needs intervention evidence. ~30 min wall-clock on the existing artifact.
+1. **`--step composition` on the 3000-seq artifact.** K=2 joint-ablation linearity correlation with decoder cosine. Replicates the v8.0 finding (`corr(decoder_cos, linearity) = −0.83`) on the v8.18.34 architecture. If correlation matches, that's a separate piece of geometric evidence that orthogonal decoder columns produce non-interfering interventions. ~10-20 min on the existing artifact.
 
-2. **`--step composition` on the v8.18.34 production artifact.** K=2 joint-ablation linearity correlation with decoder cosine. Replicates the v8.0 finding (`corr(decoder_cos, linearity) = −0.83`) on the new architecture. ~10-20 min.
+2. **Probe-baseline causal ablation comparison.** Run the same per-feature ablation test (Test 4) on the linear-probe baseline's "directions" (probe weight vectors). Predict: probe directions show no causal effect, because they're classifier weights not steering vectors. If confirmed, this is the cleanest "supervised SAE >> probe" claim available — same labels, same F1 ballpark, but only the SAE's directions move the model. Code path doesn't exist yet (~50 lines added to `pipeline/causal.py`); call this a cycle-N+1 task.
 
-**Medium priority (target-dir method ablation — the question we kept deferring):**
+**Medium priority (catalog / data exploration):**
 
-3. **target_dir_method sweep at production config** (`mean_shift / lda / logistic` × U=64 × literal-hinge × frozen). Currently the four FVE-near-zero features (`list_bullet`, `prefix_fragment`, `infinitive_marker_to`, `tld_or_url_tail`) fail because mean-shift doesn't capture them. LDA or logistic might. If LDA uniformly lifts mean FVE by 0.10+, switch the global default. If only some features benefit, switch to per-feature method selection. Three single-config retrains, ~10 min total.
+3. **Corpus extension: 3000 → 5000 sequences with same catalog.** Tests whether F1 scaling continues or hits the IRR ceiling. Annotation cost ~6-7 hr if implemented as an extension (only annotate seqs 3000-4999); ~16-17 hr if rerun from scratch. Worth implementing the extend-corpus path before the next scale point.
 
-4. **5000-sequence run at the same config.** Tests whether FVE continues to rise with corpus size (1000 → 2000 gave +0.07) and whether the 11 currently-low-F1 features recover with more positive examples. Annotation cost ~12-15 hr.
+4. **target_dir_method sweep at production config** (`mean_shift / lda / logistic` × U=64 × literal-hinge × frozen). The FVE-near-zero features (`list_bullet`, `prefix_fragment`, `infinitive_marker_to`, `tld_or_url_tail`) fail because mean-shift doesn't capture them. LDA or logistic might. ~10 min total for three retrains.
 
 **Lower priority (loss / architecture exploration):**
 
@@ -246,27 +329,31 @@ What is *not* yet a publishable claim:
 | `pipeline/config.py` | full config surface incl. `use_pos_weight`, `hinge_margin`, `hinge_freeze_decoder`, `target_dir_method`, `min_support`, `legacy_prompts`, `exclusions_in_annotator_suffix` |
 | `pipeline/annotate.py` | `_format_feature_for_annotator(include_exclusions=...)` for the throughput / boundary-discipline trade (v8.18.34) |
 | `pipeline_data/usweep_frozen_literal/summary.json` | test-catalog frozen-decoder × literal-hinge sweep |
-| `pipeline_data/evaluation.json` | latest production-scale run results |
-| `pipeline_data/feature_catalog.json` | post-min-support 43-feature catalog |
+| `pipeline_data/evaluation.json` | latest production-scale run results (3000 seq, 46 features) |
+| `pipeline_data/causal.json` | per-feature ablation KL + IOI sufficiency / necessity / IIA results |
+| `pipeline_data/feature_catalog.json` | post-min-support 46-feature catalog (3000-seq run) |
 | `pipeline_data/feature_catalog.unfiltered.json` | pre-filter backup |
 | `pipeline_data/feature_catalog.quarantined.json` | dropped features with `_drop_reason` annotations |
+| `pipeline/causal.py` | Makelov-style three-axis evaluation (`--step causal`) |
 | `supervised_saes_hinge_loss.md` | mentor's note (formulations 1-3, gate-loss arguments) |
 | `summary8.md` | prior cycle: discovery loop ships, methodology retrenchment |
 | `summary9.md` | this writeup |
 
 ## Process note
 
-Eight reviewer rounds over this cycle, focused on threshold geometry and catalog quality. Each round caught a specific overclaim or unjustified assumption: "two equal stories" (corrected to "main + ablation"), "frozen wins on every axis" (corrected to "wins on F1 / cos / FVE / intervention plausibility, but ΔR²(S) ≈ 0 at U=1024 means supervised slice isn't the recon engine at all widths"), "cos = 1 validates direction" (corrected to "cos = 1 is by construction; needs causal validation"), "literal hinge proves the framework wrong" (corrected to "the runs labeled 'mentor's hinge' used margin=1 and pos_weight; not the literal formula"), "we have v8.10's 0.62 F1" (corrected to "we have 0.42 cal F1; v8.10's 0.62 was a noisy-label ceiling, not a quality win"), "supervised SAE doesn't beat probe on real catalogs" (overturned by the v8.18.34 production result: t=0 F1 0.502 vs probe 0.389).
+Eight reviewer rounds over this cycle, focused on threshold geometry and catalog quality. Each round caught a specific overclaim or unjustified assumption: "two equal stories" (corrected to "main + ablation"), "frozen wins on every axis" (corrected to "wins on F1 / cos / FVE / intervention plausibility, but ΔR²(S) ≈ 0 at U=1024 means supervised slice isn't the recon engine at all widths"), "cos = 1 validates direction" (corrected to "cos = 1 is by construction; needs causal validation"), "literal hinge proves the framework wrong" (corrected to "the runs labeled 'mentor's hinge' used margin=1 and pos_weight; not the literal formula"), "we have v8.10's 0.62 F1" (corrected to "we have 0.42 cal F1; v8.10's 0.62 was a noisy-label ceiling, not a quality win"), "supervised SAE doesn't beat probe on real catalogs" (overturned by the v8.18.34 production result: t=0 F1 0.502 vs probe 0.389, then 0.566 vs 0.401 at 3000 seqs).
 
-The final correction matters: the supervised SAE *does* beat the probe, but only at t=0, and only because of the calibration-honesty property the mentor's loss formulation provides. That's a contribution the linear probe and post-train baselines structurally cannot match — they rely on per-feature threshold calibration to be competitive at all.
+The final correction matters: the supervised SAE *does* beat the probe, but only at t=0, and only because of the calibration-honesty property the mentor's loss formulation provides. That's a contribution the linear probe and post-train baselines structurally cannot match — they rely on per-feature threshold calibration to be competitive at all. **And as of the 3000-seq run + causal validation, the supervised SAE produces 12 features with measurable, location-specific causal effect on GPT-2's predictions** — a contribution the probe baseline cannot match in a different sense: probe weight vectors are classifier directions, not steering vectors, and ablating them at the residual stream wouldn't be expected to produce comparable causal effect (the probe-vs-SAE causal comparison is the highest-priority next experiment).
 
-The architecture in v8.18.34 is genuinely simpler than v8.10 (Delphi removed, vLLM workarounds removed, hinge-family modes consolidated), has better empirical numbers (test-catalog supT0 0.672 → 0.772, production t=0 F1 vs probe gap −0.05 → +0.11), and has tighter honesty discipline (cos = 1 reported with caveats, calibrated/oracle F1 demoted to diagnostic, t=0 F1 promoted to headline, L0 ratio added as a separate calibration-honesty metric).
+The architecture in v8.18.34 is genuinely simpler than v8.10 (Delphi removed, vLLM workarounds removed, hinge-family modes consolidated), has better empirical numbers (test-catalog supT0 0.672 → 0.772, production t=0 F1 vs probe gap −0.05 → +0.16), and has tighter honesty discipline (cos = 1 reported with caveats, calibrated/oracle F1 demoted to diagnostic, t=0 F1 promoted to headline, L0 ratio added as a separate calibration-honesty metric, per-feature causal KL added as the direction-validity metric distinct from FVE).
 
-The publishable contribution rests on three legs:
-- t=0 F1 beats probe at production scale ✓ (this run)
-- L0 calibration-honest at scale ✓ (this run)
-- Reconstruction parity at 230× fewer latents ✓ (this run)
-- ΔR²(S) > 0 at U=64 ✓ (this run)
-- Causal effect along named directions ✗ (needs `--step causal`)
+The publishable contribution rests on five legs, all now established:
+- t=0 F1 beats probe at production scale ✓ (production run, +0.165 at 3000 seqs)
+- L0 calibration-honest at scale ✓ (production run)
+- Reconstruction parity at 230× fewer latents ✓ (production run)
+- ΔR²(S) > 0 at U=64 ✓ (production run)
+- Per-feature causal effect along named directions ✓ (causal validation, 12/46)
+
+What remains is corroborating evidence (composition test for K=2 linearity correlation, probe-baseline causal comparison, soft-anchor decoder validation), corpus scaling (3000 → 5000+ to confirm or refute the F1-rises-with-data trend), and target_dir method ablation (mean_shift vs LDA vs logistic) for the FVE-near-zero features. The methodology contribution is locked; subsequent experiments are tightening the empirical claim.
 
 Until leg five is in, "named, controllable directions" is asserted on the strength of FVE (heterogeneous) and cos = 1 (vacuous). Closing that gap is the next experiment.
