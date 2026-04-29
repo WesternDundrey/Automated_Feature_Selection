@@ -12,10 +12,19 @@ Two analyses, both READ-ONLY against existing artifacts:
 
   2. Per-feature monosemy ratio (computed fresh from activations.pt +
      annotations.pt + supervised_sae.pt): for each feature k,
-        monosemy = mean(|sup_pre_k|, positive positions) /
-                   mean(|sup_pre_k|, negative positions)
+        monosemy = mean(ReLU(sup_pre_k), positive positions) /
+                   mean(ReLU(sup_pre_k), negative positions)
+     ReLU(pre_act) is the GATED ACTIVATION in hinge mode: equals 0 at
+     properly-suppressed negative positions, equals pre_act magnitude
+     at correctly-firing positive positions. Using `|pre_act|` instead
+     of ReLU would invert the sign — hinge loss with margin=0 lets the
+     encoder push pre_act arbitrarily negative at negatives without
+     penalty, so `|pre_act|` at negatives can be LARGER than at
+     positives even for a correctly trained feature. ReLU restores the
+     intended semantics: how strongly does the feature ACTIVATE here.
+
      Supervised features by construction should have monosemy >> 1
-     (BCE pushes pre-act high at positive positions, low at negative).
+     (gate fires at positive positions, ~0 at negative positions).
      Unsup SAE latents typically have monosemy 1-3 due to polysemy
      across multiple unrelated firing contexts.
 
@@ -129,9 +138,15 @@ def _per_feature_monosemy(cfg: Config) -> list[dict]:
             chunk = flat_acts[i : i + bs].to(cfg.device)
             _, sup_pre, _, _ = sae(chunk)
             # sup_pre shape: (chunk, n_supervised). Take only first n_features
-            # (catalog leaves) — matches the BCE-supervised slice.
-            sup_pre_chunks.append(sup_pre[:, : n_features].cpu())
-    sup_pre_all = torch.cat(sup_pre_chunks, dim=0).abs()  # (n_pos, n_features)
+            # (catalog leaves) — matches the BCE-supervised slice. Use ReLU
+            # to match the gated activation semantics of hinge mode (the
+            # actual feature ACTIVATION the model would see, which is 0 at
+            # properly-suppressed negatives). |sup_pre| would invert the
+            # sign of the comparison — hinge with margin=0 pushes pre_act
+            # arbitrarily negative at negatives, making |pre_act| at
+            # negatives spuriously larger than at positives.
+            sup_pre_chunks.append(sup_pre[:, : n_features].clamp(min=0).cpu())
+    sup_pre_all = torch.cat(sup_pre_chunks, dim=0)  # (n_pos, n_features)
 
     records = []
     for k, feat in enumerate(leaves[:n_features]):
@@ -167,8 +182,8 @@ def _per_feature_monosemy(cfg: Config) -> list[dict]:
             "id": feat["id"],
             "n_positive": n_p,
             "n_negative_sampled": n_n,
-            "mean_abs_pre_pos": round(mean_pos, 4),
-            "mean_abs_pre_neg": round(mean_neg, 4),
+            "mean_relu_pre_pos": round(mean_pos, 4),
+            "mean_relu_pre_neg": round(mean_neg, 4),
             "monosemy_ratio": round(ratio, 3) if ratio is not None else None,
         })
 
@@ -207,7 +222,7 @@ def run(cfg: Config = None) -> dict:
               f"catalog-quality gates curate for distinguishability, so the "
               f"redundant + subset rates are normally near-zero.")
 
-    print(f"\n  Per-feature monosemy ratio (mean |sup_pre| at pos / neg):")
+    print(f"\n  Per-feature monosemy ratio (mean ReLU(sup_pre) at pos / neg):")
     monosemy = _per_feature_monosemy(cfg)
 
     valid = [r for r in monosemy if r.get("monosemy_ratio") is not None]
