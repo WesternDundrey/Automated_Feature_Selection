@@ -119,7 +119,7 @@ def main():
                  "composition", "layer-sweep", "promote-loop", "usweep",
                  "hinge-ablation", "trim-by-kappa",
                  "audit-feature", "rewrite-catalog",
-                 "extend-corpus"],
+                 "extend-corpus", "probe-causal", "polysemy-report"],
         help="Run only this step",
     )
     parser.add_argument(
@@ -601,6 +601,34 @@ def main():
         from .extend_corpus import run as run_extend
         run_extend(cfg)
         print(f"Extend corpus completed in {time.time() - t0:.1f}s")
+
+    # Probe-vs-SAE causal asymmetry test (v8.18.38). Per-feature ablation
+    # along the linear-probe baseline's weight vectors. Predicted to show
+    # ~zero causal effect: probe weights are classifier directions, not
+    # steering vectors. Reads existing artifacts (tokens, activations,
+    # annotations, catalog); writes pipeline_data/probe_causal.json. Does
+    # NOT touch supervised_sae.pt or any other production artifact.
+    if args.step == "probe-causal":
+        print("\n" + "=" * 70)
+        print("STEP: PROBE-CAUSAL ABLATION (sup-vs-probe causal asymmetry)")
+        print("=" * 70)
+        t0 = time.time()
+        from .probe_causal import run as run_probe_causal
+        run_probe_causal(cfg)
+        print(f"Probe-causal completed in {time.time() - t0:.1f}s")
+
+    # Polysemy / monosemy diagnostic. Read-only: reads existing
+    # overlap_check.json (already produced by annotation step) plus
+    # activations.pt + annotations.pt + supervised_sae.pt to compute
+    # per-feature monosemy ratios. Writes pipeline_data/polysemy_report.json.
+    if args.step == "polysemy-report":
+        print("\n" + "=" * 70)
+        print("STEP: POLYSEMY / MONOSEMY REPORT")
+        print("=" * 70)
+        t0 = time.time()
+        from .polysemy_report import run as run_polysemy
+        run_polysemy(cfg)
+        print(f"Polysemy report completed in {time.time() - t0:.1f}s")
 
     # Step 2: Annotation
     if args.step is None or args.step == "annotate":
