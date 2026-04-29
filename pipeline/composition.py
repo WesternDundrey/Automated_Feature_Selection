@@ -39,6 +39,63 @@ from .intervention import (
 )
 
 
+def _find_causal_active_targets(
+    features: list[dict],
+    causal_results_path: Path,
+    target_count: int = 5,
+    min_kl: float = 0.01,
+    min_ratio: float = 3.0,
+) -> list[tuple[int, str]]:
+    """Pick target features by causal-active criterion from the per-feature
+    necessity test in `pipeline_data/causal.json`.
+
+    Selection rule:
+      - mean_kl (= KL_pos under ablation at active positions) >= min_kl
+      - targeting_ratio (= mean_kl / mean_kl_neg) >= min_ratio
+      - feature exists in the current catalog as a leaf
+    Sorted by mean_kl descending; top `target_count` returned.
+
+    Empty list if causal.json is missing, malformed, or no features pass.
+    Caller should fall back to the legacy heuristic in that case.
+
+    Why this beats the legacy "top by positive count" heuristic for the
+    composition test specifically: K-way joint ablation linearity is
+    only meaningfully non-zero when the individual ablations are also
+    non-zero. A test set of features where 3 of 5 have KL_pos = 0
+    (passive-token feature recoveries like whitespace runs, hashtags,
+    emoji) makes "linearity = 1 − |joint − Σindiv| / max(...)" dominated
+    by floating-point noise, and the cos↔linearity correlation becomes
+    a noise statistic. Picking causally-active features ensures the
+    K=2/K=3 joint-ablation test is run on a regime where it has signal.
+    """
+    if not causal_results_path.exists():
+        return []
+    try:
+        causal = json.loads(causal_results_path.read_text())
+    except json.JSONDecodeError:
+        return []
+
+    feat_records = (causal.get("feature_necessity") or {}).get("features") or []
+    if not feat_records:
+        return []
+
+    id_to_idx = {
+        f["id"]: i for i, f in enumerate(features)
+        if f.get("type") == "leaf"
+    }
+
+    eligible: list[dict] = []
+    for r in feat_records:
+        kl = r.get("mean_kl") or 0.0
+        ratio = r.get("targeting_ratio") or 0.0
+        fid = r.get("id")
+        if fid in id_to_idx and kl >= min_kl and ratio >= min_ratio:
+            eligible.append(r)
+
+    eligible.sort(key=lambda r: -(r.get("mean_kl") or 0.0))
+    return [(id_to_idx[r["id"]], r["id"]) for r in eligible[:target_count]]
+
+
 # ── Multi-latent ablation hooks ─────────────────────────────────────────────
 
 def _make_sup_ablate_multi_hook(sae_sup, latent_indices: Iterable[int]):
@@ -332,14 +389,38 @@ def run(cfg: Config = None):
     features = catalog["features"]
     n_features = annotations.shape[-1]
 
-    # Select target features (same heuristic as intervention.py)
-    targets = _find_target_indices(
-        features, annotations=annotations, target_count=cfg.composition_n_targets,
+    # Select target features. Causal-active first (preferred for K-way
+    # composition: features with measurable individual KL on ablation
+    # are the only ones where joint-ablation linearity has signal). Fall
+    # back to the legacy positive-count heuristic if causal.json doesn't
+    # exist yet or no features clear the KL/ratio thresholds.
+    targets = _find_causal_active_targets(
+        features,
+        causal_results_path=cfg.causal_path,
+        target_count=cfg.composition_n_targets,
     )
+    if targets:
+        print(f"  Target-feature selection: causal-active subset from "
+              f"{cfg.causal_path.name}  (mean_kl ≥ 0.01, ratio ≥ 3)")
+    else:
+        if cfg.causal_path.exists():
+            print(f"  Target-feature selection: no causal-active features "
+                  f"cleared thresholds (KL≥0.01, ratio≥3). Falling back to "
+                  f"legacy positive-count heuristic.")
+        else:
+            print(f"  Target-feature selection: {cfg.causal_path.name} not "
+                  f"found; using legacy positive-count heuristic. Run "
+                  f"--step causal first for sharper composition results.")
+        targets = _find_target_indices(
+            features, annotations=annotations,
+            target_count=cfg.composition_n_targets,
+        )
     if len(targets) < 2:
         raise RuntimeError(
             f"Need ≥2 target features for composition, got {len(targets)}. "
-            f"Check TARGET_FEATURE_HINTS in intervention.py against your catalog."
+            f"Either run --step causal first (so causal-active selection works) "
+            f"or check TARGET_FEATURE_HINTS in intervention.py against your "
+            f"catalog."
         )
     print(f"\nTarget features ({len(targets)}):")
     for idx, fid in targets:
