@@ -573,6 +573,21 @@ def main():
             print(f"\n  Flat catalog: stripped {_before - _after} group "
                   f"features, {_after} leaves remain")
 
+    # Step 1.5: Corpus extension (opt-in via --step extend-corpus).
+    # Bumps tokens.pt / activations.pt / annotations.pt from N_old to
+    # cfg.n_sequences while preserving existing labels for seqs
+    # [0, N_old) and only computing fresh tensors for [N_old, N_new).
+    # Aborts cleanly with backup restoration if the newly-tokenized
+    # head doesn't bit-match existing tokens.pt (corpus drift).
+    if args.step == "extend-corpus":
+        print("\n" + "=" * 70)
+        print(f"STEP 1.5: EXTEND CORPUS (target n_sequences={cfg.n_sequences})")
+        print("=" * 70)
+        t0 = time.time()
+        from .extend_corpus import run as run_extend
+        run_extend(cfg)
+        print(f"Extend corpus completed in {time.time() - t0:.1f}s")
+
     # Step 2: Annotation
     if args.step is None or args.step == "annotate":
         print("\n" + "=" * 70)
