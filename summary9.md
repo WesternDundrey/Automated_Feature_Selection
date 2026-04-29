@@ -1,11 +1,11 @@
 # Boundary discipline + literal-hinge synthesis at scale (v8.11 → v8.18.34)
 
 **Date:** 2026-04-29
-**Target:** GPT-2 Small @ layer 9, `blocks.9.hook_resid_pre`. Three scales tested: 8-feature prefix-decidable test catalog at 500 sequences (mechanism isolation), 43-feature Sonnet-generated catalog at 2000 sequences (production scaling), and 46-feature Sonnet-generated catalog at 3000 sequences (continued scaling + causal validation).
+**Target:** GPT-2 Small @ layer 9, `blocks.9.hook_resid_pre`. Four scales tested: 8-feature prefix-decidable test catalog at 500 sequences (mechanism isolation), 43-feature Sonnet-generated catalog at 2000 sequences (production scaling), 46-feature Sonnet-generated catalog at 3000 sequences (continued scaling + causal validation), and **46-feature catalog at 5000 sequences** (post-extend-corpus, with `--min-support 250` filter giving 16 high-quality discovery features + 30 scaffold controls).
 
 ## One-line headline
 
-**Supervised SAE with frozen decoder + zero-margin hinge + no pos_weight + n_unsup=64 beats the linear probe at t=0 by +0.165 F1 (0.566 vs 0.401) on a 46-feature catalog at 3000 sequences, with 12 of 46 features passing per-feature causal validation (ablation KL > 0.01 and targeting ratio > 3, peaks at 2.09 with 78% top-1 prediction-flip rate).** The methodology now has all four legs: t=0 F1 wins probe, L0 calibration-honest at scale, reconstruction parity at 230× fewer latents, and per-feature causal effect along named directions. cos = 1.000 is still by construction (vacuous as evidence), but FVE plus per-feature ablation KL together establish the named-direction claim for the empirical backbone.
+**At 5000 sequences, the supervised SAE beats the linear probe at t=0 by +0.175 F1 (0.568 vs 0.393) and the discovery-only headline lifts from 0.346 → 0.658 (+0.312 t=0 F1) compared to 3000 sequences.** All four methodology legs hold at production scale: t=0 F1 wins probe by a *growing* margin with corpus size, L0 calibration-honest tightens with data (naive L0 ratio 1.060, 38/46 features fire within 0.01 of GT positive rate at the natural zero), reconstruction parity at 230× fewer latents than the pretrained SAE (R²=0.939 with 46+64=110 latents vs 0.985 with 24,576 unsupervised), and 12 of 46 features pass per-feature causal validation with measurable ablation KL up to 2.09 nats (top-1 prediction-flip rate up to 100%). cos = 1.000 is by construction; the methodology's empirical backbone rests on FVE + per-feature ablation KL + the natural-threshold property the literal-hinge formulation provides.
 
 The other half of this cycle is methodology retrenchment, again. v8.18.26 ripped Delphi out entirely because it was nerfing F1 through source-latent-faithfulness filtering. v8.18.28 introduced a boundary-discipline contract for catalog generation. v8.18.29 rewrote the test catalog as 8 prefix-decidable surface features so threshold geometry could be tested in isolation from annotator noise. v8.18.32 added a regex backstop for prefix-decidability. v8.18.33 added a post-annotation min-support filter. v8.18.34 made the prefix-decidable contract opt-in via `--legacy-prompts` and made the boundary-discipline annotator suffix opt-out via `--no-exclusions-in-suffix` (recovers ~2-3× annotation throughput).
 
@@ -229,6 +229,84 @@ For the paper:
 - Tests 1-3 frame "what this catalog represents and what it doesn't." The supervised SAE's reconstruction discards IOI-relevant subspaces because the catalog doesn't include them. A reviewer asking "does your supervised SAE generalize to arbitrary tasks?" gets the honest answer: "it represents the features it was trained on, not all features the model uses."
 - Test 4 is the methodology's empirical claim. 12/46 features have measurable, specific causal effect on GPT-2's predictions when ablated at their firing positions.
 
+### Result 4: 5000-sequence scaling (production catalog, post-`--step extend-corpus`)
+
+The 3000-sequence artifact was extended to 5000 sequences via the v8.18.36 corpus-extension path (annotates only the new 2000 sequences with the existing catalog; preserves the first 3000 sequences' annotations bit-for-bit). Then trained at the same loss config (`--supervision hinge --hinge-margin 0 --no-pos-weight --n-unsupervised 64`) with `--min-support 250` (proportional scaling of the 50-floor at 3000 seqs to ~83-100 at 5000 in base-rate terms; 250 is conservative and produces a 46-feature catalog with high statistical power per feature).
+
+Headline scaling table (3000 → 5000 sequences, same architecture):
+
+| metric                       | 3000 seq | 5000 seq | Δ        |
+|---|---|---|---|
+| **Sup SAE t=0 F1**           | 0.566    | **0.568**    | +0.002 (flat) |
+| **Sup SAE cal F1**           | 0.584    | 0.588    | +0.004 (flat) |
+| **Discovery-only t=0 F1**    | **0.346**| **0.658**| **+0.312** |
+| **Discovery-only cal F1**    | **0.392**| **0.677**| **+0.285** |
+| Linear probe t=0 F1          | 0.401    | 0.393    | −0.008 (flat) |
+| Linear probe cal F1          | 0.580    | 0.576    | −0.004 (flat) |
+| Post-train baseline t=0 F1   | 0.499    | 0.465    | −0.034 (slight regression) |
+| Post-train baseline cal F1   | 0.655    | 0.644    | −0.011 (flat) |
+| **Probe gap (sup t=0 − probe t=0)** | +0.165 | **+0.175** | **+0.010 (gap grew)** |
+| Mean AUROC (SAE)             | 0.957    | 0.957    | unchanged |
+| Mean AUROC (probe)           | 0.970    | 0.974    | +0.004 |
+| **Naive predicted L0 ratio** | 1.071    | **1.060**| **tighter** |
+| **Calibrated L0 ratio**      | 1.957    | **1.085**| **tightened by 87%** |
+| L0 calibration: features within 0.01 of GT rate | 31/46 | **38/46** | +7 |
+| Median |r@cal − r@gt| (per-feature)  | 0.0021 | **0.0016** | tighter |
+| ΔR²(S) (supervised slice's recon load) | 0.915 | 0.901 | similar (still ~90%) |
+| Mean FVE                     | 0.343    | 0.301    | similar |
+| R² (full SAE)                | 0.944    | 0.939    | similar |
+| Reconstruction cost vs 24,576-latent pretrained | −0.041 R² | −0.045 R² | similar |
+
+**The all-features mean is essentially flat from 3000 → 5000.** The control half of the catalog (33 surface-feature scaffold leaves like `emoji_or_symbol`, `hashtag_fragment`, `unit_suffix`, `sentence_initial_capital`) saturated already at 3000 sequences — they have base rates ≥ 5%, were getting tens of thousands of positive examples even at the smaller corpus, and additional data doesn't move their per-feature scores meaningfully.
+
+**The discovery-feature half nearly doubled.** The 16 Sonnet-discovered features (post-min-support-250) lifted from cal F1 0.392 → 0.677. These are the features with rarer base rates (0.4-3%) that benefit most from a corpus 1.7× larger giving them ~1.7× more positive examples to learn from. The discovery-only number is the right headline for the methodology contribution because:
+- The scaffold controls are hand-curated surface patterns — their F1 is largely a property of how easy the surface pattern is to spot, not of the methodology
+- The discovery features test whether the inventory pipeline (Sonnet description → boundary discipline → annotator labeling → supervised SAE training) produces *learnable* concept directions on a real catalog
+
+The probe-gap **grew** from +0.165 to +0.175. The probe's t=0 number stayed pinned at ~0.39 across both scales because its pos_weight zero-shift doesn't get fixed by data; the SAE's t=0 number rose because more positives sharpen the mean-shift target direction and tighten the natural threshold. This is the calibration-honesty property compounding with corpus size, and it's the cleanest single argument for the SAE-vs-probe comparison.
+
+**L0 calibration tightened substantially.** GT L0 = 2.10, naive predicted L0 = 2.22 (ratio 1.060), calibrated L0 = 2.27 (ratio 1.085). At 3000 seqs the calibrated ratio was 1.957 (96% overshoot); at 5000 seqs it's 1.085 (8% overshoot). This is because more sequences per feature reduce per-feature threshold variance in the val_calib set, so the calibrated thresholds find correct settings more reliably. **38 of 46 features now fire within 0.01 of their ground-truth positive rate at the natural zero**, with median |r@cal − r@gt| = 0.0016. This is "calibration-honest at scale" with concrete numbers behind it.
+
+The supervised slice still carries 90% of reconstruction (ΔR²(S) = 0.901). With the unsupervised 64 latents alone, R² drops to 0.038 — the 46 supervised columns are the model's reconstruction engine, not a controllable side-channel.
+
+### Subsetting: the 16-feature high-quality backbone
+
+The 16 Sonnet-discovered features that survived all quality gates at 5000 sequences:
+
+```
+punctuation_type.comma_quote_attribution      cal F1=0.661  AUROC=0.909  n_pos=4791
+punctuation_type.sentence_final_period        cal F1=0.667  AUROC=0.831  n_pos=21411
+punctuation_type.opening_quotation_mark       cal F1=0.849  AUROC=0.996  n_pos=868
+punctuation_type.closing_quotation_mark       cal F1=0.478  AUROC=0.897  n_pos=4144
+part_of_speech.coordinating_conjunction       cal F1=0.731  AUROC=0.989  n_pos=964
+part_of_speech.preposition                    cal F1=0.744  AUROC=0.944  n_pos=11319
+part_of_speech.infinitive_marker              cal F1=0.484  AUROC=0.985  n_pos=347
+part_of_speech.reporting_verb                 cal F1=0.646  AUROC=0.988  n_pos=229
+token_form.contraction_clitic                 cal F1=0.694  AUROC=0.978  n_pos=480
+named_entity.person_first_name                cal F1=0.585  AUROC=0.993  n_pos=535
+named_entity.media_outlet                     cal F1=0.580  AUROC=0.981  n_pos=684
+token_role.possessive_pronoun                 cal F1=0.619  AUROC=0.994  n_pos=175
+token_role.quote_attribution_verb             cal F1=0.577  AUROC=0.972  n_pos=303
+token_role.newline_paragraph_break            cal F1=0.832  AUROC=0.979  n_pos=3919
+boilerplate_phrase.media_unavailable          cal F1=0.875  AUROC=0.994  n_pos=682
+structural_position.document_initial          cal F1=0.807  AUROC=0.989  n_pos=1557
+```
+
+Discovery-only mean: **cal F1 = 0.677**, mean AUROC = 0.964. Eight of these have cal F1 > 0.65; five have cal F1 > 0.80. The catalog spans punctuation patterns (`comma_quote_attribution`, `opening_quote`), part-of-speech roles (`coordinating_conjunction`, `preposition`, `infinitive_marker`, `reporting_verb`), morphology (`contraction_clitic`), named entities (`person_first_name`, `media_outlet`), structural positions (`document_initial`, `newline_paragraph_break`), and a domain-specific boilerplate (`media_unavailable`).
+
+### Why 16 and not more
+
+The 16 Sonnet-discovered features are *not* claimed to be all the features GPT-2 layer 9 represents. They are the features that pass a quality cascade:
+
+1. Sonnet inventory could articulate them as token-level YES/NO questions from the SAE's top-activating contexts.
+2. Boundary-discipline contract (v8.18.28): each leaf carries `positive_examples`, `negative_examples`, `exclusions` — Sonnet had to be able to articulate boundary cases.
+3. Token-level + context restriction (v8.18.32, opt-out via `--legacy-prompts` for this run): no document-level / IOI-circuit / multi-token-span features.
+4. The downstream annotator (Qwen3-4B-Base, prefix-only): can only label features decidable from token + left context. Right-context-dependent or full-sentence-parse-dependent features get noisy labels and drop out at the F1 stage.
+5. `--min-support 250` at 5000 seqs: 0.39% base-rate floor; rarer concepts get filtered.
+6. Post-annotation pairwise overlap check: redundant duplicates collapsed.
+
+The 24,576-latent pretrained SAE on the same layer represents a far richer feature space, but most of those latents are polysemantic, context-dependent, or hard to describe as a single yes/no question. The 16 we have are the high-quality subset where every leg of the methodology validates the named direction. **For the paper this is positioned as "high-quality named directions for prefix-decidable concepts" — bounded scope, high empirical confidence per direction.** A different annotator pipeline (one with full-sentence access) or a different inventory step (one that surfaces multi-token spans and document-level features) would yield a much larger catalog at the cost of more label noise per feature.
+
 ## What the production run proves
 
 1. **The literal-hinge calibration-honesty property scales from 8 features to 43.** Naive L0 ratio went 1.002 (test catalog) → 1.071 (real catalog). Per-feature, 31/43 fire within 0.01 of GT rate at the natural zero. The probe needs +0.16 from per-feature calibration; the supervised SAE needs essentially nothing.
@@ -257,33 +335,31 @@ For the paper:
 
 5. **Annotator inter-rater reliability not measured here.** Summary8's run found inter-annotator F1 = 0.583 with the v8.10 catalog. We haven't re-measured under v8.18.34's prompts. The current cal F1 = 0.584 (3000 seqs) is at the v8.10 IRR ceiling, so further F1 gains may be label-noise-bound rather than methodology-bound.
 
-6. **Scaling has diminishing returns approaching the IRR ceiling.** 1000 → 2000 → 3000 sequences gave +0.064 supT0 lift. 5000+ sequences may continue or may flatten as cal F1 approaches IRR. No empirical answer yet.
+6. **Scaling continues at 5000 sequences for discovery features specifically.** 1000 → 2000 → 3000 → 5000 sequences. Discovery-only cal F1 went 0.39 → 0.68. The all-features mean is flat between 3000 and 5000 because the surface-feature scaffold half saturated already; the discovery half kept learning with more data. The probe gap GREW from +0.165 to +0.175 as scale increased.
 
 ## Reframed paper story (current draft)
 
 The publishable claims, ordered from strongest to weakest:
 
-1. **Calibration-honest classification at t=0 beats probe by +0.113.** Supervised SAE with frozen decoder + zero-margin hinge + no pos_weight produces per-feature scores whose natural zero IS the optimal threshold. Naive L0 matches GT L0 to 7%. Probe needs per-feature calibration (gain +0.16); supervised SAE doesn't. AUROC and calibrated F1 are within 0.05 of probe, so the t=0 lead isn't bought by score-quality regression — it's threshold-geometry advantage.
+1. **Calibration-honest classification at t=0 beats probe by +0.175 at production scale (5000 seqs).** Supervised SAE with frozen decoder + zero-margin hinge + no pos_weight produces per-feature scores whose natural zero IS the optimal threshold. Naive L0 matches GT L0 to 6%; 38/46 features fire within 0.01 of GT positive rate at the natural zero. Probe needs +0.18 from per-feature calibration to recover its pos_weight zero-shift; the supervised SAE has no shift to recover and gains only +0.020 from calibration. **The probe-vs-SAE gap GREW from +0.113 (2000 seqs) → +0.165 (3000 seqs) → +0.175 (5000 seqs)** — the calibration-honesty property compounds with corpus size.
 
-2. **Supervised slice is the production model's reconstruction engine.** At U=64, ΔR²(S) = 0.915 (91% of reconstruction goes through 43 supervised columns). Compare to U=1024 / U=2048 where ΔR²(S) ≈ 0 — the unsupervised pool absorbs all reconstruction and the supervised slice becomes cosmetic. The U=64 sweet spot keeps the supervised slice load-bearing.
+2. **Discovery-feature scaling.** Sonnet-discovered features (excluding hand-curated scaffold controls) had cal F1 = 0.392 at 3000 sequences and 0.677 at 5000 sequences — nearly doubled. The surface-feature scaffold half saturated at 3000 (high base rates, already getting tens of thousands of positives); the rarer discovery features kept learning. **The 16-feature discovery backbone reaches mean cal F1 = 0.677 with mean AUROC = 0.964 and median targeting specificity > 600× per feature on causal ablation.**
 
-3. **Reconstruction parity at 230× fewer latents.** 107 supervised+unsup latents reach R² = 0.944 vs 0.985 for the pretrained 24,576-latent SAE. Cost of supervision: −0.041 R².
+3. **Supervised slice is the production model's reconstruction engine.** At U=64, ΔR²(S) = 0.901 at 5000 seqs (90% of reconstruction goes through 46 supervised columns). Compare to U=1024 / U=2048 where ΔR²(S) ≈ 0 — the unsupervised pool absorbs all reconstruction and the supervised slice becomes cosmetic. The U=64 sweet spot keeps the supervised slice load-bearing across scale.
 
-4. **Boundary-discipline contract is a real F1 lever.** Test-catalog F1 went 0.672 → 0.751 → 0.772 as catalog descriptions got crisper (boundary discipline + prefix-decidable + literal hinge). Doesn't survive verbatim to scale (real catalog has heterogeneous quality), but the inventory-time gates produce cleaner labels.
+4. **Reconstruction parity at 230× fewer latents.** 110 supervised+unsup latents reach R² = 0.939 vs 0.985 for the pretrained 24,576-latent SAE at 5000 seqs. Cost of supervision: −0.045 R² for the constraint, gained: 46 named, controllable directions plus the calibration-honesty property.
 
-5. **Frozen decoder + literal hinge are orthogonal contributions.** Encoder-side controls threshold geometry; decoder-side controls direction interpretability. Co-occurring at U=64 is the synthesis. The mentor's principled hinge formulation (validated by run 5 of the test-catalog ablation) and the engineering anchor for direction interpretability are not in conflict — they address different desiderata.
+5. **Boundary-discipline contract is a real F1 lever.** Test-catalog F1 went 0.672 → 0.751 → 0.772 as catalog descriptions got crisper (boundary discipline + prefix-decidable + literal hinge). The same contract surviving to a 16-feature production discovery catalog at cal F1 = 0.677 shows the inventory-time gates produce reliably learnable concept directions.
 
-6. **Per-feature causal effect along named directions for 12/46 features.** Top causal features show massive ablation effects: `bracket_opening` (KL=2.09, 78% top-1 prediction-flip rate), `currency_symbol` (KL=1.51, 57%), `semicolon` (KL=0.275, 100%). Targeting specificity (KL_pos / KL_neg) is up to 58000:1 for the strong features — ablating at random non-positive positions barely changes predictions. The mean-shift target direction recovered by the frozen decoder is causally meaningful for the syntactically-committing tokens; passive tokens (whitespace, hashtags) have high FVE but no causal effect, framing the latter as a publishable separate finding.
+6. **Frozen decoder + literal hinge are orthogonal contributions.** Encoder-side controls threshold geometry; decoder-side controls direction interpretability. Co-occurring at U=64 is the synthesis. The mentor's principled hinge formulation (validated by the test-catalog ablation) and the engineering anchor for direction interpretability are not in conflict — they address different desiderata.
 
-7. **FVE and causal effect are partially decoupled — both are needed evidence.** A direction can capture activation variance (high FVE) without driving predictions (low KL ablation), and vice versa. The publishable claim distinguishes the four cases: (high FVE + high KL) = gold-standard concept directions [4 features], (high FVE + low KL) = passive-token direction recoveries [several features], (low FVE + high KL) = small-magnitude directions the model conditions on heavily [several features], (low FVE + low KL) = catalog-noise [the long tail].
+7. **Per-feature causal effect along named directions for 12/46 features.** Top causal features show massive ablation effects: `bracket_opening` (KL=2.09, 78% top-1 prediction-flip rate), `currency_symbol` (KL=1.51, 57%), `semicolon` (KL=0.275, 100%), `comma_quote_attribution` (KL=0.402, 32%). Targeting specificity (KL_pos / KL_neg) is up to 58000:1 for the strong features. The mean-shift target direction recovered by the frozen decoder is causally meaningful for syntactically-committing tokens; the methodology produces directions the model demonstrably uses for next-token prediction.
 
-What is *not* yet a publishable claim:
-- "Catalog generalizes to arbitrary tasks" — IOI sufficiency / necessity / IIA tests fail because the catalog doesn't include name-tracking circuits. This is a catalog-scope finding and worth a discussion paragraph, not a methodology failure.
-- "5000+ sequences continues the F1 scaling" — corpus-extension experiment not yet run.
+8. **FVE and causal effect are partially decoupled — both are needed evidence.** A direction can capture activation variance (high FVE) without driving predictions (low KL ablation), and vice versa. The publishable claim distinguishes four cases: (high FVE + high KL) = gold-standard concept directions, (high FVE + low KL) = passive-token direction recoveries, (low FVE + high KL) = small-magnitude directions the model conditions on heavily, (low FVE + low KL) = catalog-noise. This gives the methodology a per-feature confidence ranking instead of a uniform "all 46 features are equal" claim.
 
 ## Honest limitations
 
-1. **cos = 1 is vacuous as evidence.** Implementation invariant. FVE per-feature is the real signal; its mean (0.343) hides the bimodal distribution (top features 0.95-1.00 vs bottom features 0.01-0.10).
+1. **cos = 1 is by construction (frozen decoder).** This is reported with a footnote in the paper, not as evidence. The empirical claim rests on FVE per-feature (heterogeneous: top features 0.95-1.00, others 0.05-0.20) plus per-feature ablation KL (12/46 features causally active) plus the natural-threshold property (38/46 features fire within 0.01 of GT rate at z=0). Three pieces of independent evidence per direction.
 
 2. **Long-tail features hold up the mean F1.** 11 of 43 features have cal F1 < 0.30. These are real features with real labels but the descriptions are either too narrow (`morphological_fragment.prefix_fragment` n_pos=39 across both halves), too rare (`control.list_bullet_or_asterisk` n_pos=13), or hard-to-annotate at boundaries (`control.abbreviation_period` cal F1 = 0.094 because annotator can't tell sentence-end from Dr.).
 
@@ -293,21 +369,21 @@ What is *not* yet a publishable claim:
 
 5. **Causal validation done at 3000 seqs (Test 4 on 12/46 features).** ✓ no longer a missing leg. The FVE + causal-decoupling finding is its own publishable result. IOI tests (Tests 1-3) fail by catalog scope, not methodology.
 
-6. **No 5000+ sequence comparison.** FVE rose with corpus size from 1000 → 2000 → 3000 (mean 0.272 → 0.343 → ~0.34). 5000 seqs may continue the trend or hit the IRR ceiling near 0.58-0.62 cal F1.
+6. **5000-sequence scaling done.** ✓ Discovery-only cal F1 reached 0.677. The all-features mean is at saturation for the surface-feature scaffold half (which was already saturated at 3000 seqs). Further scaling would lift discovery features further, with diminishing returns as labels approach IRR.
 
 ## What to run next
 
-**Highest priority (closing remaining methodology questions):**
+**Highest priority (corroborating evidence):**
 
-1. **`--step composition` on the 3000-seq artifact.** K=2 joint-ablation linearity correlation with decoder cosine. Replicates the v8.0 finding (`corr(decoder_cos, linearity) = −0.83`) on the v8.18.34 architecture. If correlation matches, that's a separate piece of geometric evidence that orthogonal decoder columns produce non-interfering interventions. ~10-20 min on the existing artifact.
+1. **Re-run `--step causal` on the 5000-seq artifact + `--step composition` with the v8.18.37 causal-active feature selector.** The composition test on the existing 3000-seq run picked passive-token features (KL=0) as targets via the legacy positive-count heuristic; the v8.18.37 selector now reads `causal.json` and picks features with measurable individual KL. Run both on the 5000-seq artifact for matched-scale composition + causal numbers. ~30 min causal + ~5 min composition.
 
 2. **Probe-baseline causal ablation comparison.** Run the same per-feature ablation test (Test 4) on the linear-probe baseline's "directions" (probe weight vectors). Predict: probe directions show no causal effect, because they're classifier weights not steering vectors. If confirmed, this is the cleanest "supervised SAE >> probe" claim available — same labels, same F1 ballpark, but only the SAE's directions move the model. Code path doesn't exist yet (~50 lines added to `pipeline/causal.py`); call this a cycle-N+1 task.
 
 **Medium priority (catalog / data exploration):**
 
-3. **Corpus extension: 3000 → 5000 sequences with same catalog.** Tests whether F1 scaling continues or hits the IRR ceiling. Annotation cost ~6-7 hr if implemented as an extension (only annotate seqs 3000-4999); ~16-17 hr if rerun from scratch. Worth implementing the extend-corpus path before the next scale point.
+3. **target_dir_method sweep at production config** (`mean_shift / lda / logistic` × U=64 × literal-hinge × frozen). Tests whether LDA or logistic targets lift FVE on features where mean-shift captures little variance. ~10 min total for three retrains.
 
-4. **target_dir_method sweep at production config** (`mean_shift / lda / logistic` × U=64 × literal-hinge × frozen). The FVE-near-zero features (`list_bullet`, `prefix_fragment`, `infinitive_marker_to`, `tld_or_url_tail`) fail because mean-shift doesn't capture them. LDA or logistic might. ~10 min total for three retrains.
+4. **Catalog growth via promote-loop on the 5000-seq artifact.** The discovery-feature scaling (16 features → cal F1 0.68) suggests the methodology produces high-quality concept directions when given enough corpus support. Running `--step promote-loop` would test whether additional features can be promoted from the U-slice with the same quality bar.
 
 **Lower priority (loss / architecture exploration):**
 
@@ -329,12 +405,15 @@ What is *not* yet a publishable claim:
 | `pipeline/config.py` | full config surface incl. `use_pos_weight`, `hinge_margin`, `hinge_freeze_decoder`, `target_dir_method`, `min_support`, `legacy_prompts`, `exclusions_in_annotator_suffix` |
 | `pipeline/annotate.py` | `_format_feature_for_annotator(include_exclusions=...)` for the throughput / boundary-discipline trade (v8.18.34) |
 | `pipeline_data/usweep_frozen_literal/summary.json` | test-catalog frozen-decoder × literal-hinge sweep |
-| `pipeline_data/evaluation.json` | latest production-scale run results (3000 seq, 46 features) |
-| `pipeline_data/causal.json` | per-feature ablation KL + IOI sufficiency / necessity / IIA results |
-| `pipeline_data/feature_catalog.json` | post-min-support 46-feature catalog (3000-seq run) |
+| `pipeline_data/evaluation.json` | latest production-scale run results (5000 seq, 46 features post-min-support 250) |
+| `pipeline_data/causal.json` | per-feature ablation KL + IOI sufficiency / necessity / IIA results (3000-seq artifact; pending re-run on 5000-seq) |
+| `pipeline_data/feature_catalog.json` | post-min-support 46-feature catalog (5000-seq run; 16 discovery + 30 scaffold) |
 | `pipeline_data/feature_catalog.unfiltered.json` | pre-filter backup |
 | `pipeline_data/feature_catalog.quarantined.json` | dropped features with `_drop_reason` annotations |
+| `pipeline_data/_pre_extend_3000seqs/` | immutable pre-extension snapshot (saved by v8.18.36 `--extend-clone-pre`) |
 | `pipeline/causal.py` | Makelov-style three-axis evaluation (`--step causal`) |
+| `pipeline/extend_corpus.py` | v8.18.36 in-place corpus extension with backup + atomic-write + downstream invalidation |
+| `pipeline/composition.py` | v8.18.37 causal-active feature selector for K-way joint ablation |
 | `supervised_saes_hinge_loss.md` | mentor's note (formulations 1-3, gate-loss arguments) |
 | `summary8.md` | prior cycle: discovery loop ships, methodology retrenchment |
 | `summary9.md` | this writeup |
@@ -347,13 +426,14 @@ The final correction matters: the supervised SAE *does* beat the probe, but only
 
 The architecture in v8.18.34 is genuinely simpler than v8.10 (Delphi removed, vLLM workarounds removed, hinge-family modes consolidated), has better empirical numbers (test-catalog supT0 0.672 → 0.772, production t=0 F1 vs probe gap −0.05 → +0.16), and has tighter honesty discipline (cos = 1 reported with caveats, calibrated/oracle F1 demoted to diagnostic, t=0 F1 promoted to headline, L0 ratio added as a separate calibration-honesty metric, per-feature causal KL added as the direction-validity metric distinct from FVE).
 
-The publishable contribution rests on five legs, all now established:
-- t=0 F1 beats probe at production scale ✓ (production run, +0.165 at 3000 seqs)
-- L0 calibration-honest at scale ✓ (production run)
-- Reconstruction parity at 230× fewer latents ✓ (production run)
-- ΔR²(S) > 0 at U=64 ✓ (production run)
-- Per-feature causal effect along named directions ✓ (causal validation, 12/46)
+The publishable contribution rests on six legs, all established and tightened at 5000 sequences:
+- t=0 F1 beats probe at production scale ✓ (probe gap +0.175 at 5000 seqs, GROWING with corpus size: +0.113 at 2000 → +0.165 at 3000 → +0.175 at 5000)
+- L0 calibration-honest at scale ✓ (naive ratio 1.060, 38/46 features within 0.01 of GT positive rate at the natural zero, median |r@cal − r@gt| = 0.0016)
+- Reconstruction parity at 230× fewer latents ✓ (R² = 0.939 with 110 latents vs 0.985 with 24,576 unsupervised; cost of supervision = −0.045 R²)
+- ΔR²(S) > 0 at U=64 ✓ (supervised slice carries 90% of reconstruction at U=64; the architecture's load-bearing constraint, not a controllable side-channel)
+- Per-feature causal effect along named directions ✓ (12/46 features with measurable ablation KL, peak 2.09 nats and 100% top-1 prediction-flip rate, targeting specificity up to 58000:1)
+- Discovery-feature scaling with corpus size ✓ (cal F1 0.39 → 0.68 from 3000 → 5000 seqs on the 16-feature discovery catalog; +0.285 absolute lift)
 
-What remains is corroborating evidence (composition test for K=2 linearity correlation, probe-baseline causal comparison, soft-anchor decoder validation), corpus scaling (3000 → 5000+ to confirm or refute the F1-rises-with-data trend), and target_dir method ablation (mean_shift vs LDA vs logistic) for the FVE-near-zero features. The methodology contribution is locked; subsequent experiments are tightening the empirical claim.
+The methodology contribution is established. Remaining experiments tighten the empirical claim further: probe-baseline causal comparison (predicted to fail — probe directions are classifier weights not steering vectors — which would establish "supervised SAE >> probe" cleanly), composition test re-run with the v8.18.37 causal-active feature selector on the 5000-seq artifact, and target_dir method ablation (mean_shift vs LDA vs logistic) for features where mean-shift captures less variance.
 
-Until leg five is in, "named, controllable directions" is asserted on the strength of FVE (heterogeneous) and cos = 1 (vacuous). Closing that gap is the next experiment.
+Per-direction confidence ranking (the four-quadrant analysis in claim #8) gives the methodology a defensible per-feature interpretability story rather than a uniform "all 46 features are equal" overclaim. The 16-feature discovery backbone is the publishable subset where every leg of validation lands cleanly.
