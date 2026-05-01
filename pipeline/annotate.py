@@ -1405,32 +1405,18 @@ torch.save(annotations, {str(shard_out)!r})
             # throughput cost vs out-of-process; far better than
             # hanging. setdefault lets the user opt back in.
             env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-            # v8.19.8 readability: disable tqdm progress bars in shards.
-            # Two shards' tqdm bars overwriting each other on the same
-            # tty cause visual flicker. Explicit `rate=X/s ETA=Yh`
-            # prints (one full line per chunk) survive — those are
-            # useful and don't redraw in place.
-            env["TQDM_DISABLE"] = "1"
+            # v8.19.8: do NOT set TQDM_DISABLE=1 here. vLLM 0.20.0's
+            # _run_engine reads pbar.format_dict["elapsed"] to compute
+            # input throughput; when tqdm is disabled, elapsed=0 and
+            # vLLM crashes with ZeroDivisionError. Keep tqdm on; user
+            # accepts visual interleaving in exchange for live progress.
 
-            # v8.19.8: redirect each shard's stdout/stderr to a
-            # per-shard log file. Two shards both writing to
-            # sys.stdout caused the GPU-alternation pattern observed
-            # in nvidia-smi dmon — one shard would block on the pipe
-            # while the other wrote, leaving its GPU idle. Per-shard
-            # log files (in cfg.output_dir for visibility) eliminate
-            # the contention. tail -f any one to follow progress.
-            shard_log_path = (
-                Path(cfg.output_dir) / f"annotate_shard_{gpu_idx}.log"
-            )
-            shard_log_path.parent.mkdir(parents=True, exist_ok=True)
-            shard_log_handle = open(shard_log_path, "w", buffering=1)
-            print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx} → "
-                  f"log: {shard_log_path}")
+            print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx}...")
             proc = subprocess.Popen(
                 [sys.executable, "-c", script],
                 env=env,
-                stdout=shard_log_handle,
-                stderr=subprocess.STDOUT,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
             )
             procs.append(proc)
             out_paths.append(shard_out)
