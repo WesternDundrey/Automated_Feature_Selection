@@ -36,3 +36,8 @@ Thumbs.db
 circuit-tracer/
 agentic-delphi/
 agentic-delphi-correct/
+agentic-delphi.legacy_*/
+delphi/
+
+# Pilot sandbox (separate from production pipeline_data/)
+pipeline_data_pilot/

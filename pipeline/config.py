@@ -27,11 +27,16 @@ class Config:
 
     # ── Feature selection from pretrained SAE ────────────────────────
     n_latents_to_explain: int = 500
-    # v8.18.26: Delphi removed. top_k_examples retained at 30 — Sonnet
-    # benefits from seeing more activating contexts when writing the
-    # description, even without a held-out scorer to reserve some for.
-    top_k_examples: int = 30
-    n_tokens_for_activation_collection: int = 2_000_000
+    # v8.19.0: bumped 30→50 for Opus 4.7 1M-context (more activating
+    # contexts per latent strengthens descriptions). v8.18.26 raised this
+    # from 20→30 when Delphi was removed; v8.19 raises again now that
+    # Opus 4.7 replaces Sonnet for the sup-arm catalog design pass.
+    top_k_examples: int = 50
+    # v8.19.0: 2M→3M to give shortlist_latents stable freq + concentration
+    # estimates over the 24576 gpt2-small-res-jb latents (Engels-style
+    # dense-latent detection threshold needs ≥3M for ±0.01 freq precision
+    # at the 0.10 cutoff).
+    n_tokens_for_activation_collection: int = 3_000_000
     activation_collection_batch_size: int = 8
     activation_collection_seq_len: int = 128
     min_firing_rate: float = 0.0005
@@ -41,7 +46,9 @@ class Config:
     explanation_model: str = "anthropic/claude-sonnet-4.6"
     organization_model: str = "anthropic/claude-sonnet-4.6"
     annotation_model: str = "anthropic/claude-haiku-4.5"
-    features_per_explanation_batch: int = 10
+    # v8.19.0: 10→30 for Opus 4.7 1M context (used by opus_catalog.py
+    # design pass; legacy Sonnet inventory still uses 10 via local override).
+    features_per_explanation_batch: int = 30
     features_per_annotation_call: int = 50
     max_annotation_concurrency: int = 20
 
@@ -72,7 +79,10 @@ class Config:
     # do (no parent-child relations), so lambda_hier is auto-zeroed at
     # train time when flatten_catalog=True. Pass --keep-groups to opt out.
     flatten_catalog: bool = True
-    warmup_steps: int = 500
+    # v8.19.0: 500→700 for the 300-feature catalog at 5K seqs (~15K total
+    # steps; 5% warmup matches summary8/9 production runs). For pilot
+    # (500 seqs × 80 features) the trainer auto-scales warmup to 100.
+    warmup_steps: int = 700
     train_fraction: float = 0.8
     seed: int = 42
     n_lista_steps: int = 0  # LISTA refinement iterations (0 = disabled)
@@ -364,6 +374,49 @@ class Config:
 
     # ── Manual catalog (skips inventory step) ────────────────────
     manual_catalog: str = ""  # path to JSON catalog; empty = use inventory
+
+    # ── v8.19 Delphi-vs-Opus comparison architecture ─────────────
+    # Symmetric Type-1 native-pipeline F1 head-to-head:
+    #   sup arm:   Opus 4.7 designs N features → annotate → train supSAE
+    #              → F1(supSAE feature firing vs labels(Opus desc))
+    #   unsup arm: real EleutherAI Delphi describes N latents 1:1
+    #              → annotate → F1(unsup latent firing vs labels(Delphi desc))
+    # Both arms consume the same shortlist of candidate latents from
+    # gpt2-small-res-jb (selection-freedom asymmetry IS the methodology).
+    shortlist_size: int = 1000
+    delphi_n_features: int = 300
+    opus_n_features: int = 300
+    # Opus 4.7 OpenRouter model id. Verify exact slug at first call;
+    # update if Anthropic re-tags. 1M context variant required so Opus can
+    # ingest top contexts of 1000 latents in a single design pass.
+    opus_explanation_model: str = "anthropic/claude-opus-4.7"
+    # Real EleutherAI Delphi: explainer/scorer model on OpenRouter. Sonnet
+    # 4.6 is cost-bounded for 300 latents (~$10 vs ~$200 for Opus). Switch
+    # to Opus only if ablation shows Sonnet's descriptions limit unsup F1.
+    delphi_explainer_model: str = "anthropic/claude-sonnet-4.6"
+    delphi_explainer_provider: str = "openrouter"
+    delphi_scorer: str = "detection"   # "detection", "fuzz", or both
+    delphi_run_dir: str = "pipeline_data/delphi_run"
+    # Pre-Delphi/Opus latent shortlist: candidate-pool selection from the
+    # 24576-latent gpt2-small-res-jb. Frequency window keeps us in the
+    # describable middle of the distribution; concentration filters out
+    # polysemy-noise latents whose top-K contexts look random.
+    shortlist_freq_min: float = 0.0005   # drop dead latents
+    shortlist_freq_max: float = 0.10     # drop ultra-dense (Engels territory)
+    shortlist_concentration_topk: int = 1000  # contexts per latent for entropy
+    shortlist_calibration_tokens: int = 3_000_000
+    # 4-GPU annotation shard: one CUDA-isolated subprocess per GPU.
+    n_annotation_shards: int = 4
+    # Pilot gate (HARD requirement before full 38hr run):
+    pilot_n_sequences: int = 500
+    pilot_opus_n_features: int = 50
+    pilot_delphi_n_features: int = 30
+    # Per-catalog inter-rater reliability sample size (double-annotated).
+    irr_sample_size: int = 30
+    # Project-out preprocessing (Engels dense latents). PARKED for now;
+    # separate ablation, not headline. Detector threshold matches Engels.
+    project_out_dense: bool = False
+    dense_freq_threshold: float = 0.10
 
     # ── Output ──────────────────────────────────────────────────────
     output_dir: str = "pipeline_data"

@@ -119,7 +119,9 @@ def main():
                  "composition", "layer-sweep", "promote-loop", "usweep",
                  "hinge-ablation", "trim-by-kappa",
                  "audit-feature", "rewrite-catalog",
-                 "extend-corpus", "probe-causal", "polysemy-report"],
+                 "extend-corpus", "probe-causal", "polysemy-report",
+                 "shortlist", "delphi-run", "opus-catalog",
+                 "pilot", "irr", "oracle-unsup"],
         help="Run only this step",
     )
     parser.add_argument(
@@ -629,6 +631,68 @@ def main():
         from .polysemy_report import run as run_polysemy
         run_polysemy(cfg)
         print(f"Polysemy report completed in {time.time() - t0:.1f}s")
+
+    # ── v8.19.0 Delphi-vs-Opus comparison architecture ──────────
+    # Symmetric Type-1 native-pipeline F1 head-to-head. Each step is
+    # independently runnable; full sequence is shortlist → delphi-run +
+    # opus-catalog (parallel) → annotate (both catalogs) → train (sup
+    # arm) → evaluate → oracle-unsup (Type 2 appendix).
+    if args.step == "shortlist":
+        print("\n" + "=" * 70)
+        print("STEP: SHORTLIST  (top-N candidates from gpt2-small-res-jb)")
+        print("=" * 70)
+        t0 = time.time()
+        from .shortlist_latents import run as run_shortlist
+        run_shortlist(cfg)
+        print(f"Shortlist completed in {time.time() - t0:.1f}s")
+
+    if args.step == "delphi-run":
+        print("\n" + "=" * 70)
+        print(f"STEP: DELPHI-RUN  (real EleutherAI Delphi on "
+              f"{cfg.delphi_n_features} latents)")
+        print("=" * 70)
+        t0 = time.time()
+        from .delphi_runner import run as run_delphi
+        run_delphi(cfg)
+        print(f"Delphi run completed in {time.time() - t0:.1f}s")
+
+    if args.step == "opus-catalog":
+        print("\n" + "=" * 70)
+        print(f"STEP: OPUS-CATALOG  (Opus 4.7 designs "
+              f"{cfg.opus_n_features} features)")
+        print("=" * 70)
+        t0 = time.time()
+        from .opus_catalog import run as run_opus
+        run_opus(cfg)
+        print(f"Opus catalog completed in {time.time() - t0:.1f}s")
+
+    if args.step == "pilot":
+        print("\n" + "=" * 70)
+        print("STEP: PILOT  (go/no-go gate before 38hr full run)")
+        print("=" * 70)
+        t0 = time.time()
+        from .pilot import run as run_pilot
+        run_pilot(cfg)
+        print(f"Pilot completed in {time.time() - t0:.1f}s")
+
+    if args.step == "irr":
+        print("\n" + "=" * 70)
+        print("STEP: IRR  (per-catalog inter-rater reliability)")
+        print("=" * 70)
+        t0 = time.time()
+        from .irr import run as run_irr
+        run_irr(cfg)
+        print(f"IRR completed in {time.time() - t0:.1f}s")
+
+    if args.step == "oracle-unsup":
+        print("\n" + "=" * 70)
+        print("STEP: ORACLE-UNSUP  (Type-2 appendix: best unsup latent "
+              "vs Opus labels)")
+        print("=" * 70)
+        t0 = time.time()
+        from .oracle_unsup import run as run_oracle
+        run_oracle(cfg)
+        print(f"Oracle-unsup completed in {time.time() - t0:.1f}s")
 
     # Step 2: Annotation
     if args.step is None or args.step == "annotate":

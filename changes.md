@@ -4,6 +4,148 @@
 
 ---
 
+## [v8.19.0] — Symmetric Delphi-vs-Opus 4.7 F1 head-to-head architecture
+
+User-locked plan (2026-05-01): publishable F1 comparison between
+unsupervised SAE auto-interp (real EleutherAI Delphi) and supervised
+SAE label-fidelity (Opus-4.7-designed catalog). Each method runs its
+NATIVE pipeline against its OWN catalog descriptions; F1 measures
+description-faithfulness on held-out tokens. Type-2 same-catalog
+appendix added for reviewer-bulletproof rigor.
+
+### What landed
+
+* `delphi/` — fresh upstream EleutherAI/delphi v0.1.3 cloned from
+  github.com/EleutherAI/delphi (replaces 7-month-old `agentic-delphi/`,
+  preserved as `agentic-delphi.legacy_2025-10-08`). Verified API
+  compatibility: only diffs are additive (`fuzz_type`, `random` init,
+  `max_memory` default 0.9→0.7) and don't affect our wrapper since we
+  use detection scorer.
+* `pipeline/shortlist_latents.py` — picks `cfg.shortlist_size` (1000
+  default) candidate latents from gpt2-small-res-jb by frequency
+  window [0.0005, 0.10] + ranked by descending firing rate. Output:
+  `pipeline_data/latent_shortlist.json`. Shared input to BOTH arms.
+* `pipeline/delphi_runner.py` — subprocess wrapper around real Delphi.
+  Inline invoker script imports delphi internals
+  (`process_cache`, `populate_cache`, `load_artifacts`) and calls them
+  with `latent_range = torch.tensor(shortlist[:N])` so we explain
+  ARBITRARY indices (CLI's `--max_latents` only supports first N).
+  Subprocess passes config via env vars (no quoting hell). Output:
+  `pipeline_data/delphi_catalog.json` with delphi-mode features
+  exempt from boundary-discipline contract.
+* `pipeline/opus_catalog.py` — Opus 4.7 (1M context) inspects all
+  `cfg.shortlist_size` shortlist latents (top contexts from
+  `inventory.collect_top_activations`) and designs
+  `cfg.opus_n_features` (300 default) features with the full
+  prefix-decidable + boundary-discipline contract. Symmetry-completing
+  families enforced (colors, days, months, digits, directions,
+  comparatives, pronoun grids, punctuation, quantifiers, modal verbs).
+  Selection-freedom asymmetry vs Delphi (which describes 1:1) IS the
+  methodology; not normalized away. Output:
+  `pipeline_data/opus_catalog.json`.
+* `pipeline/pilot.py` — HARD go/no-go gate. End-to-end mini-run at 500
+  seqs × 50 Opus + 30 Delphi features. Validates throughput, training
+  stability, F1 directionality. Aborts the full 38hr commitment if
+  annotation throughput < 200 dec/sec/GPU OR supSAE F1 ≤ unsup-latent
+  F1 OR any stage fails. Sandboxed in `pipeline_data_pilot/` so
+  production artifacts stay untouched. ~2 hr wall-clock.
+* `pipeline/irr.py` — per-catalog inter-rater reliability. Samples 30
+  features per catalog, double-annotates with two annotator seeds,
+  reports Cohen's kappa + agreement-F1 per catalog. F1 numbers in the
+  paper get reported as "Δ above respective IRR ceilings" so the
+  Opus-vs-Delphi comparison can't be entirely a label-noise effect.
+* `pipeline/oracle_unsup.py` — Type-2 appendix. For each Opus feature,
+  searches all 24576 unsup latents for the one with maximum F1 vs
+  Opus labels on val. Reuses Opus annotation labels (no extra cost).
+  Reviewer-bulletproof same-catalog comparison: "even with oracle-best
+  unsup-latent matching, supSAE outperforms unsup readout."
+* `pipeline/run.py` — wired six new `--step` choices: `shortlist`,
+  `delphi-run`, `opus-catalog`, `pilot`, `irr`, `oracle-unsup`.
+
+### Existing infrastructure reused
+
+* `annotate.py:_annotate_local_parallel` already does CUDA_VISIBLE_DEVICES
+  subprocess sharding across N GPUs with per-shard partial checkpoints.
+  Activated when `cfg.n_annotation_gpus >= 2`. No new shard wrapper
+  needed.
+* `inventory.collect_top_activations` reused by `opus_catalog` for the
+  design pass.
+* `catalog_quality.filter_by_min_support` + boundary-discipline gate
+  filter Opus features post-annotation; Delphi-mode features exempt
+  via `delphi_mode: True` tag (catalog_quality already supports this
+  shape via `_is_boundary_discipline_exempt`).
+
+### Config scalars (locked)
+
+* `shortlist_size: 1000` — Delphi describes top 300 1:1; Opus inspects
+  all 1000 for design freedom.
+* `delphi_n_features: 300` / `opus_n_features: 300` — symmetric counts
+  per user 2026-05-01.
+* `pilot_n_sequences: 500`, `pilot_opus_n_features: 50`,
+  `pilot_delphi_n_features: 30`.
+* `irr_sample_size: 30` per catalog.
+* `n_annotation_shards: 4` (matches user's 4-GPU rig).
+* `delphi_explainer_model: "anthropic/claude-sonnet-4.6"` via
+  OpenRouter (Sonnet bounded at ~$10 vs Opus ~$200 for 300 latents).
+* `opus_explanation_model: "anthropic/claude-opus-4.7"` for the
+  catalog design pass (verify exact OpenRouter slug at first call).
+* `n_tokens_for_activation_collection: 2_000_000 → 3_000_000` for
+  stable freq + concentration over 24576 latents.
+* `warmup_steps: 500 → 700` for the 300-feature catalog at 5K seqs
+  (~15K total steps; 5% warmup matches summary8/9 production).
+* `top_k_examples: 30 → 50`, `features_per_explanation_batch: 10 → 30`
+  for Opus 4.7's 1M context window.
+
+### Cost & wall-clock estimates
+
+* Delphi (Sonnet 4.6, 300 latents, detection scorer only): ~$10 API
+* Opus 4.7 (1000 latents inspected, 300 features designed): ~$15 API
+* IRR (60 samples × 2 passes): ~$5 API
+* Total API: ~$30 (under user's $30 budget)
+* Annotation: 5K × 128 × 600 = 384M decisions; 700 dec/sec/GPU × 4 GPUs
+  → ~38 hr wall-clock on 4090s; ~11 hr on H100s.
+* Pilot: ~2 hr wall-clock.
+* SupSAE training (300-feature catalog): ~6-8 hr.
+
+### Honest paper framing (locked)
+
+* Headline (Type 1, native pipelines): "Trained supervised features
+  achieve higher cross-context label-fidelity than post-hoc Delphi
+  auto-interp on the same model's residual stream."
+* Appendix (Type 2, same catalog): "Even with oracle-best unsup-latent
+  matching, supSAE features outperform unsup readout on the
+  Opus-designed catalog."
+* Per-catalog IRR ceiling reported alongside F1 (Δ-relative claims).
+* Selection-freedom asymmetry stated, not normalized away.
+* Pretrained unsup SAE has more training data than supSAE — favorable
+  to unsup; supSAE win survives this asymmetry.
+* Do NOT claim "supSAE makes better features." Claim "supSAE achieves
+  better description fidelity."
+
+### Pre-flight checklist before full run
+
+1. `cd delphi && uv pip install -e .` (already cloned at v0.1.3)
+2. `export OPENROUTER_API_KEY=...`
+3. `python -m pipeline.run --step shortlist`
+4. `python -m pipeline.run --step delphi-run` (validates Delphi wrapper)
+5. `python -m pipeline.run --step opus-catalog` (validates Opus model id)
+6. `python -m pipeline.run --step pilot` ← HARD gate; must pass
+7. Only on pilot pass: `python -m pipeline.run --step annotate --train --evaluate`
+   on the merged 600-feature catalog at 5K seqs
+8. `python -m pipeline.run --step oracle-unsup` (free Type-2 appendix)
+9. `python -m pipeline.run --step irr` (small extra annotation cost)
+
+### Parked (not in this version)
+
+* Project-out preprocessing (Engels dense latents) — separate ablation,
+  not headline.
+* Synthetic-label position / entropy regulator features.
+* Antipodal signed-latent support.
+* 10K-sequence scale-up — deferred until 5K result lands.
+* Causal re-run on 5K + U=256 — deferred per user 2026-04-30.
+
+---
+
 ## [v8.18] — Delphi covers FINAL leaves; flat catalog default; token highlighting; mid-tier examples; visibility
 
 **Date:** 2026-04-26
