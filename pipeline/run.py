@@ -121,6 +121,7 @@ def main():
                  "audit-feature", "rewrite-catalog",
                  "extend-corpus", "probe-causal", "polysemy-report",
                  "shortlist", "delphi-run", "opus-catalog",
+                 "merge-catalogs",
                  "pilot", "irr", "oracle-unsup"],
         help="Run only this step",
     )
@@ -665,6 +666,15 @@ def main():
         from .opus_catalog import run as run_opus
         run_opus(cfg)
         print(f"Opus catalog completed in {time.time() - t0:.1f}s")
+
+    if args.step == "merge-catalogs":
+        print("\n" + "=" * 70)
+        print("STEP: MERGE-CATALOGS  (Opus + Delphi → feature_catalog.json)")
+        print("=" * 70)
+        t0 = time.time()
+        from .merge_catalogs import run as run_merge
+        run_merge(cfg)
+        print(f"Merge catalogs completed in {time.time() - t0:.1f}s")
 
     if args.step == "pilot":
         print("\n" + "=" * 70)

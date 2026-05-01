@@ -9,16 +9,21 @@ SHARED input to both arms of the Delphi-vs-Opus comparison:
   • Opus arm: inspects all `cfg.shortlist_size` latents and designs
     `cfg.opus_n_features` features with full design freedom.
 
-Selection: frequency window [shortlist_freq_min, shortlist_freq_max]
-filters out dead latents and ultra-dense latents (Engels project-out
-territory). Within the window, rank by descending firing rate — more
-active = easier to describe with stable top-context statistics.
+CURRENT IMPLEMENTATION: frequency-window filter only. Drops dead
+latents (freq < shortlist_freq_min) and ultra-dense latents (freq >
+shortlist_freq_max, Engels project-out territory). Within the window,
+ranks by DESCENDING firing rate — most-active first, on the assumption
+that more-firing latents have more stable top-context statistics for
+both arms.
 
-The frequency window is the only filter applied here. A more
-sophisticated activation-concentration score (kurtosis / top-K vs
-median ratio) would require a forward pass we already do later in
-`opus_catalog.collect_contexts`; not worth duplicating compute for the
-candidate pool.
+LIMITATION: a true "activation concentration" score (kurtosis, top-K
+mean / median, or entropy of the top-1000 contexts) would better
+filter polysemantic-noise latents whose top contexts look random.
+That requires a forward pass we don't currently perform here. Could
+be added by piggy-backing on inventory.collect_top_activations after
+shortlist runs (compute concentration over the candidate set, re-rank,
+re-save). Treated as follow-up; the frequency-rank shortlist is
+adequate for the Delphi-vs-Opus headline experiment.
 
 Output: pipeline_data/latent_shortlist.json — read by both arms.
 """

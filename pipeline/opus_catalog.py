@@ -137,7 +137,12 @@ def _build_design_prompt(top_activations: dict, tokenizer, cfg: Config) -> str:
         SOURCE TRACE — every leaf needs `source_latents`: list of integer
         latent IDs from the shortlist whose contexts grounded this leaf.
         For symmetry-completing features that have no direct latent
-        grounding, use `source_latents: []` and add `source: "symmetry"`.
+        grounding, use `source_latents: []` and add
+        `source_kind: "symmetry"` (the catalog_quality validator
+        recognizes this kind and exempts the leaf from the
+        source_latents check, but boundary-discipline still applies —
+        all leaves need positive_examples / negative_examples /
+        exclusions).
 
         OUTPUT — reply with ONLY this JSON, no other text:
         {{
@@ -235,6 +240,42 @@ def run(cfg: Config = None) -> dict:
     n_leaves = sum(1 for f in catalog["features"] if f.get("type") == "leaf")
     print(f"\n  Designed: {n_groups} groups, {n_leaves} leaves "
           f"(target {cfg.opus_n_features})")
+
+    # v8.19.0: validate Opus catalog through catalog_quality (lexical
+    # hard-fail + boundary-discipline). Symmetry-completing leaves with
+    # source_kind="symmetry" are exempted from the source_latents check
+    # (no 1:1 unsup latent grounding) but still need positive_examples /
+    # negative_examples / exclusions. Quarantined features are written
+    # to a sidecar for audit and dropped from the saved catalog.
+    try:
+        from .catalog_quality import apply_catalog_gates, write_quality_report
+        filtered, quarantined, records = apply_catalog_gates(
+            catalog, cfg=cfg,
+            mode=cfg.catalog_gate_mode,
+            use_llm_crispness=cfg.catalog_gate_use_llm,
+        )
+        n_kept = sum(1 for f in filtered["features"] if f.get("type") == "leaf")
+        n_quar = sum(
+            1 for f in quarantined["features"] if f.get("type") == "leaf"
+        )
+        print(f"  catalog_quality: {n_kept} kept, {n_quar} quarantined "
+              f"(mode={cfg.catalog_gate_mode!r})")
+        catalog = filtered
+        # Save the quarantined sidecar for audit.
+        quar_path = cfg.output_dir / "opus_catalog.quarantined.json"
+        quar_path.write_text(json.dumps(quarantined, indent=2))
+        try:
+            write_quality_report(
+                records,
+                cfg.output_dir / "opus_catalog_quality_report.json",
+                mode=cfg.catalog_gate_mode,
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        # Don't crash the run; emit a warning. The merge step + min-support
+        # filter will catch grossly bad leaves.
+        print(f"  WARNING: catalog_quality validation skipped: {e}")
 
     out_path = cfg.output_dir / "opus_catalog.json"
     out_path.write_text(json.dumps(catalog, indent=2))

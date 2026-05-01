@@ -155,7 +155,26 @@ def _word_count(description: str) -> int:
 
 
 _SOURCE_LATENTS_EXEMPT_ROLES = {"control"}
-_SOURCE_LATENTS_EXEMPT_KINDS = {"scaffold", "manual", "decomposed_atom"}
+# v8.19.0: extended for the Delphi-vs-Opus comparison architecture.
+#   "symmetry": Opus 4.7 designs symmetry-completing leaves (colors,
+#               days, months, digits, etc.) that have no 1:1 unsup
+#               latent grounding (source_latents=[]). Boundary-
+#               discipline (positive/negative_examples, exclusions)
+#               STILL applies — Opus emits them by design.
+#   "delphi":   real Delphi auto-interp descriptions; free-form, no
+#               positive/negative_examples by construction. Exempt
+#               from BOTH source_latents AND boundary-discipline.
+_SOURCE_LATENTS_EXEMPT_KINDS = {
+    "scaffold", "manual", "decomposed_atom",
+    "symmetry", "delphi",
+}
+# Boundary-discipline exemption is stricter — symmetry-completing
+# Opus leaves still need pos/neg/exclusions, only Delphi-mode auto-
+# interp leaves are skipped on that.
+_BOUNDARY_DISCIPLINE_EXEMPT_KINDS = {
+    "scaffold", "manual", "decomposed_atom",
+    "delphi",
+}
 
 # Boundary-discipline thresholds (v8.18.28 — required for every
 # inventory-generated leaf so the annotator has explicit boundary
@@ -180,11 +199,15 @@ def _is_source_latents_exempt(feature: dict) -> bool:
 def _is_boundary_discipline_exempt(feature: dict) -> bool:
     """Scaffold / control / manual features are hand-curated; they
     pre-date the boundary-discipline contract and shouldn't be
-    silently dropped by it. Same exemption set as source_latents.
-    Inventory-derived leaves and discovered atoms must comply."""
+    silently dropped by it. v8.19.0: Delphi-mode (auto-interp) leaves
+    are exempt too — they're free-form descriptions by design.
+    Inventory-derived leaves, discovered atoms, and Opus symmetry-
+    completing leaves must comply (Opus emits the contract fields)."""
     if feature.get("role") in _SOURCE_LATENTS_EXEMPT_ROLES:
         return True
-    if feature.get("source_kind") in _SOURCE_LATENTS_EXEMPT_KINDS:
+    if feature.get("source_kind") in _BOUNDARY_DISCIPLINE_EXEMPT_KINDS:
+        return True
+    if feature.get("delphi_mode"):
         return True
     return False
 

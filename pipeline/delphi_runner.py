@@ -43,32 +43,49 @@ from .config import Config
 DELPHI_INVOKER_SCRIPT = '''\
 """Inline Delphi runner — supplied by pipeline/delphi_runner.py.
 
-Reads its config from env vars set by the parent process. Calls
-delphi's process_cache directly with our custom latent_range, so we
-explain only the shortlisted indices instead of [0, max_latents).
+Reads its config from env vars set by the parent process. Bypasses
+Delphi\'s `load_artifacts` (which routes non-Gemma SAEs through
+`sparsify.SparseCoder.load_many` and would fail on `gpt2-small-res-jb`,
+a sae_lens-format release). Instead loads gpt2 via transformers\'
+AutoModel and gpt2-small-res-jb via our own pipeline.inventory.load_sae,
+then constructs hookpoint_to_sparse_encode = {"h.8": sae.encode_dense}
+where "h.8" (output of GPT2Block 8) equals TransformerLens\'
+blocks.9.hook_resid_pre bit-perfectly (LN folding is a parameter-
+equivalence transformation that preserves residual-stream output).
+
+Calls Delphi\'s `process_cache` directly with our custom
+`latent_range = torch.tensor(shortlist[:N])` so only the shortlisted
+indices get explained (Delphi CLI\'s `--max_latents N` only supports
+the FIRST N).
 """
 import asyncio
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 
 from delphi import logger
 from delphi.config import (
     RunConfig, ConstructorConfig, SamplerConfig, CacheConfig,
 )
 from delphi.__main__ import (
-    load_artifacts, populate_cache, process_cache, non_redundant_hookpoints,
+    populate_cache, process_cache, non_redundant_hookpoints,
 )
 from delphi.utils import assert_type
 
 logger.setLevel(logging.INFO)
 
+# Make supsae root importable so we can use pipeline.inventory.load_sae
+SUPSAE_ROOT = os.environ["SUPSAE_ROOT"]
+if SUPSAE_ROOT not in sys.path:
+    sys.path.insert(0, SUPSAE_ROOT)
+
 LATENT_INDICES = json.loads(os.environ["DELPHI_LATENT_INDICES"])
-HOOKPOINT = os.environ["DELPHI_HOOKPOINT"]
+TRANSFORMERS_HOOKPOINT = os.environ["DELPHI_TRANSFORMERS_HOOKPOINT"]
 MODEL = os.environ["DELPHI_MODEL"]
 SPARSE_MODEL = os.environ["DELPHI_SPARSE_MODEL"]
 EXPLAINER_MODEL = os.environ["DELPHI_EXPLAINER_MODEL"]
@@ -76,6 +93,66 @@ EXPLAINER_PROVIDER = os.environ["DELPHI_EXPLAINER_PROVIDER"]
 SCORERS = json.loads(os.environ["DELPHI_SCORERS"])
 N_TOKENS = int(os.environ["DELPHI_N_TOKENS"])
 RUN_DIR = os.environ["DELPHI_RUN_DIR"]
+SAE_ID = os.environ["DELPHI_SAE_ID"]
+
+
+def _build_artifacts():
+    """Load gpt2 + gpt2-small-res-jb without Delphi\'s sparsify loader.
+
+    Returns (hookpoints, hookpoint_to_sparse_encode, model, transcode)
+    matching Delphi\'s internal contract from `load_artifacts`.
+    """
+    from pipeline.config import Config as SupsaeConfig
+    from pipeline.inventory import load_sae as supsae_load_sae
+
+    # Build a minimal supsae Config; only needs the SAE-loading fields.
+    sup_cfg = SupsaeConfig()
+    sup_cfg.sae_release = SPARSE_MODEL
+    sup_cfg.sae_id = SAE_ID
+
+    sae_wrap, _sparsity = supsae_load_sae(sup_cfg)
+
+    # Load transformers model (Delphi requires PreTrainedModel).
+    if torch.cuda.is_available():
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+        device_map = {"": "cuda"}
+    else:
+        dtype = torch.float32
+        device_map = {"": "cpu"}
+    print(f"[delphi-invoker] loading {MODEL} via transformers AutoModel", flush=True)
+    model = AutoModel.from_pretrained(
+        MODEL, torch_dtype=dtype, device_map=device_map,
+    )
+
+    # Verify the chosen hookpoint exists in the loaded model.
+    module_names = {n for n, _ in model.named_modules()}
+    if TRANSFORMERS_HOOKPOINT not in module_names:
+        # Print a few candidates to help the user diagnose.
+        sample = sorted(n for n in module_names if "h." in n and len(n) < 24)[:8]
+        raise RuntimeError(
+            f"hookpoint {TRANSFORMERS_HOOKPOINT!r} not found in "
+            f"{MODEL}. Candidates (first 8): {sample}"
+        )
+
+    # Move SAE to the same device as the model.
+    sae_wrap = sae_wrap.to(model.device)
+
+    def encode_fn(x):
+        """Closure called by Delphi\'s LatentCache.run on the residual
+        stream activation at the hookpoint.
+
+        Input  x: tensor of shape (B, T, d_model), the output of the
+                  transformers GPT2Block at layer 8 = resid_pre of layer 9.
+        Output:   (B, T, n_lat) dense ReLU/JumpReLU activations.
+
+        sae_lens SAE.encode handles (B, T, d) → (B, T, n_lat) directly.
+        For our PretrainedSAE wrapper, both the native sae_lens path and
+        the bare-weights GemmaScope path return (B, T, n_lat).
+        """
+        return sae_wrap.encode(x)
+
+    hookpoint_to_sparse_encode = {TRANSFORMERS_HOOKPOINT: encode_fn}
+    return [TRANSFORMERS_HOOKPOINT], hookpoint_to_sparse_encode, model, False
 
 
 async def main():
@@ -85,7 +162,7 @@ async def main():
         sampler_cfg=SamplerConfig(),
         model=MODEL,
         sparse_model=SPARSE_MODEL,
-        hookpoints=[HOOKPOINT],
+        hookpoints=[TRANSFORMERS_HOOKPOINT],
         explainer_model=EXPLAINER_MODEL,
         explainer_provider=EXPLAINER_PROVIDER,
         scorers=SCORERS,
@@ -104,7 +181,7 @@ async def main():
     scores_path = base_path / "scores"
 
     print(f"[delphi-invoker] caching activations to {latents_path}", flush=True)
-    hookpoints, hookpoint_to_sparse_encode, model, transcode = load_artifacts(run_cfg)
+    hookpoints, hookpoint_to_sparse_encode, model, transcode = _build_artifacts()
     tokenizer = AutoTokenizer.from_pretrained(MODEL, token=run_cfg.hf_token)
 
     nrh = assert_type(dict, non_redundant_hookpoints(
@@ -157,12 +234,36 @@ def run(cfg: Config = None) -> dict:
     script_path = run_dir / "_delphi_invoker.py"
     script_path.write_text(DELPHI_INVOKER_SCRIPT)
 
+    # Map our TransformerLens hookpoint to a transformers AutoModel module
+    # path. For gpt2 (AutoModel), GPT2Block instances live at "h.0".."h.11".
+    # blocks.{L}.hook_resid_pre = output of block (L-1) = "h.{L-1}".
+    # blocks.{L}.hook_resid_post = output of block L = "h.{L}".
+    # This identity holds bit-perfectly: TL's LN folding is parameter-
+    # equivalent and preserves residual stream output.
+    tl_hp = cfg.hook_point
+    if tl_hp.startswith("blocks.") and tl_hp.endswith(".hook_resid_pre"):
+        layer = int(tl_hp.split(".")[1])
+        transformers_hookpoint = f"h.{layer - 1}"
+    elif tl_hp.startswith("blocks.") and tl_hp.endswith(".hook_resid_post"):
+        layer = int(tl_hp.split(".")[1])
+        transformers_hookpoint = f"h.{layer}"
+    else:
+        raise RuntimeError(
+            f"Don't know how to map TL hookpoint {tl_hp!r} to a "
+            f"transformers AutoModel module path. Supported: "
+            f"blocks.<L>.hook_resid_pre / blocks.<L>.hook_resid_post."
+        )
+
+    supsae_root = str(Path(__file__).resolve().parent.parent)
+
     env = os.environ.copy()
     env.update({
+        "SUPSAE_ROOT": supsae_root,
         "DELPHI_LATENT_INDICES": json.dumps(delphi_indices),
-        "DELPHI_HOOKPOINT": cfg.hook_point,
+        "DELPHI_TRANSFORMERS_HOOKPOINT": transformers_hookpoint,
         "DELPHI_MODEL": cfg.model_name,
         "DELPHI_SPARSE_MODEL": cfg.sae_release,
+        "DELPHI_SAE_ID": cfg.sae_id,
         "DELPHI_EXPLAINER_MODEL": cfg.delphi_explainer_model,
         "DELPHI_EXPLAINER_PROVIDER": cfg.delphi_explainer_provider,
         "DELPHI_SCORERS": json.dumps([cfg.delphi_scorer]),
@@ -172,8 +273,10 @@ def run(cfg: Config = None) -> dict:
 
     print(f"  invoker:        {script_path}")
     print(f"  model:          {cfg.model_name}")
-    print(f"  sparse_model:   {cfg.sae_release}")
-    print(f"  hookpoint:      {cfg.hook_point}")
+    print(f"  sparse_model:   {cfg.sae_release}/{cfg.sae_id}")
+    print(f"  TL hookpoint:   {cfg.hook_point}")
+    print(f"  → transformers: {transformers_hookpoint}  "
+          f"(bit-perfect via LN-folding equivalence)")
     print(f"  explainer:      {cfg.delphi_explainer_model} "
           f"via {cfg.delphi_explainer_provider}")
     print(f"  scorer:         {cfg.delphi_scorer}")
@@ -206,9 +309,21 @@ def _extract_descriptions(
     Filename pattern (from delphi/latents/latents.py:31):
         {module_name}_latent{latent_index}.txt
 
-    For our hookpoint blocks.9.hook_resid_pre, files look like:
-        blocks.9.hook_resid_pre_latent42.txt
+    Our invoker uses transformers-style hookpoint (e.g. `h.8`); files
+    look like `h.8_latent42.txt`. We compute the same TL→transformers
+    mapping here that the invoker uses, so callers see consistent
+    addressing.
     """
+    tl_hp = cfg.hook_point
+    if tl_hp.endswith(".hook_resid_pre"):
+        layer = int(tl_hp.split(".")[1])
+        transformers_hp = f"h.{layer - 1}"
+    elif tl_hp.endswith(".hook_resid_post"):
+        layer = int(tl_hp.split(".")[1])
+        transformers_hp = f"h.{layer}"
+    else:
+        transformers_hp = tl_hp  # fall through; let path-existence check fail
+
     explanations_path = run_dir / "explanations"
     if not explanations_path.exists():
         raise FileNotFoundError(
@@ -220,7 +335,7 @@ def _extract_descriptions(
     descriptions: dict[int, str] = {}
     missing: list[int] = []
     for lat_idx in latent_indices:
-        path = explanations_path / f"{cfg.hook_point}_latent{lat_idx}.txt"
+        path = explanations_path / f"{transformers_hp}_latent{lat_idx}.txt"
         if path.exists():
             try:
                 raw = path.read_bytes()

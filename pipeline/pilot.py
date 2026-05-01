@@ -166,7 +166,7 @@ def run(cfg: Config = None) -> dict:
     print("\n[6/7] evaluate")
     t0 = time.time()
     try:
-        from .evaluate import run as run_evaluate
+        from .evaluate import evaluate as run_evaluate
         run_evaluate(pilot_cfg)
         findings["evaluate"] = {"seconds": time.time() - t0}
     except Exception as e:

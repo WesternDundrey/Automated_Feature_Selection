@@ -76,12 +76,34 @@ def _agreement_f1(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _run_annotator_pass(
-    cfg: Config, tokens: torch.Tensor, features: list[dict], seed: int
+    cfg: Config,
+    tokens: torch.Tensor,
+    features: list[dict],
+    pass_label: str,
+    legacy_prompts: bool,
+    exclusions_in_suffix: bool,
 ) -> torch.Tensor:
-    """Run one annotation pass at a given seed. Returns (N, T, F) labels."""
+    """Run one annotation pass at a given prompt-perturbation setting.
+
+    Local vLLM annotation is deterministic at temperature=0, so two
+    passes that differ only in `cfg.seed` produce IDENTICAL labels and
+    IRR collapses to 1.0 trivially. To make passes meaningfully
+    independent, we perturb the PROMPT formulation between passes:
+
+      pass A: legacy_prompts=False, exclusions_in_annotator_suffix=True
+              (strict prefix-decidable, exclusions appended)
+      pass B: legacy_prompts=True,  exclusions_in_annotator_suffix=False
+              (relaxed v8.10-style prompts, no exclusions in suffix)
+
+    What this measures: robustness of annotator decisions to prompt
+    framing on the same model. A small kappa here means the catalog's
+    descriptions are not crisp enough for prompt-stable labels — a
+    real F1 ceiling for the comparison.
+    """
     pass_cfg = copy.copy(cfg)
-    pass_cfg.seed = seed
-    pass_cfg.output_dir = cfg.output_dir / f"_irr_pass_seed{seed}"
+    pass_cfg.legacy_prompts = legacy_prompts
+    pass_cfg.exclusions_in_annotator_suffix = exclusions_in_suffix
+    pass_cfg.output_dir = cfg.output_dir / f"_irr_pass_{pass_label}"
     pass_cfg.output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(tokens, pass_cfg.tokens_path)
     catalog = {"features": features}
@@ -133,9 +155,21 @@ def run(cfg: Config = None) -> dict:
         sample_n = min(cfg.irr_sample_size, len(leaves))
         sample = rng.sample(leaves, sample_n)
         print(f"\n  [{arm_name}] sampling {sample_n} of {len(leaves)} features")
+        print(f"    pass A: strict prompts, exclusions in suffix")
+        print(f"    pass B: legacy prompts, no exclusions in suffix")
 
-        annot_a = _run_annotator_pass(cfg, sub_tokens, sample, seed=cfg.seed)
-        annot_b = _run_annotator_pass(cfg, sub_tokens, sample, seed=cfg.seed + 1)
+        annot_a = _run_annotator_pass(
+            cfg, sub_tokens, sample,
+            pass_label="A_strict",
+            legacy_prompts=False,
+            exclusions_in_suffix=True,
+        )
+        annot_b = _run_annotator_pass(
+            cfg, sub_tokens, sample,
+            pass_label="B_legacy",
+            legacy_prompts=True,
+            exclusions_in_suffix=False,
+        )
         a = annot_a.bool().numpy().reshape(-1, sample_n)
         b = annot_b.bool().numpy().reshape(-1, sample_n)
 

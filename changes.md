@@ -4,6 +4,95 @@
 
 ---
 
+## [v8.19.1] — Audit fixes for the Delphi-vs-Opus architecture
+
+Reviewer caught 9 real defects in v8.19.0. All addressed:
+
+* **Full benchmark path is now wired.** New `pipeline/merge_catalogs.py`
+  + `--step merge-catalogs` concatenates `opus_catalog.json` and
+  `delphi_catalog.json` into the canonical `feature_catalog.json` that
+  `--step annotate` reads. Without this, annotate would silently use
+  whatever stale catalog happened to exist. Run order is:
+  `shortlist → delphi-run + opus-catalog → merge-catalogs → annotate
+  → train → evaluate → oracle-unsup`.
+
+* **Sup arm no longer trains on Delphi labels.** `pipeline/train.py:run`
+  filters leaves with `delphi_mode=True` from the supSAE training set
+  before calling `train_supervised_sae`. Annotations.pt is unchanged
+  (Delphi columns remain available for unsup-arm F1 + oracle_unsup
+  appendix); only the supSAE encoder is trained on Opus labels.
+  Orphaned Delphi-only groups are dropped from `features` for cleanliness.
+
+* **Pilot's evaluate import fixed.** `pipeline/pilot.py` now imports
+  `evaluate as run_evaluate` from `.evaluate` (was `run`, which doesn't
+  exist).
+
+* **Delphi loader rewritten for sae_lens compatibility.**
+  `pipeline/delphi_runner.py`'s inline invoker now bypasses Delphi's
+  `load_artifacts` (which routes non-Gemma models through
+  `sparsify.SparseCoder.load_many` and would fail on `gpt2-small-res-jb`,
+  a sae_lens-format release without an EleutherAI Sparsify equivalent
+  on HuggingFace). Replacement loader uses `transformers.AutoModel
+  .from_pretrained("gpt2")` directly + our existing
+  `pipeline.inventory.load_sae` for the SAE, and constructs
+  `hookpoint_to_sparse_encode = {"h.<L-1>": sae.encode}` mapping our
+  TransformerLens hookpoint `blocks.<L>.hook_resid_pre` to the
+  bit-perfectly-equivalent transformers GPT2Block output (LN folding
+  is parameter-equivalent and preserves residual stream output).
+  `SUPSAE_ROOT` env var lets the subprocess import `pipeline.inventory`.
+
+* **oracle_unsup is now an honest val-select / test-report oracle.**
+  Held-out is split 50/50 into VAL (latent selection) and TEST (F1
+  reporting). Selection-bias is reported (`val_f1_mean - test_f1_mean`)
+  so the inflation is auditable. Memory: rewritten to stream batches
+  through the SAE; per-feature per-latent (tp, fp) counts accumulated
+  via small matmuls (`y.T @ fires_long`) rather than materializing the
+  full `(T_total, n_lat)` bool matrix. Old code allocated 15 GB CPU
+  for fires + multi-GB long churn; new code peaks at ~1 GB. Test pass
+  forwards SAE only for chosen oracle latents per feature.
+
+* **IRR passes are now meaningfully independent.** Vary the prompt
+  framing across the two passes (legacy_prompts + exclusions_in_suffix)
+  rather than just the seed. Local vLLM at temp=0 is deterministic, so
+  seed-only variation collapses IRR to 1.0. The new design measures
+  robustness of annotator decisions to prompt framing on the same
+  model — a real F1 ceiling for the comparison.
+
+* **catalog_quality now applied to opus_catalog.json.** `opus_catalog.py:run`
+  calls `apply_catalog_gates` at the end, writes quarantined leaves to
+  `opus_catalog.quarantined.json` for audit, and writes the per-feature
+  quality report. New `source_kind="symmetry"` exemption recognizes
+  Opus-designed symmetry-completing leaves (no `source_latents`) but
+  STILL requires boundary-discipline (positive_examples,
+  negative_examples, exclusions). New `source_kind="delphi"` and the
+  existing `delphi_mode: True` flag exempt auto-interp leaves from
+  both source_latents AND boundary-discipline checks.
+
+* **Shortlist docs honestly describe the implementation.** Removed
+  the "frequency window + activation concentration" claim; current
+  ranking is by descending firing rate within the freq window.
+  Documented as a future enhancement that could piggy-back on
+  `inventory.collect_top_activations`. Behavior unchanged.
+
+The pre-flight checklist is now:
+```
+cd delphi && uv pip install -e .          # fresh upstream v0.1.3
+export OPENROUTER_API_KEY=...
+python -m pipeline.run --step shortlist
+python -m pipeline.run --step opus-catalog       # ← validated by gates
+python -m pipeline.run --step delphi-run         # ← validated end-to-end
+python -m pipeline.run --step merge-catalogs     # ← canonical feature_catalog.json
+python -m pipeline.run --step pilot              # ← HARD gate, ~2 hr
+# only on pilot pass:
+python -m pipeline.run --step annotate           # ← reads merged catalog
+python -m pipeline.run --step train              # ← filters delphi_mode out
+python -m pipeline.run --step evaluate
+python -m pipeline.run --step oracle-unsup       # ← Type-2 honest oracle
+python -m pipeline.run --step irr                # ← prompt-perturbed
+```
+
+---
+
 ## [v8.19.0] — Symmetric Delphi-vs-Opus 4.7 F1 head-to-head architecture
 
 User-locked plan (2026-05-01): publishable F1 comparison between

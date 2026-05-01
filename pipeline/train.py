@@ -844,6 +844,36 @@ def run(cfg: Config = None):
     from .position_mask import mask_leading
     activations, annotations = mask_leading(activations, annotations, cfg=cfg)
 
+    # v8.19.0: filter Delphi-arm features out of supSAE training. They
+    # remain in annotations.pt for the unsup-arm F1 evaluation and the
+    # Type-2 oracle_unsup appendix, but the supSAE encoder must not be
+    # supervised against Delphi labels (the sup arm is by-design
+    # exclusively the Opus-designed catalog). Maintains a parallel
+    # mapping so annotations columns still align with the kept features.
+    leaves = [f for f in features if f.get("type") == "leaf"]
+    keep_mask = [not f.get("delphi_mode") for f in leaves]
+    n_drop = sum(1 for k in keep_mask if not k)
+    if n_drop > 0:
+        keep_idx = [i for i, k in enumerate(keep_mask) if k]
+        keep_idx_t = torch.tensor(keep_idx, dtype=torch.long)
+        annotations = annotations.index_select(-1, keep_idx_t)
+        kept_leaves = [leaves[i] for i in keep_idx]
+        # Drop groups that are exclusively Delphi parents (no kept
+        # children). Keeps the catalog clean for hierarchy / display
+        # code that walks type=group.
+        kept_parents = {
+            leaf.get("parent") for leaf in kept_leaves
+            if leaf.get("parent")
+        }
+        kept_groups = [
+            f for f in features
+            if f.get("type") == "group" and f.get("id") in kept_parents
+        ]
+        features = kept_groups + kept_leaves
+        print(f"  v8.19.0 filter: dropped {n_drop} delphi_mode leaves "
+              f"from supSAE training (kept in annotations.pt for "
+              f"unsup-arm evaluation)")
+
     print(f"Activations: {activations.shape} (masked first "
           f"{cfg.mask_first_n_positions} positions)")
     print(f"Annotations: {annotations.shape}")
