@@ -646,6 +646,33 @@ def _annotate_local_vllm_pertoken(
     token-level prefix alignment. BPE merges across string boundaries
     can't break the prefix match when IDs are pre-tokenized separately.
 
+    v8.19.6 lever-7: load position_mask.pt sidecar (written by
+    _load_or_compute_position_mask in annotate_local) and skip
+    unsampled positions in the prompt-building loop. The mask is a
+    sidecar — when running from a fresh shard subprocess that didn't
+    call annotate_local, we still load it directly from disk.
+    """
+    position_mask = None
+    if int(getattr(cfg, "position_subsample_k", 0) or 0) > 0:
+        if cfg.position_mask_path.exists():
+            position_mask = torch.load(
+                cfg.position_mask_path, weights_only=True,
+            )
+            if position_mask.shape != (N, T):
+                print(f"  WARNING: position_mask shape "
+                      f"{tuple(position_mask.shape)} != ({N}, {T}); "
+                      f"falling back to full-sequence annotation")
+                position_mask = None
+            else:
+                n_sampled = int(position_mask.sum())
+                print(f"  position_mask loaded: {n_sampled}/{N*T} "
+                      f"positions sampled (lever-7)")
+        else:
+            print(f"  WARNING: position_subsample_k="
+                  f"{cfg.position_subsample_k} but no position_mask.pt "
+                  f"at {cfg.position_mask_path}; falling back to "
+                  f"full-sequence annotation")
+
     Cache hierarchy:
       Level 0: sys_ids (~200 tokens) — shared across ALL prompts
       Level 1: + tok_ids[0:k+1] — grows by exact token IDs per position
