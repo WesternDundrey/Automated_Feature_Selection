@@ -649,8 +649,13 @@ def _annotate_local_vllm_pertoken(
     v8.19.6 lever-7: load position_mask.pt sidecar (written by
     _load_or_compute_position_mask in annotate_local) and skip
     unsampled positions in the prompt-building loop. The mask is a
-    sidecar — when running from a fresh shard subprocess that didn't
+    sidecar - when running from a fresh shard subprocess that didn't
     call annotate_local, we still load it directly from disk.
+
+    Cache hierarchy:
+      Level 0: sys_ids (~200 tokens) - shared across ALL prompts
+      Level 1: + tok_ids[0:k+1] - grows by exact token IDs per position
+      Variable: suffix_ids[fi] (~6 tokens) - only non-cached part
     """
     position_mask = None
     if int(getattr(cfg, "position_subsample_k", 0) or 0) > 0:
@@ -673,11 +678,6 @@ def _annotate_local_vllm_pertoken(
                   f"at {cfg.position_mask_path}; falling back to "
                   f"full-sequence annotation")
 
-    Cache hierarchy:
-      Level 0: sys_ids (~200 tokens) — shared across ALL prompts
-      Level 1: + tok_ids[0:k+1] — grows by exact token IDs per position
-      Variable: suffix_ids[fi] (~6 tokens) — only non-cached part
-    """
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
 
