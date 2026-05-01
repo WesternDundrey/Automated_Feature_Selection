@@ -40,6 +40,16 @@ _os_init.environ.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "1800")
 # `setdefault` lets you opt back into multiproc by exporting
 # VLLM_ENABLE_V1_MULTIPROCESSING=1 before launch.
 _os_init.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+# v8.19.8: Issue vllm-project/vllm#34534 — when vLLM is launched from a
+# child Python process (our shard subprocess.Popen wrapper, or anything
+# similar), VLLM_WORKER_MULTIPROC_METHOD=fork (default) makes EngineCore
+# a forked grandchild that inherits the parent's signal handlers and
+# threads. The forked grandchild receives unexpected SIGTERM/SIGINT
+# from event-loop setup in the parent and exits silently. Forcing
+# `spawn` makes EngineCore start fresh without inheriting state. The
+# v8.18.27 commit dropped this thinking it was a cold-start workaround;
+# it is not — it is required whenever vLLM runs inside a subprocess.
+_os_init.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import asyncio
 import json
@@ -1387,6 +1397,7 @@ torch.save(annotations, {str(shard_out)!r})
             # throughput cost vs out-of-process; far better than
             # hanging. setdefault lets the user opt back in.
             env.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+            env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
             print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx}...")
             proc = subprocess.Popen(
