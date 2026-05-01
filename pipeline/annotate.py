@@ -828,6 +828,13 @@ def _annotate_local_vllm_pertoken(
         enable_prefix_caching=True,
         max_model_len=computed_max_len,
         gpu_memory_utilization=0.9,
+        # v8.19.8: nvidia-smi dmon showed both 5090s averaging ~20-25%
+        # util on the chunk=2 run, alternating between active and
+        # idle. Default max_num_seqs=256 was rate-limiting the
+        # scheduler with 30K-61K prompts per chunk. Bumping to 1024
+        # lets vLLM pack ~4x more in-flight, keeping the GPU busy
+        # longer per chunk and reducing the alternating pattern.
+        max_num_seqs=1024,
     )
     # Base model: no thinking, no chat template. Just completes text.
     # allowed_token_ids forces "0" or "1" — safe on base models.
@@ -1405,12 +1412,25 @@ torch.save(annotations, {str(shard_out)!r})
             # useful and don't redraw in place.
             env["TQDM_DISABLE"] = "1"
 
-            print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx}...")
+            # v8.19.8: redirect each shard's stdout/stderr to a
+            # per-shard log file. Two shards both writing to
+            # sys.stdout caused the GPU-alternation pattern observed
+            # in nvidia-smi dmon — one shard would block on the pipe
+            # while the other wrote, leaving its GPU idle. Per-shard
+            # log files (in cfg.output_dir for visibility) eliminate
+            # the contention. tail -f any one to follow progress.
+            shard_log_path = (
+                Path(cfg.output_dir) / f"annotate_shard_{gpu_idx}.log"
+            )
+            shard_log_path.parent.mkdir(parents=True, exist_ok=True)
+            shard_log_handle = open(shard_log_path, "w", buffering=1)
+            print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx} → "
+                  f"log: {shard_log_path}")
             proc = subprocess.Popen(
                 [sys.executable, "-c", script],
                 env=env,
-                stdout=sys.stdout,
-                stderr=sys.stderr,
+                stdout=shard_log_handle,
+                stderr=subprocess.STDOUT,
             )
             procs.append(proc)
             out_paths.append(shard_out)
