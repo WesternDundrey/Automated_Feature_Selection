@@ -42,20 +42,56 @@ def _build_design_prompt(top_activations: dict, tokenizer, cfg: Config) -> str:
     Includes top contexts of all shortlist latents + symmetry constraints
     + boundary-discipline contract. Output target: cfg.opus_n_features
     leaves with full positive_examples / negative_examples / exclusions.
+
+    AUTO-DOWNSHIFT: at production shortlist sizes (1000 latents × 50
+    contexts × ~30 tok/context ≈ 1.5M tokens), the prompt exceeds Opus
+    4.7's 1M context window. Estimate prompt size at requested
+    top_k_examples; if it exceeds the budget, reduce top_k per latent
+    proportionally and rebuild.
     """
     from .inventory import format_examples_for_prompt
+
+    # Budget: Opus 4.7 max context = 1,000,000 tokens. Reserve 64K for
+    # output (max_tokens) + 50K for the static prompt scaffold (rules,
+    # JSON template, symmetry list). Leaves ~880K tokens for latent
+    # contexts. At ~4 chars/token (English text) ≈ 3.5M chars budget.
+    BUDGET_CHARS = 3_500_000
+    REQUESTED_TOP_K = cfg.top_k_examples
+
+    n_in = sum(1 for examples in top_activations.values() if examples)
+    if n_in == 0:
+        raise RuntimeError("No latents have activating examples; "
+                           "shortlist might be all dead latents.")
+
+    # Sample one latent's block to estimate per-latent cost at the
+    # requested top_k. Use the first non-empty entry.
+    sample_examples = next(
+        v for v in top_activations.values() if v
+    )[:REQUESTED_TOP_K]
+    sample_block = format_examples_for_prompt(sample_examples, tokenizer)
+    # +50 chars for `--- latent_<id> ---\n` header.
+    chars_per_latent = len(sample_block) + 50
+    est_total = chars_per_latent * n_in
+
+    if est_total > BUDGET_CHARS:
+        ratio = BUDGET_CHARS / est_total
+        effective_top_k = max(5, int(REQUESTED_TOP_K * ratio))
+        print(f"  Prompt-size auto-downshift: top_k {REQUESTED_TOP_K} → "
+              f"{effective_top_k}  (estimated {est_total:,} chars > "
+              f"{BUDGET_CHARS:,} budget at top_k={REQUESTED_TOP_K})")
+    else:
+        effective_top_k = REQUESTED_TOP_K
 
     latent_blocks = []
     for lat_idx, examples in sorted(top_activations.items(), key=lambda x: int(x[0])):
         if not examples:
             continue
         examples_str = format_examples_for_prompt(
-            examples[: cfg.top_k_examples], tokenizer
+            examples[:effective_top_k], tokenizer
         )
         latent_blocks.append(f"--- latent_{lat_idx} ---\n{examples_str}")
 
     latents_text = "\n\n".join(latent_blocks)
-    n_in = len(latent_blocks)
     n_out = cfg.opus_n_features
 
     return textwrap.dedent(f"""\
@@ -243,6 +279,19 @@ def run(cfg: Config = None) -> dict:
     prompt = _build_design_prompt(top_activations, tokenizer, cfg)
     n_in_chars = len(prompt)
     print(f"Design prompt: {n_in_chars:,} chars (~{n_in_chars // 4:,} tokens)")
+    # Hard guard: 1M context window; reserve 64K for max_tokens.
+    # Use a slightly conservative limit to absorb tokenizer variance.
+    MAX_INPUT_TOKENS = 920_000
+    est_in_tokens = n_in_chars // 4
+    if est_in_tokens > MAX_INPUT_TOKENS:
+        raise RuntimeError(
+            f"Design prompt estimated at {est_in_tokens:,} tokens "
+            f"exceeds {MAX_INPUT_TOKENS:,}-token budget for "
+            f"{cfg.opus_explanation_model} (1M context − 64K output). "
+            f"Auto-downshift didn't recover; reduce shortlist_size or "
+            f"top_k_examples. Prompt was {n_in_chars:,} chars at "
+            f"effective top_k={cfg.top_k_examples}."
+        )
 
     client = get_client()
     print(f"Calling {cfg.opus_explanation_model} (max_tokens=64000)...")
