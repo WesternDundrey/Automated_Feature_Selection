@@ -1352,6 +1352,16 @@ torch.save(annotations, {str(shard_out)!r})
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
             env["SUPSAE_LOCAL_ANNOTATION_SUBPROCESS"] = "1"
             env["SUPSAE_SHARD_ID"] = str(gpu_idx)
+            # v8.19.8: each vLLM shard runs its own world_size=1
+            # distributed init. The v1 engine binds a fixed default
+            # TCP port for parallel_state setup; with two shards this
+            # collides (both pids on tcp://...:44871, NCCL hangs).
+            # Give each shard a unique master port so their
+            # single-rank "distributed" worlds don't clash.
+            base_port = 54321
+            unique_port = base_port + gpu_idx
+            env["VLLM_DP_MASTER_PORT"] = str(unique_port)
+            env["MASTER_PORT"] = str(unique_port)
 
             print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx}...")
             proc = subprocess.Popen(
