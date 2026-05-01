@@ -36,6 +36,22 @@ from pathlib import Path
 from .config import Config
 
 
+def _render_latents_text(
+    top_activations: dict, tokenizer, top_k: int
+) -> str:
+    """Render the latents block at a given per-latent context budget."""
+    from .inventory import format_examples_for_prompt
+    blocks = []
+    for lat_idx, examples in sorted(top_activations.items(), key=lambda x: int(x[0])):
+        if not examples:
+            continue
+        examples_str = format_examples_for_prompt(
+            examples[:top_k], tokenizer
+        )
+        blocks.append(f"--- latent_{lat_idx} ---\n{examples_str}")
+    return "\n\n".join(blocks)
+
+
 def _build_design_prompt(top_activations: dict, tokenizer, cfg: Config) -> str:
     """Single-shot design prompt for Opus 4.7 (1M context).
 
@@ -45,17 +61,19 @@ def _build_design_prompt(top_activations: dict, tokenizer, cfg: Config) -> str:
 
     AUTO-DOWNSHIFT: at production shortlist sizes (1000 latents × 50
     contexts × ~30 tok/context ≈ 1.5M tokens), the prompt exceeds Opus
-    4.7's 1M context window. Estimate prompt size at requested
-    top_k_examples; if it exceeds the budget, reduce top_k per latent
-    proportionally and rebuild.
+    4.7's 1M context window. Builds the full prompt at REQUESTED_TOP_K,
+    measures actual size, and iteratively rebuilds at lower top_k until
+    it fits the budget. Sample-based estimates were unreliable because
+    the first latent's block size is not representative of the average.
     """
-    from .inventory import format_examples_for_prompt
 
     # Budget: Opus 4.7 max context = 1,000,000 tokens. Reserve 64K for
-    # output (max_tokens) + 50K for the static prompt scaffold (rules,
-    # JSON template, symmetry list). Leaves ~880K tokens for latent
-    # contexts. At ~4 chars/token (English text) ≈ 3.5M chars budget.
-    BUDGET_CHARS = 3_500_000
+    # output (max_tokens) + ~80K for the static prompt scaffold (rules,
+    # JSON template, symmetry list, etc.). Leaves ~860K tokens for
+    # latent contexts. At a conservative ~3.6 chars/token (English text
+    # is denser than 4 chars/token under tiktoken-style BPE), use 3.0M
+    # chars budget for the FULL prompt to leave headroom.
+    BUDGET_CHARS = 3_000_000
     REQUESTED_TOP_K = cfg.top_k_examples
 
     n_in = sum(1 for examples in top_activations.values() if examples)
@@ -63,36 +81,53 @@ def _build_design_prompt(top_activations: dict, tokenizer, cfg: Config) -> str:
         raise RuntimeError("No latents have activating examples; "
                            "shortlist might be all dead latents.")
 
-    # Sample one latent's block to estimate per-latent cost at the
-    # requested top_k. Use the first non-empty entry.
-    sample_examples = next(
-        v for v in top_activations.values() if v
-    )[:REQUESTED_TOP_K]
-    sample_block = format_examples_for_prompt(sample_examples, tokenizer)
-    # +50 chars for `--- latent_<id> ---\n` header.
-    chars_per_latent = len(sample_block) + 50
-    est_total = chars_per_latent * n_in
-
-    if est_total > BUDGET_CHARS:
-        ratio = BUDGET_CHARS / est_total
-        effective_top_k = max(5, int(REQUESTED_TOP_K * ratio))
-        print(f"  Prompt-size auto-downshift: top_k {REQUESTED_TOP_K} → "
-              f"{effective_top_k}  (estimated {est_total:,} chars > "
-              f"{BUDGET_CHARS:,} budget at top_k={REQUESTED_TOP_K})")
-    else:
-        effective_top_k = REQUESTED_TOP_K
-
-    latent_blocks = []
-    for lat_idx, examples in sorted(top_activations.items(), key=lambda x: int(x[0])):
-        if not examples:
-            continue
-        examples_str = format_examples_for_prompt(
-            examples[:effective_top_k], tokenizer
-        )
-        latent_blocks.append(f"--- latent_{lat_idx} ---\n{examples_str}")
-
-    latents_text = "\n\n".join(latent_blocks)
     n_out = cfg.opus_n_features
+    effective_top_k = REQUESTED_TOP_K
+    full_prompt = ""
+
+    # Iteratively rebuild until it fits. At most 6 iterations (each
+    # halves the worst-case overshoot); converges in 1-2 passes typically.
+    for attempt in range(6):
+        latents_text = _render_latents_text(
+            top_activations, tokenizer, effective_top_k
+        )
+        full_prompt = _assemble_prompt(latents_text, n_in, n_out, cfg)
+        n_chars = len(full_prompt)
+        if n_chars <= BUDGET_CHARS:
+            if effective_top_k != REQUESTED_TOP_K:
+                print(f"  Prompt-size auto-downshift CONVERGED at "
+                      f"top_k={effective_top_k} (was {REQUESTED_TOP_K}); "
+                      f"prompt = {n_chars:,} chars (budget {BUDGET_CHARS:,})")
+            break
+        # Compute new top_k. Use 0.92 safety factor because the
+        # static scaffold doesn't scale with top_k, so the linear
+        # ratio undershoots slightly.
+        ratio = (BUDGET_CHARS / n_chars) * 0.92
+        new_top_k = max(3, int(effective_top_k * ratio))
+        if new_top_k >= effective_top_k:
+            new_top_k = effective_top_k - 1
+        if new_top_k < 3:
+            raise RuntimeError(
+                f"Cannot fit prompt under {BUDGET_CHARS:,}-char budget "
+                f"even at top_k=3. Reduce shortlist_size or use a "
+                f"smaller corpus / larger model."
+            )
+        print(f"  Prompt-size auto-downshift attempt {attempt + 1}: "
+              f"top_k {effective_top_k} → {new_top_k}  "
+              f"({n_chars:,} chars > {BUDGET_CHARS:,} budget)")
+        effective_top_k = new_top_k
+    else:
+        # Loop completed without break — still over budget after 6 tries.
+        raise RuntimeError(
+            f"Auto-downshift failed to converge under {BUDGET_CHARS:,} "
+            f"chars after 6 attempts (final top_k={effective_top_k}, "
+            f"prompt={len(full_prompt):,} chars)."
+        )
+
+    return full_prompt
+
+
+def _assemble_prompt(latents_text: str, n_in: int, n_out: int, cfg: Config) -> str:
 
     return textwrap.dedent(f"""\
         You are designing a supervised feature catalog for a sparse autoencoder
