@@ -302,17 +302,17 @@ class Config:
     # this many shards (must be ≤ available GPUs).
     n_annotation_gpus: int = 0
     # Sequences per vLLM batch in the per-token annotator. Tuning history:
-    # v8.19.6 bumped 2 → 8: too aggressive, Python prompt construction
-    # overhead outweighed scheduler benefit. Reverted to 2.
-    # v8.19.8 nvidia-smi diagnostic showed BOTH 5090s at 0% utilization
-    # under chunk=2 — vLLM is starving, not saturated. With vLLM 0.20.0,
-    # chunk=2 generates only 30,592 prompts per Python iteration (2 seqs
-    # × 64 positions × 239 features); the scheduler runs them through
-    # in ~100s but the GPUs sit idle between chunks during prompt
-    # construction. chunk=4 doubles per-iteration prompts (61K) which
-    # gives the scheduler more to chew on without exploding Python
-    # construction time.
-    local_annotation_seq_chunk: int = 4
+    # v8.19.6 bumped 2 → 8: too aggressive, Python overhead.
+    # Reverted to 2.
+    # v8.19.8 dmon showed GPUs at 0% under chunk=2 — vLLM was starving.
+    # Tried 4: throughput ~313 dec/s/shard. Better but still patchy.
+    # User experiment with --annotation-seq-chunk 32 + max_num_seqs=1024:
+    # 654 dec/s/shard with prefix cache warm (~2244× cold→warm speedup
+    # observed). 4× the chunk=2 baseline, sustained GPU work. Settling
+    # the default at 32 on 5090s with 32 GB. Pass --annotation-seq-chunk
+    # to override; 16 might suffice on memory-tight GPUs, 64 if
+    # construction overhead is fine.
+    local_annotation_seq_chunk: int = 32
 
     # Positions to mask out at analysis time (starting from position 0).
     #
