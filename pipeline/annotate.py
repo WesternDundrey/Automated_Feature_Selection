@@ -844,7 +844,10 @@ def _annotate_local_vllm_pertoken(
         allowed_token_ids=[tok_0_id, tok_1_id],
     )
 
-    total_decisions = n_features * N * T
+    if position_mask is not None:
+        total_decisions = int(position_mask.sum().item()) * n_features
+    else:
+        total_decisions = n_features * N * T
     t_start = time.time()
 
     seq_chunk = min(getattr(cfg, "local_annotation_seq_chunk", 2), N)
@@ -865,10 +868,13 @@ def _annotate_local_vllm_pertoken(
     else:
         annotations = torch.zeros(N, T, n_features)
 
-    completed = resume_from * T * n_features
+    if position_mask is not None:
+        completed = int(position_mask[:resume_from].sum().item()) * n_features
+    else:
+        completed = resume_from * T * n_features
 
     print(f"\nAnnotating: {n_features} features x {N} sequences x {T} tokens "
-          f"= {total_decisions:,} decisions "
+          f"= {total_decisions:,} labeled decisions "
           f"(vLLM, token-ID prefixes, chunk={seq_chunk})")
 
     # Convert to tuples for faster concatenation
@@ -939,7 +945,8 @@ def _annotate_local_vllm_pertoken(
         completed += len(prompts)
         elapsed = time.time() - t_start
         rate = completed / elapsed if elapsed > 0 else 0
-        eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
+        remaining = max(0, total_decisions - completed)
+        eta_sec = remaining / rate if rate > 0 else 0
         # Shard prefix when running multi-GPU so interleaved shard
         # output is clearly attributed.
         shard_id = os.environ.get("SUPSAE_SHARD_ID", "")
@@ -1326,6 +1333,11 @@ def _annotate_local_parallel(
     import copy
 
     N = tokens.shape[0]
+    T = tokens.shape[1]
+    # Build the global sampled-position mask once in the parent output_dir
+    # so train/evaluate/unsup_f1 can ignore unsampled labels later. Shards
+    # receive slices of this same mask in their temp state dirs.
+    full_position_mask = _load_or_compute_position_mask(cfg, N, T)
     chunk_starts = [int(N * i / n_gpus) for i in range(n_gpus + 1)]
     chunks = [
         tokens[chunk_starts[i] : chunk_starts[i + 1]] for i in range(n_gpus)
@@ -1363,6 +1375,13 @@ def _annotate_local_parallel(
             shard_cfg_path = tmp / f"cfg_shard_{gpu_idx}.pkl"
             shard_cfg = copy.copy(cfg_child)
             shard_cfg.output_dir = shard_state_dir
+            if full_position_mask is not None:
+                torch.save(
+                    full_position_mask[
+                        chunk_starts[gpu_idx] : chunk_starts[gpu_idx + 1]
+                    ],
+                    shard_cfg.position_mask_path,
+                )
             with shard_cfg_path.open("wb") as f:
                 pickle.dump(shard_cfg, f)
 

@@ -240,6 +240,19 @@ def main():
              "subprocess startup overhead.",
     )
     parser.add_argument(
+        "--annotation-seq-chunk", type=int, default=None,
+        help="Sequences per vLLM generate() chunk in local per-token "
+             "annotation. Larger values reduce scheduler/Python overhead and "
+             "can improve GPU utilization; too large can increase prompt "
+             "construction stalls or KV pressure. Default from Config.",
+    )
+    parser.add_argument(
+        "--features-per-call", type=int, default=None,
+        help="Feature batch size for annotation. Mostly relevant for API / "
+             "batch-position modes, but kept as a CLI override for local "
+             "benchmarking and prompt construction experiments.",
+    )
+    parser.add_argument(
         "--no-parallel-annotation", action="store_true",
         help="Force single-GPU annotation even when 2+ GPUs are visible. "
              "Use to leave a GPU free for another job.",
@@ -469,6 +482,10 @@ def main():
         overrides["scaffold_catalog"] = ""
     if args.annotation_gpus is not None:
         overrides["n_annotation_gpus"] = args.annotation_gpus
+    if args.annotation_seq_chunk is not None:
+        overrides["local_annotation_seq_chunk"] = args.annotation_seq_chunk
+    if args.features_per_call is not None:
+        overrides["features_per_annotation_call"] = args.features_per_call
     if args.no_parallel_annotation:
         overrides["local_annotation_parallel"] = False
     if args.keep_groups:
