@@ -110,18 +110,24 @@ class Config:
     direction_loss_weight: float = 1.0  # α: decoder direction alignment (hybrid/mse)
     magnitude_loss_weight: float = 0.5  # β: activation magnitude alignment (mse only)
     selectivity_loss: str = "bce"       # "bce", "hinge", or "none"
-    use_pos_weight: bool = True         # class-balanced pos_weight in BCE/hinge.
-                                        # Set False (--no-pos-weight) for the
-                                        # literal mentor hinge formula
+    use_pos_weight: bool = False        # v8.19.2: DEFAULT FLIPPED to False.
+                                        # The literal mentor formula in
+                                        # supervised_saes_hinge_loss.md is
                                         # `max(0, -(2y-1) z_i)` with no
-                                        # imbalance reweighting. Useful for
-                                        # ablating threshold-geometry effects.
-    hinge_margin: float = 1.0           # margin for hinge selectivity loss.
-                                        # Also used by the free-decoder
-                                        # hinge-family modes (v8.11+): set to
-                                        # 0 for zero-margin hinge (sign-
-                                        # correctness only, no score shaping),
-                                        # 1+ for SVM-style margin hinge that
+                                        # class-imbalance reweighting; this
+                                        # is what produced summary9's
+                                        # calibration-honest L0=1.015 and
+                                        # t=0 F1 vs probe gap +0.187 at
+                                        # production scale. Pass
+                                        # --use-pos-weight to opt back into
+                                        # the SVM-style class-balanced
+                                        # variant for ablation.
+    hinge_margin: float = 0.0           # v8.19.2: DEFAULT FLIPPED to 0.0
+                                        # (zero-margin hinge per mentor
+                                        # formula). Sign-correctness only,
+                                        # no score shaping past z=0. Pass
+                                        # --hinge-margin 1.0 (or higher)
+                                        # for SVM-style margin hinge that
                                         # continues shaping scores until a
                                         # configurable confidence buffer.
     hinge_squared: bool = False         # squared hinge: violation² instead
