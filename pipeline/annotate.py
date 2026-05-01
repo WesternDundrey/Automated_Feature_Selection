@@ -933,7 +933,11 @@ def _annotate_local_vllm_pertoken(
         elapsed = time.time() - t_start
         rate = completed / elapsed if elapsed > 0 else 0
         eta_sec = (total_decisions - completed) / rate if rate > 0 else 0
-        print(f"  {completed:,}/{total_decisions:,} decisions  "
+        # Shard prefix when running multi-GPU so interleaved shard
+        # output is clearly attributed.
+        shard_id = os.environ.get("SUPSAE_SHARD_ID", "")
+        prefix = f"  [shard {shard_id}] " if shard_id else "  "
+        print(f"{prefix}{completed:,}/{total_decisions:,} decisions  "
               f"rate={rate:.0f}/s  ETA {eta_sec/3600:.1f}h")
 
         # Save checkpoint after each chunk (crash recovery)
@@ -1394,6 +1398,12 @@ torch.save(annotations, {str(shard_out)!r})
             # throughput cost vs out-of-process; far better than
             # hanging. setdefault lets the user opt back in.
             env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+            # v8.19.8 readability: disable tqdm progress bars in shards.
+            # Two shards' tqdm bars overwriting each other on the same
+            # tty cause visual flicker. Explicit `rate=X/s ETA=Yh`
+            # prints (one full line per chunk) survive — those are
+            # useful and don't redraw in place.
+            env["TQDM_DISABLE"] = "1"
 
             print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx}...")
             proc = subprocess.Popen(
