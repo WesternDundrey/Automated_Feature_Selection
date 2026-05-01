@@ -85,8 +85,6 @@ def main():
                              "--scaffold-catalog and the default scaffold path.")
     parser.add_argument("--no-mse", action="store_true",
                         help="Use legacy BCE supervision instead of MSE")
-    parser.add_argument("--full-desc", action="store_true",
-                        help="Use full description in suffix instead of F-index (slower but more accurate)")
     parser.add_argument("--flat", action="store_true",
                         help="(deprecated, default-on as of v8.18) Strip group "
                              "features from catalog, keep only leaves. "
@@ -358,8 +356,6 @@ def main():
                              "The v8.3 --min-f1 flag is deprecated — the real gate has been AUROC since v8.4.")
     parser.add_argument("--promote-mini-prefilter-min-f1", type=float, default=None,
                         help=argparse.SUPPRESS)  # deprecated; retained for backwards compat only
-    parser.add_argument("--use-findex", action="store_true",
-                        help="Opt back into F-index annotation suffix (deprecated-by-default)")
     parser.add_argument(
         "--layers", default=None,
         help="Comma-separated layer list for --step layer-sweep "
@@ -474,10 +470,6 @@ def main():
         overrides["use_pos_weight"] = True
     if args.no_mse:
         overrides["supervision_mode"] = "bce"
-    if args.full_desc:
-        overrides["use_findex_suffix"] = False
-    if args.use_findex:
-        overrides["use_findex_suffix"] = True
     if args.no_freeze_decoder:
         # v8.18.25: turns off freeze for BOTH legacy and hinge family.
         # Useful for ablating the pure principled formulation.

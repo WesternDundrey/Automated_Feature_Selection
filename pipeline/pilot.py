@@ -195,6 +195,9 @@ def run(cfg: Config = None) -> dict:
         "tokens.pt",
         "activations.pt",
         "split_indices.pt",
+        # v8.19.6 lever-7: position_mask.pt must be shared across arms
+        # so unsup_f1's split aligns with sup-arm train/evaluate.
+        "position_mask.pt",
     ):
         src = sup_dir / fname
         dst = unsup_dir / fname

@@ -290,13 +290,20 @@ def run(cfg: Config = None) -> dict:
             f"it writes split_indices.pt that this Type-2 appendix reuses."
         )
     perm = torch.load(cfg.split_path, weights_only=True)
-    if perm.numel() != flat_total:
+    n_perm = perm.numel()
+    # v8.19.6 lever-7: support position-subsampled splits (n_perm <= flat_total).
+    if n_perm > flat_total:
         raise RuntimeError(
-            f"split_indices.pt has {perm.numel()} entries but tokens "
+            f"split_indices.pt has {n_perm} entries but tokens "
             f"flatten to {flat_total}. Mismatch."
         )
-    split_idx = int(cfg.train_fraction * flat_total)
-    remaining = flat_total - split_idx
+    if perm.max().item() >= flat_total:
+        raise RuntimeError(
+            f"split_indices.pt max index {int(perm.max())} >= flat_total "
+            f"({flat_total}). Corpus mismatch."
+        )
+    split_idx = int(cfg.train_fraction * n_perm)
+    remaining = n_perm - split_idx
     val_size = remaining // 2
     val_split = split_idx + val_size
     val_idx_to_pos = perm[split_idx:val_split]

@@ -121,8 +121,12 @@ def evaluate(cfg: Config = None):
         set_seed(cfg.seed)
         perm = torch.randperm(n_total)
 
-    split_idx = int(cfg.train_fraction * n_total)
-    remaining = n_total - split_idx
+    # v8.19.6 lever-7: when train.py wrote a position-subsampled perm,
+    # perm.numel() < n_total. Derive splits from perm size, not n_total,
+    # so val/test are taken from the same slice train.py used.
+    n_perm = perm.numel()
+    split_idx = int(cfg.train_fraction * n_perm)
+    remaining = n_perm - split_idx
     val_size = remaining // 2
     val_split = split_idx + val_size
 

@@ -453,6 +453,41 @@ def _format_annotator_context(token_strs: list[str], target_pos: int) -> str:
     return "".join(parts)
 
 
+def _load_or_compute_position_mask(
+    cfg: Config, N: int, T: int
+) -> torch.Tensor | None:
+    """If cfg.position_subsample_k > 0, return (N, T) bool with K of T
+    positions sampled per sequence (deterministic by cfg.seed). Saves
+    to cfg.position_mask_path so downstream consumers see the same
+    mask. None if disabled."""
+    k = int(getattr(cfg, "position_subsample_k", 0) or 0)
+    if k <= 0 or k >= T:
+        return None
+    if cfg.position_mask_path.exists():
+        existing = torch.load(cfg.position_mask_path, weights_only=True)
+        if existing.shape == (N, T):
+            print(f"  position_mask: loaded existing "
+                  f"{existing.shape} from {cfg.position_mask_path} "
+                  f"({int(existing.sum())}/{N*T} positions sampled)")
+            return existing
+        print(f"  position_mask: existing shape {tuple(existing.shape)} "
+              f"!= ({N}, {T}); regenerating")
+    g = torch.Generator()
+    g.manual_seed(int(cfg.seed))
+    mask = torch.zeros((N, T), dtype=torch.bool)
+    # Sample K of T positions per sequence (no replacement) so coverage
+    # is uniform across the sequence axis; use one big randperm batch
+    # for speed.
+    for j in range(N):
+        perm = torch.randperm(T, generator=g)
+        mask[j, perm[:k]] = True
+    torch.save(mask, cfg.position_mask_path)
+    print(f"  position_mask: sampled {k}/{T} positions per seq → "
+          f"{int(mask.sum())}/{N*T} total positions saved to "
+          f"{cfg.position_mask_path}")
+    return mask
+
+
 def annotate_local(
     tokens: torch.Tensor,
     features: list[dict],
@@ -473,6 +508,12 @@ def annotate_local(
     """
     N, T = tokens.shape
     n_features = len(features)
+    # v8.19.6 lever-7: position subsample. Build/load mask BEFORE the
+    # main loop so the same positions are skipped across crash-resume
+    # restarts. annotations[~mask] stays at the zero-init default;
+    # downstream consumers that load position_mask.pt know to ignore
+    # those positions rather than treat them as "feature did not fire".
+    position_mask = _load_or_compute_position_mask(cfg, N, T)
 
     # Decode all tokens to strings once
     print("Decoding tokens to strings...")
@@ -621,34 +662,21 @@ def _annotate_local_vllm_pertoken(
     print(f"  Token IDs: '0'={tok_0_id}, '1'={tok_1_id}")
 
     # ── Build system prefix and suffix caches ──────────────────────────
-    # Both modes share the same cache structure:
+    # Cache structure:
     #   pos_prefix = sys + text:" + tok_0...tok_k + '"\nToken: "X". '  (CACHED)
     #   suffix = feature question only                                  (NOT cached)
-    # F-index suffix: "F3? " (~3 tok).  Full-desc suffix: "description? " (~8-10 tok)
-    use_findex = cfg.use_findex_suffix
+    # v8.19.6: F-index mode REMOVED entirely (it was harmful at scale —
+    # hardcoded few-shots assumed F0=comma / F5=capitalized which
+    # breaks any catalog that doesn't match those positions, and Opus-
+    # designed catalogs at 500 features never do).
     include_excl = getattr(cfg, "exclusions_in_annotator_suffix", True)
-    if use_findex:
-        feat_defs = "\n".join(
-            f"F{i}: {_format_feature_for_annotator(f, include_exclusions=include_excl)}"
-            for i, f in enumerate(features)
-        )
-        SYS_STR = (
-            f'Answer 0 (no) or 1 (yes).\n\n'
-            f'Features:\n{feat_defs}\n\n'
-            f'Text: "The cat sat on the mat ,"\n'
-            f'Token: ",". F0? 1\n'
-            f'Token: "mat". F0? 0\n'
-            f'Token: "The". F5? 1\n'
-            f'Token: "cat". F5? 0\n\n'
-        )
-    else:
-        SYS_STR = (
-            'Answer 0 (no) or 1 (yes).\n\n'
-            'Text: "The cat sat on the mat ,"\nToken: ",". A comma? 1\n'
-            'Text: "The cat sat on the mat ,"\nToken: "mat". A comma? 0\n'
-            'Text: "The cat sat on the mat ,"\nToken: "The". Starts with uppercase? 1\n'
-            'Text: "The cat sat on the mat ,"\nToken: "cat". Starts with uppercase? 0\n\n'
-        )
+    SYS_STR = (
+        'Answer 0 (no) or 1 (yes).\n\n'
+        'Text: "The cat sat on the mat ,"\nToken: ",". A comma? 1\n'
+        'Text: "The cat sat on the mat ,"\nToken: "mat". A comma? 0\n'
+        'Text: "The cat sat on the mat ,"\nToken: "The". Starts with uppercase? 1\n'
+        'Text: "The cat sat on the mat ,"\nToken: "cat". Starts with uppercase? 0\n\n'
+    )
 
     sys_ids = ann_tokenizer.encode(SYS_STR, add_special_tokens=False)
 
@@ -688,19 +716,13 @@ def _annotate_local_vllm_pertoken(
     # different questions for any sensible annotator, and plenty of our
     # features are case-sensitive by design (capitalization, acronym,
     # code identifier).
-    if use_findex:
-        feat_suffix_list = [
-            tuple(ann_tokenizer.encode(f'F{fi}? ', add_special_tokens=False))
-            for fi in range(n_features)
-        ]
-    else:
-        feat_suffix_list = [
-            tuple(ann_tokenizer.encode(
-                f'{_format_feature_for_annotator(f, include_exclusions=include_excl)}? ',
-                add_special_tokens=False,
-            ))
-            for f in features
-        ]
+    feat_suffix_list = [
+        tuple(ann_tokenizer.encode(
+            f'{_format_feature_for_annotator(f, include_exclusions=include_excl)}? ',
+            add_special_tokens=False,
+        ))
+        for f in features
+    ]
 
     text_open_ids = ann_tokenizer.encode('Text: "', add_special_tokens=False)
 
@@ -716,8 +738,7 @@ def _annotate_local_vllm_pertoken(
     computed_max_len = min(8192, ((max_prompt + 63) // 64) * 64)
 
     avg_sfx = sum(len(s) for s in feat_suffix_list) / max(len(feat_suffix_list), 1)
-    mode_str = "F-index" if use_findex else "full-desc"
-    print(f"  System prefix: {len(sys_ids)} tokens ({mode_str})")
+    print(f"  System prefix: {len(sys_ids)} tokens (full-desc)")
     print(f"  Token names: {len(tok_name_cache)} unique (cached per-position)")
     print(f"  Feature suffixes: avg {avg_sfx:.1f} tok (NOT cached)")
     print(f"  Max prompt: {max_prompt} tok → max_model_len={computed_max_len}")
@@ -808,6 +829,11 @@ def _annotate_local_vllm_pertoken(
             prefix = sys_tuple + text_open_tuple
             for tok_k in range(T):
                 prefix = prefix + tok_id_tuples[seq_j][tok_k]
+                # v8.19.6 lever-7: skip unsampled positions. Prefix
+                # still accumulates so later (sampled) positions get
+                # correct context.
+                if position_mask is not None and not bool(position_mask[seq_j, tok_k]):
+                    continue
                 tok_str = all_token_strs[seq_j][tok_k]  # preserve whitespace
                 # Token name in prefix: cached across all features at this position
                 pos_prefix = prefix + tok_name_cache[tok_str]

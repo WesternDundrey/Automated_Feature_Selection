@@ -49,7 +49,11 @@ class Config:
     # v8.19.0: 10→30 for Opus 4.7 1M context (used by opus_catalog.py
     # design pass; legacy Sonnet inventory still uses 10 via local override).
     features_per_explanation_batch: int = 30
-    features_per_annotation_call: int = 50
+    # v8.19.6: 50→80 for the 500-feature scaling run. The annotator's
+    # accuracy holds at ≤100 features per call when descriptions are
+    # short (≤10 words, single sentence — enforced by the v8.19.6 Opus
+    # prompt edits). Pass --features-per-call N to override.
+    features_per_annotation_call: int = 80
     max_annotation_concurrency: int = 20
 
     # ── Supervision corpus ──────────────────────────────────────────
@@ -58,6 +62,15 @@ class Config:
     n_sequences: int = 5000
     seq_len: int = 128
     corpus_batch_size: int = 8
+    # v8.19.6 lever-7 position subsampling: when > 0, annotate K of T
+    # positions per sequence (deterministic per-sequence RNG seeded by
+    # cfg.seed). 0 disables (full-sequence annotation, the default).
+    # Saved as `position_mask.pt` sidecar; train.py / evaluate.py /
+    # unsup_f1.py / oracle_unsup.py respect it. Compensate the lower
+    # per-feature positive count by raising cfg.min_support — at
+    # 50K seqs × 64 of 128 positions, min_support=500 gives a 0.0156%
+    # base-rate floor.
+    position_subsample_k: int = 0
 
     # ── Training ────────────────────────────────────────────────────
     n_unsupervised: int = 256
@@ -226,7 +239,14 @@ class Config:
     # recovering ~2-3x annotation throughput. Pass --legacy-prompts to
     # set both at once.
     legacy_prompts: bool = False
-    exclusions_in_annotator_suffix: bool = True
+    # v8.19.6: DEFAULT FLIPPED to False (was True). At 500-feature scale,
+    # rendering exclusions into the annotator suffix triples per-decision
+    # token count without measurable label-quality gain — boundary-
+    # discipline is enforced at catalog-generation time (positive_examples,
+    # negative_examples, exclusions are stored in catalog metadata for
+    # audit) and the annotator follows the description directly. Pass
+    # --exclusions-in-suffix to opt back in for small catalogs.
+    exclusions_in_annotator_suffix: bool = False
 
     # When true, --step extend-corpus saves a permanent immutable
     # snapshot of the pre-extension annotations.pt + tokens.pt at
@@ -281,21 +301,13 @@ class Config:
     # torch.cuda.device_count); 1 = force single-GPU; 2+ = use exactly
     # this many shards (must be ≤ available GPUs).
     n_annotation_gpus: int = 0
-    # Full description is the safer default: F-index mode ("F3? ") has
-    # hardcoded few-shot exemplars in annotate.py that assume F0=comma and
-    # F5=capitalized, which breaks for any catalog that doesn't match those
-    # positions (in particular, any catalog with fewer than 6 features, or
-    # any incremental discovery round). Flipped to False in v8.3; pass
-    # `--use-findex` to opt back in if you know your catalog matches.
-    use_findex_suffix: bool = False  # True = "F3? " (~3 tok), False = full description (~15 tok)
-
     # Sequences per vLLM batch in the per-token annotator. Previously
     # hardcoded to 2; the actual throughput optimum depends on feature count
-    # × seq_len × KV-cache budget. Sweep {2,4,8,16,32} on your GPU and pick
-    # the knee. A knob here instead of a constant lets the user tune without
-    # code changes. Too high wastes KV-cache (exceeds `max_model_len *
-    # max_num_seqs` budget in vLLM); too low underfeeds the engine.
-    local_annotation_seq_chunk: int = 2
+    # × seq_len × KV-cache budget. v8.19.6: bumped 2→8 — at 500 features
+    # × seq_len 128 with short descriptions, 5090's 32 GB easily fits
+    # chunk=8 (vLLM continuous-batching sweet spot). Sweep {4,8,16,32}
+    # on your GPU and pick the knee if you need more.
+    local_annotation_seq_chunk: int = 8
 
     # Positions to mask out at analysis time (starting from position 0).
     #
@@ -508,6 +520,15 @@ class Config:
         cached labels can be remapped by ID instead of silently misbinding to
         whatever happens to sit at the same column index."""
         return self.output_dir / "annotations_meta.json"
+
+    @property
+    def position_mask_path(self) -> Path:
+        """Sidecar (N, T) bool tensor written by annotate.py when
+        position_subsample_k > 0. Downstream consumers (train.py,
+        evaluate.py, unsup_f1.py, oracle_unsup.py) load this and treat
+        unsampled positions as `not labeled` rather than `feature did
+        not fire`."""
+        return self.output_dir / "position_mask.pt"
 
     @property
     def checkpoint_path(self) -> Path:

@@ -531,11 +531,39 @@ def train_supervised_sae(
 
     # Train/test split (shuffled to avoid distribution shift from document order)
     n_total = x_flat.shape[0]
-    perm = torch.randperm(n_total)
-    split_idx = int(cfg.train_fraction * n_total)
+    # v8.19.6 lever-7: when a position_mask sidecar exists, restrict the
+    # split permutation to ONLY sampled positions. Unsampled positions
+    # have annotations==0 (the zero-init default) and would be treated
+    # as "feature did not fire" by the loss — which is wrong, they are
+    # "not labeled". By keeping them out of `perm`, train/val/test
+    # never see them and split_indices.pt is consistent across arms.
+    if cfg.position_mask_path.exists():
+        try:
+            mask = torch.load(cfg.position_mask_path, weights_only=True)
+            mask_flat = mask.reshape(-1)
+            if mask_flat.numel() == n_total:
+                valid_idx = mask_flat.nonzero(as_tuple=True)[0]
+                perm = valid_idx[torch.randperm(valid_idx.numel())]
+                print(f"  position_mask applied: split restricted to "
+                      f"{perm.numel():,} of {n_total:,} flat positions "
+                      f"({perm.numel()*100/n_total:.1f}%)")
+            else:
+                print(f"  position_mask shape {tuple(mask.shape)} "
+                      f"flatten ({mask_flat.numel()}) != n_total "
+                      f"({n_total}); ignoring mask")
+                perm = torch.randperm(n_total)
+        except Exception as e:
+            print(f"  position_mask load failed ({e}); using full split")
+            perm = torch.randperm(n_total)
+    else:
+        perm = torch.randperm(n_total)
+    split_idx = int(cfg.train_fraction * perm.numel())
     train_idx, test_idx = perm[:split_idx], perm[split_idx:]
 
-    # Save split indices for reproducible evaluation (avoids RNG coupling)
+    # Save split indices for reproducible evaluation (avoids RNG coupling).
+    # Note: when position_mask is active, perm.numel() < n_total — downstream
+    # tools (evaluate, unsup_f1, oracle_unsup) compute val/test from
+    # `int(train_fraction * perm.numel())` so they remain consistent.
     if save_checkpoint:
         torch.save(perm, cfg.split_path)
 

@@ -95,6 +95,17 @@ def _build_design_prompt(top_activations: dict, tokenizer, cfg: Config) -> str:
           - "Token immediately follows a comma"                (left context)
           - "Token appears after 'Mr.' or 'Dr.'"               (left context)
 
+        CRISPNESS / LENGTH BUDGET (v8.19.6, scaling-run requirement):
+          - Each leaf `description` MUST be a single sentence ≤ 10 words.
+          - Leaf `id` MUST be ≤ 24 chars (e.g. "punctuation.comma", not
+            "punctuation_type.contrastive_dialogue_comma").
+          - The annotator suffix renders ONLY the description (exclusions
+            are kept in catalog metadata for audit but are NOT sent to
+            the annotator). Short descriptions = 4-5× annotation
+            throughput at 500-feature scale.
+          - If you can't say it in ≤ 10 words, the feature is too
+            entangled — split it or drop it.
+
         SELECTION FREEDOM — you may:
           - merge multiple shortlist latents into one feature
           - drop noisy / polysemantic latents that don't yield a clean

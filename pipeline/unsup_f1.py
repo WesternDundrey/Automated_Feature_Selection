@@ -197,19 +197,29 @@ def run(cfg: Config = None) -> dict:
             f"train in the sup arm before --step unsup-f1."
         )
     perm = torch.load(cfg.split_path, weights_only=True)
-    if perm.numel() != n_total:
+    n_perm = perm.numel()
+    # v8.19.6 lever-7: when position-subsampled, n_perm < n_total. Allow
+    # either case; only reject if n_perm is bigger than n_total or
+    # appears to be from a totally different corpus shape.
+    if n_perm > n_total:
         raise RuntimeError(
-            f"split_indices.pt has {perm.numel()} entries but tokens "
-            f"flatten to {n_total}. Mismatch — sup and unsup arms saw "
-            f"different corpora."
+            f"split_indices.pt has {n_perm} entries but tokens flatten "
+            f"to {n_total}. Mismatch — sup and unsup arms saw different "
+            f"corpora."
         )
-    split_idx = int(cfg.train_fraction * n_total)
-    remaining = n_total - split_idx
+    if perm.max().item() >= n_total:
+        raise RuntimeError(
+            f"split_indices.pt max index {int(perm.max())} >= n_total "
+            f"({n_total}). Corpus mismatch."
+        )
+    split_idx = int(cfg.train_fraction * n_perm)
+    remaining = n_perm - split_idx
     val_size = remaining // 2
     val_split = split_idx + val_size
     test_idx = perm[val_split:]
     print(f"  Test split:         {test_idx.numel():,} flat positions "
-          f"of {n_total:,} (matches sup-arm evaluate.py)")
+          f"of {n_total:,} (matches sup-arm evaluate.py; "
+          f"position-subsampled if n_perm={n_perm} < n_total)")
 
     # Annotations columns: assume aligned with leaves order (annotate.py
     # writes one column per leaf in catalog order; we order leaves by
