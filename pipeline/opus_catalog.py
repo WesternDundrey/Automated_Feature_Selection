@@ -335,15 +335,26 @@ def run(cfg: Config = None) -> dict:
         print(f"  Single-call design: {cfg.opus_n_features} features "
               f"(≤ {features_per_call} per-call cap).")
 
-    # Slice the shortlist evenly. Keep the original order from the
-    # shortlist (descending firing rate). Use the latent indices that
-    # actually have activating examples.
-    shortlist_with_acts = [k for k in shortlist if top_activations.get(k)]
-    chunk_size = (len(shortlist_with_acts) + n_chunks - 1) // n_chunks
+    # Slice the shortlist evenly. inventory.collect_top_activations
+    # returns a dict keyed by str(latent_idx), so build chunks from
+    # the existing items rather than re-keying via the int shortlist.
+    # Keeps the original order (descending firing rate from shortlist).
+    items_with_acts = [(k, v) for k, v in top_activations.items() if v]
+    # Sort by integer interpretation of the key so the order matches
+    # the shortlist ranking (collect_top_activations preserves order
+    # internally, but be defensive for str-keyed dicts).
+    items_with_acts.sort(key=lambda kv: int(kv[0]))
+    chunk_size = (len(items_with_acts) + n_chunks - 1) // n_chunks
     chunks = [
-        shortlist_with_acts[i * chunk_size : (i + 1) * chunk_size]
+        dict(items_with_acts[i * chunk_size : (i + 1) * chunk_size])
         for i in range(n_chunks)
     ]
+    if not items_with_acts:
+        raise RuntimeError(
+            "Top-activations dict has no entries with examples; "
+            "the activation-collection pass returned empty results "
+            "for every latent in the shortlist."
+        )
 
     merged_features: list[dict] = []
     seen_ids: set[str] = set()
@@ -351,8 +362,7 @@ def run(cfg: Config = None) -> dict:
     # Per-chunk cfg with its own opus_n_features so the design prompt
     # asks for the right per-chunk count.
     import copy as _copy
-    for chunk_i, chunk_lat_ids in enumerate(chunks):
-        chunk_top_acts = {k: top_activations[k] for k in chunk_lat_ids}
+    for chunk_i, chunk_top_acts in enumerate(chunks):
         chunk_cfg = _copy.copy(cfg)
         chunk_cfg.opus_n_features = chunk_target
 
@@ -360,7 +370,7 @@ def run(cfg: Config = None) -> dict:
         n_in_chars = len(prompt)
         if n_chunks > 1:
             print(f"\n  --- Chunk {chunk_i + 1}/{n_chunks}  "
-                  f"({len(chunk_lat_ids)} latents, target "
+                  f"({len(chunk_top_acts)} latents, target "
                   f"{chunk_target} features) ---")
         print(f"  Design prompt: {n_in_chars:,} chars "
               f"(~{n_in_chars // 4:,} tokens)")
