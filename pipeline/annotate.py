@@ -1353,15 +1353,23 @@ torch.save(annotations, {str(shard_out)!r})
             env["SUPSAE_LOCAL_ANNOTATION_SUBPROCESS"] = "1"
             env["SUPSAE_SHARD_ID"] = str(gpu_idx)
             # v8.19.8: each vLLM shard runs its own world_size=1
-            # distributed init. The v1 engine binds a fixed default
-            # TCP port for parallel_state setup; with two shards this
-            # collides (both pids on tcp://...:44871, NCCL hangs).
-            # Give each shard a unique master port so their
-            # single-rank "distributed" worlds don't clash.
+            # distributed init. Two issues addressed:
+            # (1) Master port — give each shard its own so single-rank
+            #     "distributed" worlds don't share state.
+            # (2) NCCL on Docker — vast.ai runs in a container with a
+            #     bridge interface (172.17.0.5/eth0). NCCL by default
+            #     probes IB/SHM/P2P transports and Docker-bridge
+            #     interfaces; on single-rank worlds it has no peer to
+            #     find and hangs. Force loopback + disable P2P/IB so
+            #     NCCL init returns immediately.
             base_port = 54321
             unique_port = base_port + gpu_idx
             env["VLLM_DP_MASTER_PORT"] = str(unique_port)
             env["MASTER_PORT"] = str(unique_port)
+            env["NCCL_P2P_DISABLE"] = "1"
+            env["NCCL_IB_DISABLE"] = "1"
+            env["NCCL_SOCKET_IFNAME"] = "lo"
+            env["NCCL_SHM_DISABLE"] = "1"
 
             print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx}...")
             proc = subprocess.Popen(
