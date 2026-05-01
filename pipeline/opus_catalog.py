@@ -311,54 +311,130 @@ def run(cfg: Config = None) -> dict:
         model, sae, tokenizer, shortlist, cfg
     )
 
-    prompt = _build_design_prompt(top_activations, tokenizer, cfg)
-    n_in_chars = len(prompt)
-    print(f"Design prompt: {n_in_chars:,} chars (~{n_in_chars // 4:,} tokens)")
-    # Hard guard: 1M context window; reserve 64K for max_tokens.
-    # Use a slightly conservative limit to absorb tokenizer variance.
-    MAX_INPUT_TOKENS = 920_000
-    est_in_tokens = n_in_chars // 4
-    if est_in_tokens > MAX_INPUT_TOKENS:
-        raise RuntimeError(
-            f"Design prompt estimated at {est_in_tokens:,} tokens "
-            f"exceeds {MAX_INPUT_TOKENS:,}-token budget for "
-            f"{cfg.opus_explanation_model} (1M context − 64K output). "
-            f"Auto-downshift didn't recover; reduce shortlist_size or "
-            f"top_k_examples. Prompt was {n_in_chars:,} chars at "
-            f"effective top_k={cfg.top_k_examples}."
-        )
-
     client = get_client()
-    print(f"Calling {cfg.opus_explanation_model} (max_tokens=64000)...")
 
-    catalog = None
-    last_err = None
-    text = None
-    for attempt in range(3):
-        try:
-            text = chat(
-                client, cfg.opus_explanation_model, prompt, max_tokens=64000,
-            )
-            from .inventory import _extract_json_object
-            catalog = _extract_json_object(text)
-            if catalog is not None and "features" in catalog:
-                break
-            preview = (text[:300] if isinstance(text, str)
-                       else f"<non-string response: {type(text).__name__}>")
-            last_err = ValueError(
-                f"Could not parse catalog JSON. Begins: {preview}"
-            )
-        except Exception as e:
-            last_err = e
-            text = None
-        if attempt < 2:
-            print(f"  Attempt {attempt + 1} failed: {last_err}, retrying...")
-            time.sleep(2 ** attempt)
+    # v8.19.7 chunked design. Opus 4.7 max_tokens=64K caps output at
+    # ~150 features per call (each feature ≈ 400 tok of JSON). For
+    # opus_n_features > opus_features_per_call, split the shortlist
+    # evenly and design <chunk_target> features from each slice. Merge
+    # by feature id (last write wins; duplicates expected on symmetry
+    # families that survive across slices).
+    features_per_call = max(20, int(cfg.opus_features_per_call))
+    if cfg.opus_n_features <= features_per_call:
+        n_chunks = 1
+    else:
+        import math as _math
+        n_chunks = _math.ceil(cfg.opus_n_features / features_per_call)
+    chunk_target = (cfg.opus_n_features + n_chunks - 1) // n_chunks
 
-    if catalog is None:
-        raise RuntimeError(
-            f"Opus catalog design failed after 3 attempts: {last_err}"
+    if n_chunks > 1:
+        print(f"  Chunked design: {cfg.opus_n_features} target features "
+              f"split across {n_chunks} Opus calls "
+              f"({chunk_target} features each).")
+    else:
+        print(f"  Single-call design: {cfg.opus_n_features} features "
+              f"(≤ {features_per_call} per-call cap).")
+
+    # Slice the shortlist evenly. Keep the original order from the
+    # shortlist (descending firing rate). Use the latent indices that
+    # actually have activating examples.
+    shortlist_with_acts = [k for k in shortlist if top_activations.get(k)]
+    chunk_size = (len(shortlist_with_acts) + n_chunks - 1) // n_chunks
+    chunks = [
+        shortlist_with_acts[i * chunk_size : (i + 1) * chunk_size]
+        for i in range(n_chunks)
+    ]
+
+    merged_features: list[dict] = []
+    seen_ids: set[str] = set()
+
+    # Per-chunk cfg with its own opus_n_features so the design prompt
+    # asks for the right per-chunk count.
+    import copy as _copy
+    for chunk_i, chunk_lat_ids in enumerate(chunks):
+        chunk_top_acts = {k: top_activations[k] for k in chunk_lat_ids}
+        chunk_cfg = _copy.copy(cfg)
+        chunk_cfg.opus_n_features = chunk_target
+
+        prompt = _build_design_prompt(chunk_top_acts, tokenizer, chunk_cfg)
+        n_in_chars = len(prompt)
+        if n_chunks > 1:
+            print(f"\n  --- Chunk {chunk_i + 1}/{n_chunks}  "
+                  f"({len(chunk_lat_ids)} latents, target "
+                  f"{chunk_target} features) ---")
+        print(f"  Design prompt: {n_in_chars:,} chars "
+              f"(~{n_in_chars // 4:,} tokens)")
+
+        MAX_INPUT_TOKENS = 920_000
+        est_in_tokens = n_in_chars // 4
+        if est_in_tokens > MAX_INPUT_TOKENS:
+            raise RuntimeError(
+                f"Chunk {chunk_i + 1} prompt estimated at "
+                f"{est_in_tokens:,} tokens exceeds "
+                f"{MAX_INPUT_TOKENS:,}-token budget. Reduce shortlist_size "
+                f"or top_k_examples; auto-downshift didn't recover."
+            )
+
+        print(f"  Calling {cfg.opus_explanation_model} (max_tokens=64000)...")
+        chunk_catalog = None
+        last_err = None
+        text = None
+        for attempt in range(3):
+            try:
+                text = chat(
+                    client, cfg.opus_explanation_model, prompt,
+                    max_tokens=64000,
+                )
+                from .inventory import _extract_json_object
+                chunk_catalog = _extract_json_object(text)
+                if chunk_catalog is not None and "features" in chunk_catalog:
+                    break
+                if isinstance(text, str):
+                    head = text[:200]
+                    tail = text[-200:] if len(text) > 200 else ""
+                    preview = (
+                        f"head[{len(text):,} chars]: {head!r}"
+                        + (f"  TAIL: {tail!r}" if tail else "")
+                    )
+                else:
+                    preview = (
+                        f"<non-string response: {type(text).__name__}>"
+                    )
+                last_err = ValueError(
+                    f"Could not parse catalog JSON. {preview}. "
+                    f"Likely cause: response truncated at max_tokens; "
+                    f"reduce cfg.opus_features_per_call (currently "
+                    f"{cfg.opus_features_per_call})."
+                )
+            except Exception as e:
+                last_err = e
+                text = None
+            if attempt < 2:
+                print(f"    Attempt {attempt + 1} failed: {last_err}, "
+                      f"retrying...")
+                time.sleep(2 ** attempt)
+
+        if chunk_catalog is None:
+            raise RuntimeError(
+                f"Opus chunk {chunk_i + 1}/{n_chunks} failed after 3 "
+                f"attempts: {last_err}"
+            )
+
+        chunk_leaves = sum(
+            1 for f in chunk_catalog["features"] if f.get("type") == "leaf"
         )
+        print(f"  Chunk {chunk_i + 1}: {chunk_leaves} leaves designed")
+
+        for f in chunk_catalog["features"]:
+            fid = f.get("id")
+            if not fid:
+                continue
+            if fid in seen_ids:
+                continue
+            merged_features.append(f)
+            seen_ids.add(fid)
+
+    catalog = {"features": merged_features}
 
     n_groups = sum(1 for f in catalog["features"] if f.get("type") == "group")
     n_leaves = sum(1 for f in catalog["features"] if f.get("type") == "leaf")

@@ -412,6 +412,13 @@ class Config:
     shortlist_size: int = 1000
     delphi_n_features: int = 300
     opus_n_features: int = 300
+    # v8.19.7: Opus 4.7 output is capped (max_tokens=64K = ~150 features
+    # at ~400 JSON tokens per feature with full boundary-discipline). To
+    # design more features, split into multiple API calls; each call
+    # designs `opus_features_per_call` features from its slice of the
+    # shortlist. Chunked design auto-triggers when opus_n_features >
+    # opus_features_per_call.
+    opus_features_per_call: int = 100
     # Opus 4.7 OpenRouter model id. Verify exact slug at first call;
     # update if Anthropic re-tags. 1M context variant required so Opus can
     # ingest top contexts of 1000 latents in a single design pass.
