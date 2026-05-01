@@ -886,8 +886,14 @@ def _annotate_local_vllm_pertoken(
         for j in range(N)
     ]
 
+    chunk_idx = 0
+    checkpoint_every = max(
+        1, int(getattr(cfg, "annotation_checkpoint_every_n_chunks", 5))
+    )
+
     for seq_start in range(resume_from, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
+        chunk_idx += 1
 
         prompts = []
         positions = []
@@ -955,9 +961,16 @@ def _annotate_local_vllm_pertoken(
         print(f"{prefix}{completed:,}/{total_decisions:,} decisions  "
               f"rate={rate:.0f}/s  ETA {eta_sec/3600:.1f}h")
 
-        # Save checkpoint after each chunk (crash recovery)
-        torch.save(annotations, partial_path)
-        progress_path.write_text(str(seq_end))
+        # Save checkpoint every N chunks (crash recovery). Every-chunk
+        # saves are wasteful at scale: with 5K seqs/shard at chunk=32,
+        # that's 156 saves/shard each writing a ~610MB tensor — pure
+        # disk I/O between GPU bursts. Every-5-chunks → ~31 saves
+        # per shard. Always save on the final chunk so completion
+        # never loses work.
+        is_last_chunk = seq_end >= N
+        if is_last_chunk or (chunk_idx % checkpoint_every == 0):
+            torch.save(annotations, partial_path)
+            progress_path.write_text(str(seq_end))
 
     # Clean up partial checkpoints on success
     if partial_path.exists():

@@ -313,6 +313,14 @@ class Config:
     # to override; 16 might suffice on memory-tight GPUs, 64 if
     # construction overhead is fine.
     local_annotation_seq_chunk: int = 32
+    # Save annotations_local_partial.pt + progress.txt every N chunks
+    # instead of every chunk. At chunk=32, the per-shard annotations
+    # tensor is ~610MB; saving 156 times/run is ~95GB of disk I/O,
+    # mostly wasted between GPU bursts. Every 5 chunks → ~31 saves
+    # per shard, keeping crash recovery to ~5 chunks of lost work
+    # (~1.5 minutes at current throughput) while reclaiming ~80% of
+    # checkpoint I/O time.
+    annotation_checkpoint_every_n_chunks: int = 5
 
     # Positions to mask out at analysis time (starting from position 0).
     #

@@ -253,6 +253,13 @@ def main():
              "benchmarking and prompt construction experiments.",
     )
     parser.add_argument(
+        "--annotation-checkpoint-every", type=int, default=None,
+        help="Save annotations_local_partial.pt every N chunks (default 5). "
+             "Lower = more frequent saves (more I/O, less work lost on "
+             "crash). Higher = less I/O, more work lost on crash. The "
+             "final chunk is always saved regardless.",
+    )
+    parser.add_argument(
         "--no-parallel-annotation", action="store_true",
         help="Force single-GPU annotation even when 2+ GPUs are visible. "
              "Use to leave a GPU free for another job.",
@@ -486,6 +493,8 @@ def main():
         overrides["local_annotation_seq_chunk"] = args.annotation_seq_chunk
     if args.features_per_call is not None:
         overrides["features_per_annotation_call"] = args.features_per_call
+    if args.annotation_checkpoint_every is not None:
+        overrides["annotation_checkpoint_every_n_chunks"] = args.annotation_checkpoint_every
     if args.no_parallel_annotation:
         overrides["local_annotation_parallel"] = False
     if args.keep_groups:
