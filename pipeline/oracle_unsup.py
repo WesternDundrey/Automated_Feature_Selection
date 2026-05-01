@@ -99,7 +99,7 @@ def _stream_firing_counts(
     """
     from .inventory import load_sae, load_target_model
     sae, _ = load_sae(cfg)
-    model, _tok = load_target_model(cfg)
+    model = load_target_model(cfg)
     sae = sae.to(cfg.device)
 
     n_lat = (
@@ -179,7 +179,7 @@ def _eval_oracle_on_test(
     """
     from .inventory import load_sae, load_target_model
     sae, _ = load_sae(cfg)
-    model, _tok = load_target_model(cfg)
+    model = load_target_model(cfg)
     sae = sae.to(cfg.device)
 
     n_features = test_y.shape[1]

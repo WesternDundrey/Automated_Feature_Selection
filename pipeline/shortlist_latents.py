@@ -58,7 +58,7 @@ def _compute_firing_rate(cfg: Config, sae) -> torch.Tensor:
           f"{cfg.shortlist_calibration_tokens:,} tokens "
           f"(no hosted sparsity for {cfg.sae_release})...")
 
-    model, tokenizer = load_target_model(cfg)
+    model = load_target_model(cfg)
     sae = sae.to(cfg.device)
 
     if sae.W_enc is not None:

@@ -99,7 +99,7 @@ def _compute_per_feature_f1(
     """
     from .inventory import load_sae, load_target_model
     sae, _ = load_sae(cfg)
-    model, _tok = load_target_model(cfg)
+    model = load_target_model(cfg)
     sae = sae.to(cfg.device)
 
     n_seqs, T_per = tokens.shape

@@ -196,7 +196,8 @@ def run(cfg: Config = None) -> dict:
     print(f"Loaded shortlist: {len(shortlist)} latents")
 
     sae, _ = load_sae(cfg)
-    model, tokenizer = load_target_model(cfg)
+    model = load_target_model(cfg)
+    tokenizer = model.tokenizer
     print(f"Collecting top-{cfg.top_k_examples} contexts for "
           f"{len(shortlist)} latents over "
           f"{cfg.n_tokens_for_activation_collection:,} tokens...")
