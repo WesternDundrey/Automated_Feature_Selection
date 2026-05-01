@@ -32,6 +32,14 @@ if multiprocessing.get_start_method(allow_none=True) != "spawn":
 # it through env.copy().
 import os as _os_init
 _os_init.environ.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "1800")
+# v8.19.8: vast.ai Docker containers default to 64 MB /dev/shm.
+# vLLM v1 EngineCore needs shared-memory broadcast blocks for
+# parent↔EngineCore IPC; can't allocate at 64 MB → parent times out
+# waiting for ready (vllm-project/vllm#17676). Disable v1 multiproc
+# so the scheduler runs in-process; no /dev/shm requirement.
+# `setdefault` lets you opt back into multiproc by exporting
+# VLLM_ENABLE_V1_MULTIPROCESSING=1 before launch.
+_os_init.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 import asyncio
 import json
@@ -1368,6 +1376,17 @@ torch.save(annotations, {str(shard_out)!r})
             # this box; only kicks in for true slow paths. setdefault
             # preserves user override.
             env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "1800")
+            # v8.19.8: vLLM v1's out-of-process EngineCore uses
+            # shared-memory broadcast blocks (/dev/shm) for parent↔
+            # EngineCore IPC. vast.ai Docker containers default to
+            # 64 MB /dev/shm; vLLM can't allocate the block and the
+            # parent waits forever for ready (vllm-project/vllm#17676,
+            # "No available shared memory broadcast block found in
+            # 60 second"). Workaround per vLLM docs: disable v1
+            # multiprocessing so the scheduler runs in-process. ~5%
+            # throughput cost vs out-of-process; far better than
+            # hanging. setdefault lets the user opt back in.
+            env.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
             print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx}...")
             proc = subprocess.Popen(
