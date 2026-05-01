@@ -67,13 +67,13 @@ def _build_design_prompt(top_activations: dict, tokenizer, cfg: Config) -> str:
     the first latent's block size is not representative of the average.
     """
 
-    # Budget: Opus 4.7 max context = 1,000,000 tokens. Reserve 64K for
-    # output (max_tokens) + ~80K for the static prompt scaffold (rules,
-    # JSON template, symmetry list, etc.). Leaves ~860K tokens for
-    # latent contexts. At a conservative ~3.6 chars/token (English text
-    # is denser than 4 chars/token under tiktoken-style BPE), use 3.0M
-    # chars budget for the FULL prompt to leave headroom.
-    BUDGET_CHARS = 3_000_000
+    # Budget: Opus 4.7 max context = 1,000,000 tokens. Empirically
+    # (measured 2026-05-01 on a real run), Anthropic's tokenizer
+    # produces ~2.4 chars/token on our prompts (the latent context
+    # blocks are dense with markup like `[N] (act=X.XX) <ctx>` and
+    # short subword tokens). Budget = (1M − 64K output − 50K scaffold
+    # safety) × 2.4 chars/tok ≈ 2.1M chars. Use 1.9M to be safe.
+    BUDGET_CHARS = 1_900_000
     REQUESTED_TOP_K = cfg.top_k_examples
 
     n_in = sum(1 for examples in top_activations.values() if examples)
@@ -333,6 +333,7 @@ def run(cfg: Config = None) -> dict:
 
     catalog = None
     last_err = None
+    text = None
     for attempt in range(3):
         try:
             text = chat(
@@ -342,11 +343,14 @@ def run(cfg: Config = None) -> dict:
             catalog = _extract_json_object(text)
             if catalog is not None and "features" in catalog:
                 break
+            preview = (text[:300] if isinstance(text, str)
+                       else f"<non-string response: {type(text).__name__}>")
             last_err = ValueError(
-                f"Could not parse catalog JSON. Begins: {text[:300]}"
+                f"Could not parse catalog JSON. Begins: {preview}"
             )
         except Exception as e:
             last_err = e
+            text = None
         if attempt < 2:
             print(f"  Attempt {attempt + 1} failed: {last_err}, retrying...")
             time.sleep(2 ** attempt)
