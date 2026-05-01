@@ -95,6 +95,24 @@ $UV_PIP --force-reinstall vllm
 # decoding — uninstall it preemptively.
 $UV_UNINSTALL torchcodec 2>/dev/null || true
 
+echo ""
+echo "=== Compartment 4: EleutherAI Delphi (v8.19.0+ unsup arm) ==="
+# v8.19.4: the Delphi-vs-Opus comparison's unsup arm runs real
+# EleutherAI Delphi v0.1.3+ via subprocess (pipeline/delphi_runner.py).
+# Clone alongside the supsae repo and install editable so the inline
+# invoker can `import delphi`. The directory is .gitignore'd in supsae;
+# this is the canonical install path for vast.ai/local boxes.
+DELPHI_DIR="${DELPHI_DIR:-./delphi}"
+if [ ! -d "$DELPHI_DIR/.git" ]; then
+    echo "    Cloning EleutherAI/delphi → $DELPHI_DIR"
+    git clone --depth 1 https://github.com/EleutherAI/delphi.git "$DELPHI_DIR"
+else
+    echo "    $DELPHI_DIR already cloned; pulling latest"
+    git -C "$DELPHI_DIR" pull --ff-only || true
+fi
+echo "    Installing delphi (editable, with deps)"
+$UV_PIP -e "$DELPHI_DIR"
+
 # Verify
 echo ""
 echo "=== Verifying ==="
@@ -121,6 +139,16 @@ for mod, name in [
 import torch, numpy as np
 print(f'  torch CUDA:               {torch.version.cuda}')
 print(f'  numpy:                    {np.__version__}')
+
+# v8.19.4: also verify Delphi imports for the unsup arm.
+try:
+    import delphi
+    from delphi.config import RunConfig as _RC
+    from delphi.__main__ import process_cache as _pc, populate_cache as _pop
+    print(f'  delphi (unsup arm)        {getattr(delphi, \"__version__\", \"OK\")}')
+except Exception as e:
+    print(f'  delphi (unsup arm)        FAILED: {e}')
+    ok = False
 
 if not ok:
     sys.exit(1)
