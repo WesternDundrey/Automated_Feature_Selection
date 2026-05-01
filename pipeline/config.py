@@ -301,14 +301,18 @@ class Config:
     # torch.cuda.device_count); 1 = force single-GPU; 2+ = use exactly
     # this many shards (must be ≤ available GPUs).
     n_annotation_gpus: int = 0
-    # Sequences per vLLM batch in the per-token annotator. v8.19.6 bumped
-    # 2 → 8 thinking bigger Python batches would help. Empirically WRONG:
-    # vLLM does its own continuous batching internally and chunk=8
-    # primarily adds Python-side prompt-construction overhead with
-    # negligible scheduler benefit (user reports historical chunk=2
-    # produced ~800 tok/s; chunk=8 dropped it to ~475 tok/s on the
-    # same setup, ~40% regression). Reverted to 2 in v8.19.8.
-    local_annotation_seq_chunk: int = 2
+    # Sequences per vLLM batch in the per-token annotator. Tuning history:
+    # v8.19.6 bumped 2 → 8: too aggressive, Python prompt construction
+    # overhead outweighed scheduler benefit. Reverted to 2.
+    # v8.19.8 nvidia-smi diagnostic showed BOTH 5090s at 0% utilization
+    # under chunk=2 — vLLM is starving, not saturated. With vLLM 0.20.0,
+    # chunk=2 generates only 30,592 prompts per Python iteration (2 seqs
+    # × 64 positions × 239 features); the scheduler runs them through
+    # in ~100s but the GPUs sit idle between chunks during prompt
+    # construction. chunk=4 doubles per-iteration prompts (61K) which
+    # gives the scheduler more to chew on without exploding Python
+    # construction time.
+    local_annotation_seq_chunk: int = 4
 
     # Positions to mask out at analysis time (starting from position 0).
     #
