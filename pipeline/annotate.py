@@ -22,6 +22,17 @@ if multiprocessing.get_start_method(allow_none=True) != "spawn":
     except RuntimeError:
         pass
 
+# v8.19.8: vLLM v1 EngineCore subprocess startup defaults to a 600s
+# (10 min) ready timeout. On 5090 cold start with vLLM 0.20.0, Inductor
+# JIT compilation + CUDA graph capture for Qwen3-4B can exceed this
+# (Inductor caches aren't pre-built for new GPU architectures). Bump
+# to 30 min so legit slow boots don't get killed. This is patience,
+# not a behavioral workaround — vLLM completes init normally given
+# enough time. Set via os.environ so child shard subprocesses inherit
+# it through env.copy().
+import os as _os_init
+_os_init.environ.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "1800")
+
 import asyncio
 import json
 import logging
@@ -1370,6 +1381,10 @@ torch.save(annotations, {str(shard_out)!r})
             env["NCCL_IB_DISABLE"] = "1"
             env["NCCL_SOCKET_IFNAME"] = "lo"
             env["NCCL_SHM_DISABLE"] = "1"
+            # v8.19.8: bump vLLM EngineCore ready timeout from 600s to
+            # 30 min. Inductor JIT for 5090 + Qwen3-4B can take > 10 min
+            # on cold start.
+            env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "1800")
 
             print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx}...")
             proc = subprocess.Popen(
