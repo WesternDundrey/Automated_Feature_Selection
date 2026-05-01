@@ -281,9 +281,15 @@ def main():
     parser.add_argument(
         "--no-pos-weight", action="store_true",
         help="Disable class-balanced pos_weight in BCE/hinge supervision. "
-             "Combined with --hinge-margin 0, this is the literal mentor "
-             "formula `max(0, -(2y-1) z_i)` from supervised_saes_hinge_loss.md "
-             "with no margin shaping and no class reweighting.",
+             "v8.19.2: this is now the DEFAULT (matches the literal "
+             "mentor formula in supervised_saes_hinge_loss.md). Flag is "
+             "kept for backwards compatibility — its presence is a no-op.",
+    )
+    parser.add_argument(
+        "--use-pos-weight", action="store_true",
+        help="Re-enable class-balanced pos_weight in BCE/hinge supervision. "
+             "v8.19.2: needed only as an ablation against the new default "
+             "(use_pos_weight=False, the literal mentor formula).",
     )
     parser.add_argument("--widths", default=None,
                         help="Comma-separated n_unsupervised values for "
@@ -438,6 +444,12 @@ def main():
         overrides["hinge_squared"] = True
     if args.no_pos_weight:
         overrides["use_pos_weight"] = False
+    if args.use_pos_weight:
+        if args.no_pos_weight:
+            raise SystemExit(
+                "Cannot pass both --no-pos-weight and --use-pos-weight."
+            )
+        overrides["use_pos_weight"] = True
     if args.no_mse:
         overrides["supervision_mode"] = "bce"
     if args.full_desc:

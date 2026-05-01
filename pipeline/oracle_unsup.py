@@ -261,39 +261,44 @@ def run(cfg: Config = None) -> dict:
 
     n_seqs, T_per = tokens.shape
     flat_total = n_seqs * T_per
-    print(f"  Opus columns:    {len(opus_cols)}  /  merged leaves: {len(merged_leaves)}")
+    print(f"  Opus columns:    {len(opus_cols)}  (= n_features in catalog)")
     print(f"  Sequences:       {n_seqs}  Tokens/seq: {T_per}")
     print(f"  Total positions: {flat_total:,}")
 
-    # Held-out split (matching train.py's train_fraction). Of the held-out,
-    # half goes to VAL (oracle latent selection) and half to TEST (F1).
-    test_start = int(n_seqs * cfg.train_fraction)
-    held_out = list(range(test_start, n_seqs))
-    val_seq = held_out[: len(held_out) // 2]
-    test_seq = held_out[len(held_out) // 2 :]
-    print(f"  Train fraction:  {cfg.train_fraction}  → "
-          f"val seqs={len(val_seq)}, test seqs={len(test_seq)}")
-    if not val_seq or not test_seq:
+    # v8.19.2 methodology fix: use the same shuffled flat-position
+    # permutation as evaluate.py. Oracle val ↔ evaluate val_idx;
+    # oracle test ↔ evaluate test_idx — so the Type-2 oracle compares
+    # to sup F1 on identical positions.
+    if not cfg.split_path.exists():
+        raise FileNotFoundError(
+            f"Need {cfg.split_path}. Run --step train (sup arm) first; "
+            f"it writes split_indices.pt that this Type-2 appendix reuses."
+        )
+    perm = torch.load(cfg.split_path, weights_only=True)
+    if perm.numel() != flat_total:
         raise RuntimeError(
-            f"Held-out split has no val or test sequences "
-            f"(val={len(val_seq)}, test={len(test_seq)}). "
-            f"Increase n_sequences or lower train_fraction."
+            f"split_indices.pt has {perm.numel()} entries but tokens "
+            f"flatten to {flat_total}. Mismatch."
+        )
+    split_idx = int(cfg.train_fraction * flat_total)
+    remaining = flat_total - split_idx
+    val_size = remaining // 2
+    val_split = split_idx + val_size
+    val_idx_to_pos = perm[split_idx:val_split]
+    test_idx_to_pos = perm[val_split:]
+    print(f"  val/test (flat positions, evaluate-aligned): "
+          f"val={val_idx_to_pos.numel():,} test={test_idx_to_pos.numel():,}")
+    if val_idx_to_pos.numel() == 0 or test_idx_to_pos.numel() == 0:
+        raise RuntimeError(
+            f"Held-out split has empty val or test (n_total={flat_total}, "
+            f"train_fraction={cfg.train_fraction})."
         )
 
-    # Restrict annotations to Opus columns and split into val / test.
+    # Restrict annotations to Opus columns and slice to val / test.
     opus_col_idx = torch.tensor([c for c, _ in opus_cols], dtype=torch.long)
-    annotations_opus = annotations.index_select(-1, opus_col_idx)
-    val_y = annotations_opus[val_seq].reshape(-1, len(opus_cols))
-    test_y = annotations_opus[test_seq].reshape(-1, len(opus_cols))
-
-    val_idx_to_pos = torch.tensor(
-        [s * T_per + t for s in val_seq for t in range(T_per)],
-        dtype=torch.long,
-    )
-    test_idx_to_pos = torch.tensor(
-        [s * T_per + t for s in test_seq for t in range(T_per)],
-        dtype=torch.long,
-    )
+    annot_flat = annotations.reshape(flat_total, -1).index_select(-1, opus_col_idx)
+    val_y = annot_flat[val_idx_to_pos]                # (n_val, n_features)
+    test_y = annot_flat[test_idx_to_pos]              # (n_test, n_features)
 
     # Filter sparse-positive features (oracle is uninformative below 5
     # positives). Keep their indices.
@@ -364,8 +369,9 @@ def run(cfg: Config = None) -> dict:
         "n_evaluated": len(valid),
         "split": {
             "train_fraction": cfg.train_fraction,
-            "val_seqs": len(val_seq),
-            "test_seqs": len(test_seq),
+            "val_positions_flat": int(val_idx_to_pos.numel()),
+            "test_positions_flat": int(test_idx_to_pos.numel()),
+            "split_path": str(cfg.split_path),
         },
         "test_f1_mean": float(test_f1s.mean()) if valid else None,
         "test_f1_median": float(np.median(test_f1s)) if valid else None,

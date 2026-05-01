@@ -402,14 +402,21 @@ class Config:
     delphi_explainer_model: str = "anthropic/claude-sonnet-4.6"
     delphi_explainer_provider: str = "openrouter"
     delphi_scorer: str = "detection"   # "detection", "fuzz", or both
-    delphi_run_dir: str = "pipeline_data/delphi_run"
+    # Empty = arm-local default (resolved to <output_dir>/delphi_run in
+    # __post_init__). Pass an explicit path to override; pilot.py sets
+    # this per-arm so the unsup arm's cache lives under
+    # pipeline_data_unsup/delphi_run rather than colliding with the sup
+    # arm's pipeline_data/delphi_run.
+    delphi_run_dir: str = ""
     # Pre-Delphi/Opus latent shortlist: candidate-pool selection from the
-    # 24576-latent gpt2-small-res-jb. Frequency window keeps us in the
-    # describable middle of the distribution; concentration filters out
-    # polysemy-noise latents whose top-K contexts look random.
+    # 24576-latent gpt2-small-res-jb. Frequency window keeps the
+    # describable middle of the distribution; current implementation
+    # ranks by descending firing rate inside the window. Concentration-
+    # based ranking is documented as a future enhancement in
+    # shortlist_latents.py.
     shortlist_freq_min: float = 0.0005   # drop dead latents
     shortlist_freq_max: float = 0.10     # drop ultra-dense (Engels territory)
-    shortlist_concentration_topk: int = 1000  # contexts per latent for entropy
+    shortlist_concentration_topk: int = 1000  # documented; not yet used
     shortlist_calibration_tokens: int = 3_000_000
     # 4-GPU annotation shard: one CUDA-isolated subprocess per GPU.
     n_annotation_shards: int = 4
@@ -442,6 +449,11 @@ class Config:
             else:
                 self.hook_point = f"blocks.{self.target_layer}.hook_resid_post"
         self.output_dir = Path(self.output_dir)
+        # v8.19.2 two-arm flow: delphi_run_dir is arm-local by default so
+        # --output_dir pipeline_data_unsup automatically gets its own
+        # delphi_run cache instead of colliding with the sup arm's.
+        if not self.delphi_run_dir:
+            self.delphi_run_dir = str(self.output_dir / "delphi_run")
         # Fallback to CPU if CUDA not available.
         # Use environment check to avoid initializing CUDA (which breaks vLLM fork).
         if self.device == "cuda":

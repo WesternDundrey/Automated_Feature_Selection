@@ -77,27 +77,30 @@ def run(cfg: Config = None) -> dict:
         "unsup_dir": str(unsup_dir),
     }
 
-    # Sup arm headline
+    # Sup arm headline. evaluate.py writes mean_f1 / cal_mean_f1 /
+    # opt_mean_f1 + a `features` list of per-feature records each with
+    # an "f1" key. Compute median directly from those records.
     if sup_eval is not None:
-        sup_f1_keys = [
-            "supt0_f1_mean", "sup_t0_f1_mean", "mean_supt0_f1",
-            "supt0_f1", "f1_mean",
+        per_feat = sup_eval.get("features") or []
+        sup_f1s = [
+            r.get("f1") for r in per_feat
+            if r.get("f1") is not None
         ]
-        sup_f1_mean = next(
-            (sup_eval[k] for k in sup_f1_keys if k in sup_eval), None
-        )
-        sup_f1_median_keys = [
-            "supt0_f1_median", "sup_t0_f1_median", "f1_median",
+        sup_cal_f1s = [
+            r.get("f1_cal") for r in per_feat
+            if r.get("f1_cal") is not None
         ]
-        sup_f1_median = next(
-            (sup_eval[k] for k in sup_f1_median_keys if k in sup_eval), None
-        )
+        import numpy as np
         summary["sup"] = {
-            "f1_mean": sup_f1_mean,
-            "f1_median": sup_f1_median,
-            "n_features": (
-                sup_eval.get("n_features") or sup_eval.get("n_evaluated")
+            "f1_mean": sup_eval.get("mean_f1"),
+            "f1_median": float(np.median(sup_f1s)) if sup_f1s else None,
+            "cal_f1_mean": sup_eval.get("cal_mean_f1"),
+            "cal_f1_median": (
+                float(np.median(sup_cal_f1s)) if sup_cal_f1s else None
             ),
+            "discovery_f1_mean": sup_eval.get("mean_f1_discovery"),
+            "n_features": sup_eval.get("n_total_features"),
+            "n_with_f1": len(sup_f1s),
         }
     else:
         summary["sup"] = {"missing": str(sup_dir / "evaluation.json")}
@@ -157,6 +160,7 @@ def run(cfg: Config = None) -> dict:
     print()
     print(f"  Sup arm     (Opus catalog):  median F1 = "
           f"{fmt(s.get('f1_median'))}  mean = {fmt(s.get('f1_mean'))}  "
+          f"cal mean = {fmt(s.get('cal_f1_mean'))}  "
           f"n = {fmt(s.get('n_features'))}")
     print(f"  Unsup arm   (Delphi catalog):median F1 = "
           f"{fmt(u.get('f1_median'))}  mean = {fmt(u.get('f1_mean'))}  "

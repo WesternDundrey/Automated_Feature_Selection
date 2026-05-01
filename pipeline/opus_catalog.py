@@ -273,8 +273,16 @@ def run(cfg: Config = None) -> dict:
         except Exception:
             pass
     except Exception as e:
-        # Don't crash the run; emit a warning. The merge step + min-support
-        # filter will catch grossly bad leaves.
+        # v8.19.2: respect --catalog-gate-strict. The validator's whole
+        # job is to fail loudly; with strict mode on, propagate the
+        # error so a long benchmark run aborts rather than silently
+        # using an unfiltered catalog. Non-strict (default research
+        # mode) prints a warning and continues.
+        if cfg.catalog_gate_strict:
+            raise RuntimeError(
+                f"catalog_quality validator failed in strict mode "
+                f"(--catalog-gate-strict): {e}"
+            ) from e
         print(f"  WARNING: catalog_quality validation skipped: {e}")
 
     # v8.19.2 two-arm flow: write the named record (audit trail) AND

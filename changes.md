@@ -4,6 +4,95 @@
 
 ---
 
+## [v8.19.3] — Audit fixes + literal mentor defaults + multi-GPU note
+
+Reviewer caught seven real defects in the v8.19.2 refactor + the
+default-flip commit. All addressed.
+
+### Blocking fixes
+
+* **compare.py** read evaluate.py's actual output keys — `mean_f1`,
+  `cal_mean_f1`, `n_total_features` and the per-feature `features` list
+  with `f1`/`f1_cal` keys. Previously it looked for `f1_mean`,
+  `f1_median`, `n_features` (none exist). Median is now computed from
+  the per-feature records. Pilot's directionality gate now sees real
+  numbers instead of `None`.
+
+* **oracle_unsup.py** referenced `merged_leaves` after the v8.19.2
+  refactor removed that variable — would crash on first run. Replaced
+  with `opus_cols` length in the diagnostic print.
+
+* **Methodology bug: identical held-out positions across arms.** Sup
+  arm's `evaluate.py` uses a shuffled flat-position permutation
+  (`split_indices.pt`); `unsup_f1.py` was using the contiguous last
+  20% of sequences and `oracle_unsup.py` was splitting held-out
+  sequences in half. Different test positions = invalid F1 comparison.
+
+  Both modules now load `cfg.split_path` and use the EXACT same
+  flat-position test slice that `evaluate.py` does:
+  ```
+  perm        = torch.load(cfg.split_path)
+  split_idx   = int(train_fraction * n_total)
+  val_split   = split_idx + (n_total - split_idx) // 2
+  test_idx    = perm[val_split:]   # same as evaluate.py
+  ```
+  `oracle_unsup` additionally uses `perm[split_idx:val_split]` for
+  its val-side latent selection, matching `evaluate.py`'s val_idx.
+  `pilot.py` now symlinks `split_indices.pt` from sup arm into the
+  unsup arm dir (alongside tokens.pt + activations.pt + the shortlist).
+
+### Medium fixes
+
+* **delphi_run_dir is now arm-local.** Default changed from
+  `"pipeline_data/delphi_run"` (hardcoded) to `""`; resolved in
+  `Config.__post_init__` to `<output_dir>/delphi_run` when empty.
+  `--output_dir pipeline_data_unsup` now correctly redirects the
+  Delphi cache to `pipeline_data_unsup/delphi_run` instead of
+  colliding with the sup arm.
+
+* **opus_catalog respects `--catalog-gate-strict`.** The validator
+  call previously swallowed any exception with a warning. With
+  `cfg.catalog_gate_strict=True`, we now re-raise so a long benchmark
+  run aborts rather than silently using an unfiltered catalog.
+
+### Low fixes
+
+* **`--use-pos-weight` CLI flag added.** v8.19.2 flipped the default
+  to `False` (literal mentor formula); the existing `--no-pos-weight`
+  flag is now a no-op. Added `--use-pos-weight` (and a guard against
+  passing both) so the SVM-style ablation is reachable from the CLI.
+
+* **shortlist comments cleaned up.** Removed the stale
+  "concentration filtering" claims. `shortlist_concentration_topk`
+  field kept (used as a documented future-work placeholder; mentioned
+  in the docstring as a follow-up).
+
+### Multi-GPU
+
+Auto-detection works for annotation (the 80%+ of wall-clock cost):
+* `annotate._detect_annotation_gpus` reads `cfg.n_annotation_gpus`
+  if explicit, else `CUDA_VISIBLE_DEVICES` count, else
+  `torch.cuda.device_count()`. With 4 GPUs visible and default
+  `n_annotation_gpus=0` (auto), all 4 are used via
+  `_annotate_local_parallel` (one CUDA-isolated subprocess per GPU,
+  per-shard partial checkpoints, gathered after).
+* On a 4090×4 box, the projected ~38hr full-run annotation drops to
+  ~10hr.
+
+Other steps are single-GPU but small relative to annotation:
+* `shortlist`, `delphi-run`, `opus-catalog`, `train`, `evaluate`,
+  `oracle-unsup`, `unsup-f1` all use a single GPU (typically cuda:0).
+* No DDP or tensor-parallel; not needed at our 5K-seq + 300-feature
+  scale.
+
+If you want sup arm and unsup arm to run truly in parallel on
+different GPU subsets, launch two `python -m pipeline.run` processes
+with `CUDA_VISIBLE_DEVICES=0,1 --output_dir pipeline_data` and
+`CUDA_VISIBLE_DEVICES=2,3 --output_dir pipeline_data_unsup`.
+The pilot orchestrates them sequentially by default for simplicity.
+
+---
+
 ## [v8.19.2] — Two independent arms; merge logic removed
 
 User pushed back on the merge approach in v8.19.1: maintaining one

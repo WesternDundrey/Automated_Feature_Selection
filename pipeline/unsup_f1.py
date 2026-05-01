@@ -168,19 +168,33 @@ def run(cfg: Config = None) -> dict:
     annotations = torch.load(cfg.annotations_path, weights_only=True).bool()
     tokens = torch.load(cfg.tokens_path, weights_only=True)
     n_seqs, T_per = tokens.shape
+    n_total = n_seqs * T_per
 
-    # Held-out: last (1 - train_fraction) of sequences. Match the
-    # convention used by train.py's split for the sup arm so the
-    # comparison is on the same proportion of data.
-    test_start = int(n_seqs * cfg.train_fraction)
-    test_seq = list(range(test_start, n_seqs))
-    if not test_seq:
-        raise RuntimeError(
-            f"Held-out split has 0 sequences (train_fraction="
-            f"{cfg.train_fraction}, n_seqs={n_seqs})."
+    # v8.19.2 methodology fix: load the same shuffled flat-position
+    # split that the sup arm's evaluate.py uses, so sup F1 and unsup
+    # F1 are evaluated on IDENTICAL held-out positions. The unsup arm
+    # symlinks split_indices.pt from the sup arm (see compare flow).
+    if not cfg.split_path.exists():
+        raise FileNotFoundError(
+            f"Need {cfg.split_path} (the sup arm's shuffled flat-position "
+            f"permutation) to use the same test split as evaluate.py. "
+            f"Symlink it from the sup arm's output_dir, or run --step "
+            f"train in the sup arm before --step unsup-f1."
         )
-    print(f"  Test sequences:     {len(test_seq)} of {n_seqs} "
-          f"(train_fraction={cfg.train_fraction})")
+    perm = torch.load(cfg.split_path, weights_only=True)
+    if perm.numel() != n_total:
+        raise RuntimeError(
+            f"split_indices.pt has {perm.numel()} entries but tokens "
+            f"flatten to {n_total}. Mismatch — sup and unsup arms saw "
+            f"different corpora."
+        )
+    split_idx = int(cfg.train_fraction * n_total)
+    remaining = n_total - split_idx
+    val_size = remaining // 2
+    val_split = split_idx + val_size
+    test_idx = perm[val_split:]
+    print(f"  Test split:         {test_idx.numel():,} flat positions "
+          f"of {n_total:,} (matches sup-arm evaluate.py)")
 
     # Annotations columns: assume aligned with leaves order (annotate.py
     # writes one column per leaf in catalog order; we order leaves by
@@ -192,17 +206,12 @@ def run(cfg: Config = None) -> dict:
             f"--step annotate after the catalog change."
         )
 
-    test_y = annotations[test_seq].reshape(-1, len(leaves))
-    test_mask_flat = torch.zeros(n_seqs * T_per, dtype=torch.bool)
-    test_idx_to_pos = torch.tensor(
-        [s * T_per + t for s in test_seq for t in range(T_per)],
-        dtype=torch.long,
-    )
-    test_mask_flat[test_idx_to_pos] = True
-    test_y_full = torch.zeros(
-        (n_seqs * T_per, len(leaves)), dtype=torch.bool
-    )
-    test_y_full[test_idx_to_pos] = test_y
+    annot_flat = annotations.reshape(n_total, len(leaves))
+    test_y = annot_flat[test_idx]                          # (n_test, n_features)
+    test_mask_flat = torch.zeros(n_total, dtype=torch.bool)
+    test_mask_flat[test_idx] = True
+    test_y_full = torch.zeros((n_total, len(leaves)), dtype=torch.bool)
+    test_y_full[test_idx] = test_y
 
     print(f"  Streaming SAE over {n_seqs} sequences "
           f"(scoring only test positions)...")
@@ -238,7 +247,8 @@ def run(cfg: Config = None) -> dict:
         "n_evaluated": len(valid_records),
         "split": {
             "train_fraction": cfg.train_fraction,
-            "test_seqs": len(test_seq),
+            "test_positions_flat": int(test_idx.numel()),
+            "split_path": str(cfg.split_path),
         },
         "f1_mean": float(f1s.mean()) if valid_records else None,
         "f1_median": float(np.median(f1s)) if valid_records else None,

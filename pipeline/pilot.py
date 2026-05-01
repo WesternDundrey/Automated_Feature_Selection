@@ -180,9 +180,16 @@ def run(cfg: Config = None) -> dict:
     print("─" * 70)
 
     # Reuse sup arm's shortlist + tokens + activations (same corpus,
-    # avoid re-tokenization + re-activation collection).
+    # avoid re-tokenization + re-activation collection). Also share
+    # split_indices.pt so the unsup arm's F1 is on IDENTICAL held-out
+    # flat positions to the sup arm's evaluate test set.
     print(f"\n  Symlinking shared artifacts from {sup_dir} → {unsup_dir}")
-    for fname in ("latent_shortlist.json", "tokens.pt", "activations.pt"):
+    for fname in (
+        "latent_shortlist.json",
+        "tokens.pt",
+        "activations.pt",
+        "split_indices.pt",
+    ):
         src = sup_dir / fname
         dst = unsup_dir / fname
         if src.exists():
