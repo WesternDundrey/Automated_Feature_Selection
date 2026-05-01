@@ -50,6 +50,14 @@ def main():
                              "whether decoder-cosine drift comes from the "
                              "unsupervised slice absorbing reconstruction "
                              "pressure off the supervised columns.")
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Bypass resume / skip-if-exists checks. By default each "
+             "expensive step (shortlist, opus-catalog, delphi-run, "
+             "train, oracle-unsup, unsup-f1) skips when its primary "
+             "output already exists at <output_dir>/...; --force "
+             "re-runs from scratch even if outputs are present.",
+    )
     parser.add_argument("--local-annotator", action="store_true",
                         help="Use local model for annotation (vLLM). "
                              "v8.19.4: this is now the DEFAULT — kept "
@@ -420,6 +428,8 @@ def main():
         overrides["lambda_sparse"] = args.lambda_sparse
     if args.lambda_hier is not None:
         overrides["lambda_hier"] = args.lambda_hier
+    if args.force:
+        overrides["force"] = True
     if args.local_annotator:
         overrides["use_local_annotator"] = True
     if args.no_local_annotator:

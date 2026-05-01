@@ -136,6 +136,32 @@ def run(cfg: Config = None) -> list[int]:
           f"{cfg.sae_release}/{cfg.sae_id})")
     print("=" * 70)
 
+    # v8.19.5 resume: skip if a valid shortlist of the requested size
+    # already exists. Cheap to recompute but loading the SAE + 600K-
+    # token calibration is ~3-5 min; skip if we have it.
+    out_path = cfg.output_dir / "latent_shortlist.json"
+    if out_path.exists() and not cfg.force:
+        try:
+            existing = json.loads(out_path.read_text())
+            indices = existing.get("latent_indices") or []
+            if (len(indices) == cfg.shortlist_size
+                    and existing.get("sae_release") == cfg.sae_release
+                    and existing.get("sae_id") == cfg.sae_id):
+                print(f"  [resume] {out_path} matches "
+                      f"({len(indices)} latents from "
+                      f"{cfg.sae_release}); skipping. Pass --force to "
+                      f"regenerate.")
+                return indices
+            else:
+                print(f"  [resume] {out_path} exists but does not match "
+                      f"current cfg "
+                      f"(size {len(indices)} vs {cfg.shortlist_size}, "
+                      f"release {existing.get('sae_release')!r} vs "
+                      f"{cfg.sae_release!r}); regenerating.")
+        except Exception as e:
+            print(f"  [resume] couldn't validate {out_path} "
+                  f"({e}); regenerating.")
+
     sae, sparsity = load_sae(cfg)
     firing_rate = _load_or_compute_firing_rate(cfg, sae, sparsity)
     n_latents = firing_rate.shape[0]

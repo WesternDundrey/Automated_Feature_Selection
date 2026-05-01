@@ -186,6 +186,30 @@ def run(cfg: Config = None) -> dict:
           f"from {cfg.shortlist_size}-latent shortlist)")
     print("=" * 70)
 
+    # v8.19.5 resume: skip if a previous Opus catalog exists. Opus 4.7
+    # tokens are the single most expensive thing in the pipeline ($10-15
+    # per call); a failed downstream stage shouldn't force re-generation.
+    record_path = cfg.output_dir / "opus_catalog.json"
+    if record_path.exists() and not cfg.force:
+        try:
+            existing = json.loads(record_path.read_text())
+            n_leaves = sum(
+                1 for f in existing.get("features", [])
+                if f.get("type") == "leaf"
+            )
+            if n_leaves > 0:
+                print(f"  [resume] {record_path} exists with "
+                      f"{n_leaves} leaves; skipping Opus call. "
+                      f"Pass --force to regenerate.")
+                # Refresh the canonical feature_catalog.json so
+                # downstream --step annotate consumes it even if it
+                # was overwritten between runs.
+                cfg.catalog_path.write_text(json.dumps(existing, indent=2))
+                return existing
+        except Exception as e:
+            print(f"  [resume] couldn't validate {record_path} "
+                  f"({e}); regenerating.")
+
     from .inventory import (
         load_sae, load_target_model, collect_top_activations
     )

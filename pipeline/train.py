@@ -817,6 +817,33 @@ def run(cfg: Config = None):
     if cfg is None:
         cfg = Config()
 
+    # v8.19.5 resume: skip if a checkpoint + split + target_dirs all
+    # exist for the current cfg. Training is the longest single CPU+GPU
+    # step (~6-8 hr at production); critical to skip on re-runs.
+    if (cfg.checkpoint_path.exists()
+            and cfg.checkpoint_config_path.exists()
+            and cfg.split_path.exists()
+            and not cfg.force):
+        try:
+            ck_cfg = torch.load(
+                cfg.checkpoint_config_path, map_location="cpu",
+                weights_only=True,
+            )
+            n_sup_ck = int(ck_cfg.get("n_supervised", -1))
+            n_unsup_ck = int(ck_cfg.get("n_unsupervised", -1))
+            n_unsup_want = cfg.n_unsupervised
+            if n_unsup_ck == n_unsup_want:
+                print(f"  [resume] {cfg.checkpoint_path} exists "
+                      f"(n_supervised={n_sup_ck}, n_unsupervised={n_unsup_ck}); "
+                      f"skipping training. Pass --force to re-train.")
+                return None
+            else:
+                print(f"  [resume] checkpoint has n_unsupervised={n_unsup_ck} "
+                      f"but cfg wants {n_unsup_want}; re-training.")
+        except Exception as e:
+            print(f"  [resume] couldn't validate checkpoint "
+                  f"({e}); re-training.")
+
     # Load data
     for path, name in [
         (cfg.activations_path, "activations"),

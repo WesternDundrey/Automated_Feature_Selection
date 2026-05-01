@@ -219,6 +219,28 @@ def run(cfg: Config = None) -> dict:
     print(f"DELPHI RUN  ({cfg.delphi_n_features} latents from shortlist)")
     print("=" * 70)
 
+    # v8.19.5 resume: skip if a previous Delphi run already produced
+    # descriptions. Delphi calls Sonnet/Opus per latent (~$10-25 + ~1
+    # hour of activation caching); don't redo when downstream stages
+    # failed.
+    record_path = cfg.output_dir / "delphi_catalog.json"
+    if record_path.exists() and not cfg.force:
+        try:
+            existing = json.loads(record_path.read_text())
+            n_described = existing.get("n_latents_described", 0)
+            if n_described >= max(1, cfg.delphi_n_features // 2):
+                print(f"  [resume] {record_path} exists with "
+                      f"{n_described}/{cfg.delphi_n_features} described; "
+                      f"skipping Delphi subprocess. Pass --force to "
+                      f"regenerate.")
+                # Refresh canonical feature_catalog.json so the unsup
+                # arm's --step annotate reads it.
+                cfg.catalog_path.write_text(json.dumps(existing, indent=2))
+                return existing
+        except Exception as e:
+            print(f"  [resume] couldn't validate {record_path} "
+                  f"({e}); regenerating.")
+
     if "OPENROUTER_API_KEY" not in os.environ:
         raise RuntimeError(
             "OPENROUTER_API_KEY not set. Delphi explainer needs it for "

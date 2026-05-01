@@ -446,6 +446,13 @@ class Config:
     # `<output_dir>_unsup` then `pipeline_data_unsup`.
     unsup_output_dir: str = ""
 
+    # v8.19.5 resume/checkpointing. Each step's run() checks for its
+    # primary output artifact at start; if present and valid, prints
+    # [resume] and returns the loaded result. Set True to FORCE
+    # regeneration (bypass all skip-if-exists checks). Pass --force on
+    # the CLI to enable.
+    force: bool = False
+
     # ── Output ──────────────────────────────────────────────────────
     output_dir: str = "pipeline_data"
 

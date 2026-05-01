@@ -242,6 +242,21 @@ def run(cfg: Config = None) -> dict:
     print("ORACLE-UNSUP  (Type-2 appendix: best unsup latent vs Opus labels)")
     print("=" * 70)
 
+    # v8.19.5 resume: skip if oracle_unsup.json already exists. The
+    # streaming SAE pass over all 24576 unsup latents is ~30 min.
+    out_path = cfg.output_dir / "oracle_unsup.json"
+    if out_path.exists() and not cfg.force:
+        try:
+            existing = json.loads(out_path.read_text())
+            if existing.get("n_evaluated", 0) > 0:
+                print(f"  [resume] {out_path} exists with "
+                      f"{existing['n_evaluated']} evaluated features; "
+                      f"skipping. Pass --force to re-run.")
+                return existing
+        except Exception as e:
+            print(f"  [resume] couldn't validate {out_path} "
+                  f"({e}); re-running.")
+
     annot_path = cfg.annotations_path
     tokens_path = cfg.tokens_path
     if not (annot_path.exists() and tokens_path.exists()):
