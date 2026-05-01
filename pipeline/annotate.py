@@ -1408,10 +1408,18 @@ torch.save(annotations, {str(shard_out)!r})
 def _detect_annotation_gpus(cfg: Config) -> int:
     """Resolve the number of GPUs to use for parallel annotation.
 
-    Priority:
+    CRITICAL (v8.16 fix, commit 41c015c — re-applied v8.19.8 after
+    regression): NEVER call torch.cuda.is_available() or
+    torch.cuda.device_count() here. Both initialize CUDA in the
+    PARENT process, which then contaminates the shard subprocesses
+    spawned for vLLM annotation. The vLLM EngineCore inside each
+    shard then deadlocks on init (silent hang past parallel_state,
+    eventually killed by VLLM_ENGINE_READY_TIMEOUT_S).
+
+    Priority — strictly env-var / out-of-process only:
       1. cfg.n_annotation_gpus if explicitly set (>=1)
       2. CUDA_VISIBLE_DEVICES count if set
-      3. torch.cuda.device_count()
+      3. nvidia-smi via subprocess (no Python CUDA init)
       4. Fallback: 1
     """
     explicit = int(getattr(cfg, "n_annotation_gpus", 0) or 0)
@@ -1423,12 +1431,21 @@ def _detect_annotation_gpus(cfg: Config) -> int:
     if cvd.strip():
         return len([x for x in cvd.split(",") if x.strip()])
 
+    # Out-of-process probe: nvidia-smi prints one line per GPU.
+    # Subprocess never inherits CUDA state into our parent's torch.
     try:
-        import torch as _torch
-        n = _torch.cuda.device_count() if _torch.cuda.is_available() else 0
-        return max(1, n)
+        import subprocess as _sp
+        out = _sp.check_output(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            stderr=_sp.DEVNULL,
+            timeout=5,
+        ).decode().strip()
+        n = len([line for line in out.splitlines() if line.strip()])
+        if n >= 1:
+            return n
     except Exception:
-        return 1
+        pass
+    return 1
 
 
 # ── Main entry point ────────────────────────────────────────────────────────
