@@ -265,11 +265,24 @@ def run(cfg: Config = None) -> dict:
         )
 
     opus_leaves = _load_sup_arm_leaves(cfg)
-    opus_cols: list[tuple[int, dict]] = list(enumerate(opus_leaves))
-    if not opus_cols:
+    if not opus_leaves:
         raise RuntimeError(
             f"No leaves in {cfg.catalog_path}. Empty catalog?"
         )
+    # annotate.py writes one column per FEATURE in catalog order
+    # (groups + leaves); we need each leaf's full-features index, not
+    # its leaf index, to read the right column from annotations.pt.
+    full_catalog = json.loads(cfg.catalog_path.read_text())
+    all_features = full_catalog.get("features", [])
+    leaf_id_to_full_idx = {
+        f["id"]: i for i, f in enumerate(all_features)
+        if f.get("type") == "leaf"
+    }
+    opus_cols: list[tuple[int, dict]] = [
+        (leaf_id_to_full_idx[leaf["id"]], leaf)
+        for leaf in opus_leaves
+        if leaf["id"] in leaf_id_to_full_idx
+    ]
 
     annotations = torch.load(annot_path, weights_only=True).bool()
     tokens = torch.load(tokens_path, weights_only=True)

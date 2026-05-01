@@ -221,15 +221,31 @@ def run(cfg: Config = None) -> dict:
           f"of {n_total:,} (matches sup-arm evaluate.py; "
           f"position-subsampled if n_perm={n_perm} < n_total)")
 
-    # Annotations columns: assume aligned with leaves order (annotate.py
-    # writes one column per leaf in catalog order; we order leaves by
-    # iterating catalog["features"] type==leaf, same as annotate).
-    if annotations.shape[-1] != len(leaves):
+    # annotate.py writes one column per FEATURE (groups + leaves) in
+    # catalog order, with group columns set to OR of their children
+    # via propagate_group_labels. We want leaf columns only, so look
+    # up each leaf's index in the full features list and select those.
+    catalog = json.loads(cfg.catalog_path.read_text())
+    all_features = catalog.get("features", [])
+    leaf_id_to_full_idx = {
+        f["id"]: i for i, f in enumerate(all_features)
+        if f.get("type") == "leaf"
+    }
+    leaf_full_indices = [leaf_id_to_full_idx[leaf["id"]] for leaf in leaves]
+    expected_n_cols = len(all_features)
+    if annotations.shape[-1] not in (expected_n_cols, len(leaves)):
         raise RuntimeError(
             f"annotations.pt last-dim {annotations.shape[-1]} != "
-            f"{len(leaves)} leaves in feature_catalog.json. Re-run "
-            f"--step annotate after the catalog change."
+            f"{expected_n_cols} (full features incl. groups) and != "
+            f"{len(leaves)} (leaves only). Re-run --step annotate after "
+            f"the catalog change."
         )
+    if annotations.shape[-1] == expected_n_cols:
+        # Slice down to leaf columns in the same order as `leaves`.
+        leaf_idx_t = torch.tensor(leaf_full_indices, dtype=torch.long)
+        annotations = annotations.index_select(-1, leaf_idx_t)
+        print(f"  Sliced annotations: {expected_n_cols} columns "
+              f"(features) → {len(leaves)} (leaves)")
 
     annot_flat = annotations.reshape(n_total, len(leaves))
     test_y = annot_flat[test_idx]                          # (n_test, n_features)
