@@ -39,6 +39,94 @@ from .config import Config
 from .inventory import load_sae
 
 
+def _compute_firing_rate(cfg: Config, sae) -> torch.Tensor:
+    """Compute per-latent firing rate from a corpus pass.
+
+    Used when the SAE release has no hosted sparsity sidecar (sae_lens
+    returns sparsity=None). Single forward pass, only tracks per-latent
+    nonzero counts and a total token count. Memory: O(n_lat) accumulator
+    + one batch's z on GPU. Wall clock: ~2-5 min on 3M tokens / 4090.
+
+    Returns: (n_lat,) float tensor of firing rates in [0, 1] on CPU.
+    """
+    from datasets import load_dataset
+    from tqdm import tqdm
+
+    from .inventory import load_target_model
+
+    print(f"  Computing per-latent firing rate over "
+          f"{cfg.shortlist_calibration_tokens:,} tokens "
+          f"(no hosted sparsity for {cfg.sae_release})...")
+
+    model, tokenizer = load_target_model(cfg)
+    sae = sae.to(cfg.device)
+
+    if sae.W_enc is not None:
+        n_lat = sae.W_enc.shape[1]
+    else:
+        n_lat = sae.native_sae.cfg.d_sae
+
+    fire_count = torch.zeros(n_lat, dtype=torch.long, device=cfg.device)
+    n_tokens = 0
+    target = cfg.shortlist_calibration_tokens
+
+    ds = load_dataset(
+        cfg.corpus_dataset, split=cfg.corpus_split, streaming=True
+    )
+    seq_len = cfg.activation_collection_seq_len
+
+    pbar = tqdm(total=target, desc="Firing rate", unit="tok")
+    with torch.no_grad():
+        for example in ds:
+            if n_tokens >= target:
+                break
+            text = example.get("text") or ""
+            if len(text) < 80:
+                continue
+            toks = model.to_tokens(text, prepend_bos=True)
+            toks = toks[:, :seq_len]
+            if toks.shape[1] < 5:
+                continue
+            _, cache = model.run_with_cache(
+                toks, names_filter=cfg.hook_point, return_type=None
+            )
+            x = cache[cfg.hook_point]
+            z = sae.encode(x.reshape(-1, x.shape[-1]))
+            fire_count += (z > 0).long().sum(dim=0)
+            chunk = z.shape[0]
+            n_tokens += chunk
+            pbar.update(chunk)
+    pbar.close()
+
+    if n_tokens == 0:
+        raise RuntimeError(
+            "No tokens consumed during firing-rate calibration. "
+            "Check corpus_dataset / corpus_split."
+        )
+    return (fire_count.float() / n_tokens).cpu()
+
+
+def _load_or_compute_firing_rate(
+    cfg: Config, sae, sae_sparsity: torch.Tensor | None
+) -> torch.Tensor:
+    """Use sae_lens-hosted sparsity if available; otherwise compute and
+    cache to <output_dir>/computed_firing_rates.pt so subsequent runs
+    (and arms) don't repeat the corpus pass."""
+    if sae_sparsity is not None:
+        return sae_sparsity.exp()
+
+    cache_path = cfg.output_dir / "computed_firing_rates.pt"
+    if cache_path.exists():
+        print(f"  Loading cached firing rates: {cache_path}")
+        return torch.load(cache_path, weights_only=True)
+
+    rates = _compute_firing_rate(cfg, sae)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(rates, cache_path)
+    print(f"  Cached firing rates → {cache_path}")
+    return rates
+
+
 def run(cfg: Config = None) -> list[int]:
     if cfg is None:
         cfg = Config()
@@ -49,15 +137,7 @@ def run(cfg: Config = None) -> list[int]:
     print("=" * 70)
 
     sae, sparsity = load_sae(cfg)
-    if sparsity is None:
-        raise RuntimeError(
-            f"No sparsity info for {cfg.sae_release}; shortlist needs "
-            f"firing-rate stats. gpt2-small-res-jb provides this; if you "
-            f"swapped to a different SAE, run `shortlist_latents` after "
-            f"computing per-latent firing rate from a corpus pass."
-        )
-
-    firing_rate = sparsity.exp()
+    firing_rate = _load_or_compute_firing_rate(cfg, sae, sparsity)
     n_latents = firing_rate.shape[0]
 
     in_window = (
