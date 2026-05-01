@@ -301,13 +301,14 @@ class Config:
     # torch.cuda.device_count); 1 = force single-GPU; 2+ = use exactly
     # this many shards (must be ≤ available GPUs).
     n_annotation_gpus: int = 0
-    # Sequences per vLLM batch in the per-token annotator. Previously
-    # hardcoded to 2; the actual throughput optimum depends on feature count
-    # × seq_len × KV-cache budget. v8.19.6: bumped 2→8 — at 500 features
-    # × seq_len 128 with short descriptions, 5090's 32 GB easily fits
-    # chunk=8 (vLLM continuous-batching sweet spot). Sweep {4,8,16,32}
-    # on your GPU and pick the knee if you need more.
-    local_annotation_seq_chunk: int = 8
+    # Sequences per vLLM batch in the per-token annotator. v8.19.6 bumped
+    # 2 → 8 thinking bigger Python batches would help. Empirically WRONG:
+    # vLLM does its own continuous batching internally and chunk=8
+    # primarily adds Python-side prompt-construction overhead with
+    # negligible scheduler benefit (user reports historical chunk=2
+    # produced ~800 tok/s; chunk=8 dropped it to ~475 tok/s on the
+    # same setup, ~40% regression). Reverted to 2 in v8.19.8.
+    local_annotation_seq_chunk: int = 2
 
     # Positions to mask out at analysis time (starting from position 0).
     #
