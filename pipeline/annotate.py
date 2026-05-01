@@ -1340,30 +1340,14 @@ def _annotate_local_parallel(
             with shard_cfg_path.open("wb") as f:
                 pickle.dump(shard_cfg, f)
 
-            # v8.19.8 import-order fix. User's working direct test
-            # (`python -c "from vllm import LLM; LLM(...)"`) imports vLLM
-            # FIRST. The shard script previously imported torch +
-            # transformers + pipeline.annotate (which transitively
-            # imports a ton of things) before vLLM, and EngineCore
-            # deadlocked on init. vLLM cares about being the first
-            # thing to touch CUDA — match the working pattern by
-            # moving non-vllm imports to AFTER the LLM is created.
-            #
-            # The annotate_local call still wraps the LLM lifecycle —
-            # it's just imported lazily so module init order matches
-            # the proven-working direct invocation.
             script = f"""
-# Step 1: vLLM goes FIRST. No torch, no transformers, nothing else
-# touches CUDA-adjacent state before this. This mirrors the working
-# direct invocation from the user.
-from vllm import LLM as _LLMProbe  # import only; don't construct yet
-
-# Step 2: now safe to import everything else.
 import json
 import pickle
 from pathlib import Path
+
 import torch
 from transformers import AutoTokenizer
+
 from pipeline.annotate import annotate_local
 
 with open({str(shard_cfg_path)!r}, "rb") as f:
