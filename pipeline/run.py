@@ -175,7 +175,18 @@ def main():
              "feature_catalog.quarantined.json with reason "
              "'min_support<N'. Backup of the pre-filter catalog goes to "
              "feature_catalog.unfiltered.json. 0 (default) disables. "
-             "Recommended: 30 for 1000-sequence runs, 100 for 5000+.",
+             "Recommended: 30 for 1000-sequence runs, 100 for 5000+, "
+             "500 for 50000+ with --position-subsample-k.",
+    )
+    parser.add_argument(
+        "--position-subsample-k", type=int, default=None,
+        help="v8.19.6 lever-7: annotate K of seq_len positions per "
+             "sequence (deterministic per-sequence RNG seeded by "
+             "cfg.seed). Saved as position_mask.pt sidecar; train / "
+             "evaluate / unsup_f1 / oracle_unsup all restrict to "
+             "sampled positions. 0 (default) disables (full sequence). "
+             "Recommended pairing: --position-subsample-k 64 with "
+             "--min-support 500 at 50000+ sequences.",
     )
     parser.add_argument(
         "--extend-clone-pre", action="store_true",
@@ -487,6 +498,8 @@ def main():
         overrides["overlap_check_auto"] = False
     if args.min_support is not None:
         overrides["min_support"] = args.min_support
+    if args.position_subsample_k is not None:
+        overrides["position_subsample_k"] = args.position_subsample_k
     if args.extend_clone_pre:
         overrides["extend_clone_pre"] = True
     if args.legacy_prompts:
