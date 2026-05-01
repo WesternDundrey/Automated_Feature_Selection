@@ -31,6 +31,14 @@ def main():
     parser.add_argument("--n_latents", type=int, default=None, help="Latents to explain")
     parser.add_argument("--n_sequences", type=int, default=None, help="Corpus sequences")
     parser.add_argument("--epochs", type=int, default=None, help="Training epochs")
+    parser.add_argument("--opus-n-features", type=int, default=None,
+                        help="Target feature count for the Opus-designed "
+                             "catalog (sup arm of the Delphi-vs-Opus run, "
+                             "or the scaling-run catalog).")
+    parser.add_argument("--shortlist-size", type=int, default=None,
+                        help="Candidate-pool size for shortlist_latents "
+                             "(top-N by firing rate within the "
+                             "shortlist_freq window).")
     parser.add_argument("--output_dir", default=None, help="Output directory")
     parser.add_argument("--device", default=None, help="Device (cuda/cpu)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
@@ -415,6 +423,10 @@ def main():
         overrides["n_latents_to_explain"] = args.n_latents
     if args.n_sequences:
         overrides["n_sequences"] = args.n_sequences
+    if args.opus_n_features is not None:
+        overrides["opus_n_features"] = args.opus_n_features
+    if args.shortlist_size is not None:
+        overrides["shortlist_size"] = args.shortlist_size
     if args.epochs:
         overrides["epochs"] = args.epochs
     if args.output_dir:
