@@ -252,7 +252,15 @@ class Config:
     target_dir_lda_shrinkage: float = 0.1
 
     # ── v2: Local model annotation ────────────────────────────────
-    use_local_annotator: bool = False   # True = local model, False = API
+    use_local_annotator: bool = True    # v8.19.4: DEFAULT FLIPPED to True.
+                                        # Local Qwen3-4B-Base via vLLM is
+                                        # the user's production setup
+                                        # (free, ~700 dec/sec/GPU, multi-
+                                        # GPU shard). Pass --no-use-local-
+                                        # annotator (or set False
+                                        # explicitly) to fall back to
+                                        # OpenRouter Haiku API for
+                                        # tiny-scale debug runs only.
     local_annotator_model: str = "Qwen/Qwen3-4B-Base"  # base model, no thinking, pure transformer
     local_annotation_batch_size: int = 64
     batch_positions: bool = False  # True = full-sequence JSON, False = per-token

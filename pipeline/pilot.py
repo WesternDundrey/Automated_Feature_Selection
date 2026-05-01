@@ -43,7 +43,8 @@ from .config import Config
 
 def _arm_cfg(parent_cfg: Config, output_dir: Path, n_features_for_arm: int) -> Config:
     """Sandbox a Config for one arm. Inherits scalars from parent, swaps
-    output_dir, scales pilot scalars."""
+    output_dir, scales pilot scalars. Force-enables the local annotator
+    so a stray default flip can't burn API budget on the pilot."""
     arm = copy.copy(parent_cfg)
     arm.output_dir = output_dir
     arm.n_sequences = parent_cfg.pilot_n_sequences
@@ -54,6 +55,11 @@ def _arm_cfg(parent_cfg: Config, output_dir: Path, n_features_for_arm: int) -> C
     arm.shortlist_size = max(
         100, n_features_for_arm * 3
     )
+    # v8.19.4: pilot ALWAYS uses local annotator. ~5M decisions × Haiku
+    # API would cost ~$50, defeating the gate's purpose. The default is
+    # already True at v8.19.4+; this guard catches users who explicitly
+    # passed --no-local-annotator to the parent run.
+    arm.use_local_annotator = True
     output_dir.mkdir(parents=True, exist_ok=True)
     return arm
 

@@ -51,7 +51,13 @@ def main():
                              "unsupervised slice absorbing reconstruction "
                              "pressure off the supervised columns.")
     parser.add_argument("--local-annotator", action="store_true",
-                        help="Use local model for annotation (vLLM)")
+                        help="Use local model for annotation (vLLM). "
+                             "v8.19.4: this is now the DEFAULT — kept "
+                             "as a no-op for back-compat.")
+    parser.add_argument("--no-local-annotator", action="store_true",
+                        help="Use OpenRouter Haiku API for annotation "
+                             "instead of local Qwen3-4B-Base. Tiny-scale "
+                             "debug only — costs ~$1/1M decisions.")
     parser.add_argument("--annotator-model", default=None,
                         help="Local annotator HF model ID (default: Qwen/Qwen3-4B-Base)")
     parser.add_argument("--batch-positions", action="store_true",
@@ -416,6 +422,12 @@ def main():
         overrides["lambda_hier"] = args.lambda_hier
     if args.local_annotator:
         overrides["use_local_annotator"] = True
+    if args.no_local_annotator:
+        if args.local_annotator:
+            raise SystemExit(
+                "Cannot pass both --local-annotator and --no-local-annotator."
+            )
+        overrides["use_local_annotator"] = False
     if args.annotator_model:
         overrides["local_annotator_model"] = args.annotator_model
     if args.batch_positions:
