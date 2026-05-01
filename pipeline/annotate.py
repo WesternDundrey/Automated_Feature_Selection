@@ -51,6 +51,7 @@ _os_init.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
