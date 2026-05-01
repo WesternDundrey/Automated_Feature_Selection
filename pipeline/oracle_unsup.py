@@ -49,25 +49,27 @@ import torch
 from .config import Config
 
 
-def _load_catalogs(cfg: Config) -> tuple[list[dict], list[dict]]:
-    opus_path = cfg.output_dir / "opus_catalog.json"
-    if not opus_path.exists():
+def _load_sup_arm_leaves(cfg: Config) -> list[dict]:
+    """Read the sup arm's feature_catalog.json (= Opus catalog under v8.19.2
+    two-arm flow). All leaves are Opus features; annotations columns
+    align 1:1 with leaves order."""
+    cat_path = cfg.catalog_path
+    if not cat_path.exists():
         raise FileNotFoundError(
-            f"Need {opus_path}. Run --step opus-catalog first."
+            f"Need {cat_path}. Run --step opus-catalog + --step annotate "
+            f"in this output_dir first."
         )
-    opus = json.loads(opus_path.read_text())
-    opus_leaves = [
-        f for f in opus.get("features", []) if f.get("type") == "leaf"
-    ]
-    merged_path = cfg.catalog_path
-    if merged_path.exists():
-        merged = json.loads(merged_path.read_text())
-        merged_leaves = [
-            f for f in merged.get("features", []) if f.get("type") == "leaf"
-        ]
-    else:
-        merged_leaves = opus_leaves
-    return opus_leaves, merged_leaves
+    catalog = json.loads(cat_path.read_text())
+    if catalog.get("source") == "delphi":
+        raise RuntimeError(
+            f"{cat_path} is a Delphi-arm catalog, not Opus. The "
+            f"oracle_unsup appendix only makes sense in the SUP arm "
+            f"(it searches all unsup latents for the best match per "
+            f"OPUS-designed feature). Re-run with the sup arm's "
+            f"output_dir (typically pipeline_data/, not "
+            f"pipeline_data_unsup/)."
+        )
+    return [f for f in catalog.get("features", []) if f.get("type") == "leaf"]
 
 
 def _stream_firing_counts(
@@ -247,17 +249,11 @@ def run(cfg: Config = None) -> dict:
             f"Need {annot_path}, {tokens_path}. Run --step annotate first."
         )
 
-    opus_leaves, merged_leaves = _load_catalogs(cfg)
-    opus_ids = {f["id"] for f in opus_leaves}
-    opus_cols: list[tuple[int, dict]] = [
-        (col, leaf)
-        for col, leaf in enumerate(merged_leaves)
-        if leaf["id"] in opus_ids and not leaf.get("delphi_mode")
-    ]
+    opus_leaves = _load_sup_arm_leaves(cfg)
+    opus_cols: list[tuple[int, dict]] = list(enumerate(opus_leaves))
     if not opus_cols:
         raise RuntimeError(
-            "No Opus columns found in merged catalog; check that "
-            "annotate ran with the merged catalog (--step merge-catalogs first)."
+            f"No leaves in {cfg.catalog_path}. Empty catalog?"
         )
 
     annotations = torch.load(annot_path, weights_only=True).bool()

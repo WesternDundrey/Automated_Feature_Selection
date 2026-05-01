@@ -418,6 +418,13 @@ class Config:
     project_out_dense: bool = False
     dense_freq_threshold: float = 0.10
 
+    # v8.19.2 two-arm flow: the unsup arm runs in its own output_dir
+    # (typically `pipeline_data_unsup/`). The compare step reads both
+    # `cfg.output_dir` (sup arm) and `cfg.unsup_output_dir` (unsup arm)
+    # to produce the headline table. Empty string falls back to
+    # `<output_dir>_unsup` then `pipeline_data_unsup`.
+    unsup_output_dir: str = ""
+
     # ── Output ──────────────────────────────────────────────────────
     output_dir: str = "pipeline_data"
 

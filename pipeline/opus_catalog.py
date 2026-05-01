@@ -277,7 +277,14 @@ def run(cfg: Config = None) -> dict:
         # filter will catch grossly bad leaves.
         print(f"  WARNING: catalog_quality validation skipped: {e}")
 
-    out_path = cfg.output_dir / "opus_catalog.json"
-    out_path.write_text(json.dumps(catalog, indent=2))
-    print(f"Saved: {out_path}")
+    # v8.19.2 two-arm flow: write the named record (audit trail) AND
+    # the canonical feature_catalog.json that downstream --step annotate
+    # consumes. The user runs the sup arm in pipeline_data/ and the
+    # unsup arm in pipeline_data_unsup/, so the canonical name is
+    # arm-local — no merge step needed.
+    record_path = cfg.output_dir / "opus_catalog.json"
+    record_path.write_text(json.dumps(catalog, indent=2))
+    cfg.catalog_path.write_text(json.dumps(catalog, indent=2))
+    print(f"Saved: {record_path}")
+    print(f"Saved: {cfg.catalog_path} (canonical, picked up by --step annotate)")
     return catalog

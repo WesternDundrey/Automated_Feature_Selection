@@ -121,8 +121,7 @@ def main():
                  "audit-feature", "rewrite-catalog",
                  "extend-corpus", "probe-causal", "polysemy-report",
                  "shortlist", "delphi-run", "opus-catalog",
-                 "merge-catalogs",
-                 "pilot", "irr", "oracle-unsup"],
+                 "pilot", "irr", "oracle-unsup", "unsup-f1", "compare"],
         help="Run only this step",
     )
     parser.add_argument(
@@ -667,15 +666,6 @@ def main():
         run_opus(cfg)
         print(f"Opus catalog completed in {time.time() - t0:.1f}s")
 
-    if args.step == "merge-catalogs":
-        print("\n" + "=" * 70)
-        print("STEP: MERGE-CATALOGS  (Opus + Delphi → feature_catalog.json)")
-        print("=" * 70)
-        t0 = time.time()
-        from .merge_catalogs import run as run_merge
-        run_merge(cfg)
-        print(f"Merge catalogs completed in {time.time() - t0:.1f}s")
-
     if args.step == "pilot":
         print("\n" + "=" * 70)
         print("STEP: PILOT  (go/no-go gate before 38hr full run)")
@@ -703,6 +693,26 @@ def main():
         from .oracle_unsup import run as run_oracle
         run_oracle(cfg)
         print(f"Oracle-unsup completed in {time.time() - t0:.1f}s")
+
+    if args.step == "unsup-f1":
+        print("\n" + "=" * 70)
+        print("STEP: UNSUP-F1  (per-feature F1 of unsup latent firing "
+              "vs labels — read from output_dir's feature_catalog.json + "
+              "annotations.pt; this dir IS the unsup arm)")
+        print("=" * 70)
+        t0 = time.time()
+        from .unsup_f1 import run as run_unsup_f1
+        run_unsup_f1(cfg)
+        print(f"Unsup-F1 completed in {time.time() - t0:.1f}s")
+
+    if args.step == "compare":
+        print("\n" + "=" * 70)
+        print("STEP: COMPARE  (sup vs unsup arm headline table)")
+        print("=" * 70)
+        t0 = time.time()
+        from .compare import run as run_compare
+        run_compare(cfg)
+        print(f"Compare completed in {time.time() - t0:.1f}s")
 
     # Step 2: Annotation
     if args.step is None or args.step == "annotate":

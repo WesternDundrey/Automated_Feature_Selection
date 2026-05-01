@@ -380,14 +380,20 @@ def _extract_descriptions(
         "explainer_model": cfg.delphi_explainer_model,
         "scorer": cfg.delphi_scorer,
     }
-    out_path = cfg.output_dir / "delphi_catalog.json"
-    out_path.write_text(json.dumps(catalog, indent=2))
+    # v8.19.2 two-arm flow: write the named record (audit trail) AND
+    # the canonical feature_catalog.json. The user runs the unsup arm
+    # in its own pipeline_data_unsup/ output dir, so this canonical
+    # name is arm-local; --step annotate picks it up directly.
+    record_path = cfg.output_dir / "delphi_catalog.json"
+    record_path.write_text(json.dumps(catalog, indent=2))
+    cfg.catalog_path.write_text(json.dumps(catalog, indent=2))
 
     raw_path = cfg.output_dir / "delphi_descriptions.json"
     raw_path.write_text(
         json.dumps({str(k): v for k, v in descriptions.items()}, indent=2)
     )
 
-    print(f"  Saved: {out_path}")
+    print(f"  Saved: {record_path}")
+    print(f"  Saved: {cfg.catalog_path} (canonical, picked up by --step annotate)")
     print(f"  Saved: {raw_path}")
     return catalog

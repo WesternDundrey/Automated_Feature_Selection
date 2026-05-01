@@ -4,6 +4,104 @@
 
 ---
 
+## [v8.19.2] — Two independent arms; merge logic removed
+
+User pushed back on the merge approach in v8.19.1: maintaining one
+shared `feature_catalog.json` + `annotations.pt` for both arms forced
+complexity (merge step, `delphi_mode` filter in train, two new
+`source_kind` exemptions, `delphi_mode` propagation through annotate).
+The unsup arm doesn't even need training — it just measures
+`unsup_latent_fires` vs `labels(delphi_desc)` — so fighting through a
+shared annotation file buys nothing.
+
+### What changed
+
+* **Two independent arms** sharing only the corpus tokens:
+  - SUP arm runs in `pipeline_data/` (Opus catalog → annotate → train
+    supSAE → evaluate).
+  - UNSUP arm runs in `pipeline_data_unsup/` (Delphi catalog → annotate
+    → unsup_f1; no training).
+  - `tokens.pt` and `activations.pt` symlinked between dirs to avoid
+    recomputation.
+
+* **opus_catalog.py** writes the named record (`opus_catalog.json`,
+  audit trail) AND the canonical `feature_catalog.json` that
+  `--step annotate` reads. No merge step; the sup arm's catalog IS
+  the file annotate consumes.
+
+* **delphi_runner.py** writes the named record (`delphi_catalog.json`)
+  AND the canonical `feature_catalog.json` in its arm-local dir. The
+  unsup arm's annotate run picks it up directly.
+
+* **New `pipeline/unsup_f1.py`** — replaces train+evaluate for the
+  unsup arm. Reads the arm-local `feature_catalog.json` (Delphi,
+  source-tagged), streams the pretrained SAE over corpus tokens, and
+  computes per-feature F1 of `unsup_latent_fires` vs labels on the
+  same held-out split as the sup arm. Aborts with a clear error if
+  the catalog isn't `source: "delphi"` (so you can't accidentally
+  run unsup_f1 against the sup arm's catalog).
+
+* **New `pipeline/compare.py`** — reads both arms' result files
+  (`evaluation.json`, `unsup_f1.json`, `oracle_unsup.json`,
+  `irr_report.json`) and prints/saves the headline comparison table
+  with Δ medians and IRR ceilings.
+
+* **`pilot.py`** rewritten as two-arm sequential. Sup arm runs first
+  in `pipeline_data_pilot/`; unsup arm symlinks the shared artifacts
+  and runs in `pipeline_data_pilot_unsup/`; compare prints the
+  pilot-scale headline. Aborts if sup median F1 ≤ unsup median F1.
+
+* **Reverted from v8.19.1**:
+  - Deleted `pipeline/merge_catalogs.py`.
+  - Removed `--step merge-catalogs`.
+  - Removed the `delphi_mode` filter in `train.py:run` (not needed
+    when each arm has its own catalog).
+  - Removed `source_kind="delphi"` exemption and the
+    `_BOUNDARY_DISCIPLINE_EXEMPT_KINDS` superset in `catalog_quality.py`.
+    Kept `source_kind="symmetry"` for Opus's symmetry-completing
+    leaves (no source_latents but still need boundary-discipline).
+  - `oracle_unsup.py` simplified — reads the sup arm's
+    `feature_catalog.json` directly (no longer searches for "Opus
+    columns" in a merged catalog).
+
+* **New `cfg.unsup_output_dir: str = ""`** for the compare step
+  (falls back to `<output_dir>_unsup` then `pipeline_data_unsup`).
+
+* **Two new `--step` choices**: `unsup-f1`, `compare`.
+
+### Pre-flight checklist (v8.19.2)
+
+```bash
+cd delphi && uv pip install -e .          # fresh upstream v0.1.3
+export OPENROUTER_API_KEY=...
+
+# Sup arm
+python -m pipeline.run --step shortlist
+python -m pipeline.run --step opus-catalog        # writes feature_catalog.json
+python -m pipeline.run --step annotate
+python -m pipeline.run --step train
+python -m pipeline.run --step evaluate
+python -m pipeline.run --step oracle-unsup        # Type-2 honest oracle
+python -m pipeline.run --step irr                 # prompt-perturbed
+
+# Unsup arm
+ln -s ../pipeline_data/latent_shortlist.json pipeline_data_unsup/
+ln -s ../pipeline_data/tokens.pt              pipeline_data_unsup/
+ln -s ../pipeline_data/activations.pt         pipeline_data_unsup/
+python -m pipeline.run --output_dir pipeline_data_unsup --step delphi-run
+python -m pipeline.run --output_dir pipeline_data_unsup --step annotate
+python -m pipeline.run --output_dir pipeline_data_unsup --step unsup-f1
+python -m pipeline.run --output_dir pipeline_data_unsup --step irr
+
+# Compare
+python -m pipeline.run --step compare             # headline table
+```
+
+`--step pilot` runs the entire flow above at 500 seqs × 50+30 features
+in ~2 hr as a HARD gate before the full ~38 hr commitment.
+
+---
+
 ## [v8.19.1] — Audit fixes for the Delphi-vs-Opus architecture
 
 Reviewer caught 9 real defects in v8.19.0. All addressed:
