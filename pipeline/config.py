@@ -435,11 +435,12 @@ class Config:
     # Opus 4.7 OpenRouter model id. Verify exact slug at first call;
     # update if Anthropic re-tags. 1M context variant required so Opus can
     # ingest top contexts of 1000 latents in a single design pass.
-    # Field name kept for back-compat; Sonnet 4.6 is now the default
-    # since Opus 4.7 was overspending budget on catalog generation
-    # for marginal description-quality gains. Pass --opus-n-features
-    # / --shortlist-size unchanged.
-    opus_explanation_model: str = "anthropic/claude-sonnet-4.6"
+    # Default: Opus 4.7 with 1M-context for the headline runs.
+    # Override with --opus-model anthropic/claude-sonnet-4.6 (or any
+    # OpenRouter slug) to save cost on smaller comparison/ablation
+    # runs where Opus's reasoning advantage isn't worth the 5×
+    # token-cost premium.
+    opus_explanation_model: str = "anthropic/claude-opus-4.7"
     # Real EleutherAI Delphi: explainer/scorer model on OpenRouter. Sonnet
     # 4.6 is cost-bounded for 300 latents (~$10 vs ~$200 for Opus). Switch
     # to Opus only if ablation shows Sonnet's descriptions limit unsup F1.

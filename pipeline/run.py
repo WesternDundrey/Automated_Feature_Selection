@@ -39,6 +39,18 @@ def main():
                         help="Candidate-pool size for shortlist_latents "
                              "(top-N by firing rate within the "
                              "shortlist_freq window).")
+    parser.add_argument("--opus-model", default=None,
+                        help="OpenRouter model slug for the sup-arm "
+                             "catalog generator (overrides "
+                             "cfg.opus_explanation_model). Default: "
+                             "anthropic/claude-opus-4.7. Use "
+                             "anthropic/claude-sonnet-4.6 for cheaper "
+                             "comparison/ablation runs.")
+    parser.add_argument("--delphi-model", default=None,
+                        help="OpenRouter model slug for the Delphi "
+                             "explainer (overrides "
+                             "cfg.delphi_explainer_model). Default: "
+                             "anthropic/claude-sonnet-4.6.")
     parser.add_argument("--output_dir", default=None, help="Output directory")
     parser.add_argument("--device", default=None, help="Device (cuda/cpu)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
@@ -445,6 +457,10 @@ def main():
         overrides["n_sequences"] = args.n_sequences
     if args.opus_n_features is not None:
         overrides["opus_n_features"] = args.opus_n_features
+    if args.opus_model:
+        overrides["opus_explanation_model"] = args.opus_model
+    if args.delphi_model:
+        overrides["delphi_explainer_model"] = args.delphi_model
     if args.shortlist_size is not None:
         overrides["shortlist_size"] = args.shortlist_size
     if args.epochs:
