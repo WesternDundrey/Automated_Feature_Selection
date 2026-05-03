@@ -69,30 +69,42 @@ _POS_TERMS = [
 ]
 
 
-def _is_multi_concept_bundle(desc: str) -> bool:
-    """Detect bundles: long item lists or multi-POS descriptions.
+def _is_pos_bundle(desc: str) -> bool:
+    """Detect MULTI-POS bundles: ≥2 distinct part-of-speech terms.
 
-    True positives:
-      - "Token is one of: Like, Perhaps, Maybe, Why, Now, So" (>4 items)
-      - "Like/Perhaps/Maybe/Why/Now/So/At/And/Or" (slash list)
-      - "noun or verb in a clause" (POS bundle)
+    Drops things like "Token is a noun or verb in a clause" — these
+    have no shared variable; the latent is genuinely polysemantic
+    across POS categories and Opus can't rewrite it into a coherent
+    feature.
 
-    False-positive risk: surface families like "comma or period" — only
-    2 items, so the >4-item threshold won't fire. POS-bundle check
-    requires ≥2 distinct POS terms.
+    Does NOT drop list-bundles like "Like/Perhaps/Maybe/Why/Now/So":
+    those frequently share a residual-stream direction (e.g.
+    "discourse-start after punctuation") and Opus-judge can REWRITE
+    them as the shared-variable description for an FVE-rich feature.
+    Hence the asymmetry — POS bundles drop here; list bundles pass to
+    Opus.
     """
     desc_l = desc.lower()
-    # Always try splitting on common list separators; this catches both
-    # "or"-lists, slash-lists, and colon-prefixed comma lists.
+    hits = sum(1 for term in _POS_TERMS if re.search(rf"\b{term}\b", desc_l))
+    return hits >= 2
+
+
+def _is_list_bundle(desc: str) -> bool:
+    """Detect long list-bundles for tagging (NOT for dropping).
+
+    Returns True for descriptions like "Like/Perhaps/Maybe/Why/Now/So"
+    or "Token is one of: a, b, c, d, e". These are FLAGGED for Opus
+    judge to examine carefully — the latent likely fires on a shared
+    variable the items have in common (discourse-start, sentence-
+    initial uppercase, etc.) and Opus should rewrite the description
+    as that shared variable.
+
+    Threshold > 4 items because surface families ("comma or period",
+    "open or close paren") have only 2 items and shouldn't be flagged.
+    """
     parts = re.split(r"\s*,\s*|\s+or\s+|/|;", desc)
     nontrivial = [p.strip() for p in parts if len(p.strip()) > 1]
-    if len(nontrivial) > 4:
-        return True
-    # POS bundle: ≥2 distinct POS terms in description
-    hits = sum(1 for term in _POS_TERMS if re.search(rf"\b{term}\b", desc_l))
-    if hits >= 2:
-        return True
-    return False
+    return len(nontrivial) > 4
 
 
 def _normalize_description(desc: str) -> str:
@@ -240,10 +252,16 @@ def run(cfg: Config | None = None) -> dict:
             drops_by_reason["too_long_>25_words"].append(cid)
             continue
 
-        # 4. Multi-concept bundle detection
-        if _is_multi_concept_bundle(desc):
-            drops_by_reason["multi_concept_bundle"].append(cid)
+        # 4. POS-bundle detection (drops "noun or verb" but NOT
+        #    "Like/Perhaps/Maybe/...", which may be FVE-rich shared-
+        #    variable features for Opus to rewrite).
+        if _is_pos_bundle(desc):
+            drops_by_reason["pos_bundle"].append(cid)
             continue
+        # List-bundle: don't drop, but flag for Opus judge attention.
+        if _is_list_bundle(desc):
+            cand = dict(cand)  # don't mutate input
+            cand["_list_bundle_flag"] = True
 
         # 5. Boundary-discipline minimum
         n_pos_ex = len(cand.get("positive_examples", []) or [])

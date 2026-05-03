@@ -4,6 +4,101 @@
 
 ---
 
+## [v8.20.3] — opus-judge: cascade stage 3 + filter list-bundle relaxation
+
+User feedback: catalog cascade architecture refined twice in this commit.
+
+### Filter relaxation: list-bundles are FVE-rich, not junk
+
+User pointed out that list-bundle descriptions like "Like/Perhaps/Maybe/
+Why/Now/So/At/And/Or" often share a residual-stream direction (e.g.
+"token starts a new discourse unit after sentence punctuation") and are
+FVE-rich features when properly named. My v8.20.2 filter dropped them
+all on the >4-items rule. Fix:
+
+* `filter_candidates._is_multi_concept_bundle` split into two:
+  - `_is_pos_bundle` (≥ 2 distinct POS terms): STILL drops, no shared
+    variable — "noun or verb" can't be rewritten as one feature.
+  - `_is_list_bundle` (> 4 items): NO LONGER drops. Tags candidate with
+    `_list_bundle_flag` so Opus-judge can see them and decide whether
+    to (a) rewrite as the shared variable, (b) split into clean
+    sub-features under a parent group, or (c) drop if no coherent
+    shared variable exists.
+
+### Opus-judge (stage 3) shipped
+
+`pipeline/opus_judge.py`: single-shot Opus 4.7 over the filtered
+candidate pool. Output schema avoids the 64K cap by inheriting Haiku
+metadata for `selected` entries (Opus only outputs id + parent +
+rewritten description), plus full metadata for `new_features` (symmetry
+completion + replacements where Haiku metadata is broken).
+
+### Two-layer metadata validation (per user)
+
+User correctly flagged that Haiku's metadata can't be inherited blindly
+under a new Opus rewrite — the cand_00009 / cand_00010 hallucinations
+(description says "first-person pronoun" but example is "<<Like>>")
+would survive a naive copy. Two layers of defense:
+
+1. **Opus prompt explicitly instructs metadata validation**: a candidate
+   only goes in `selected` if Opus has VERIFIED that all positive
+   examples match the rewritten description AND the negative examples
+   are still genuine boundary cases. If metadata is broken, candidate
+   either drops or moves to `new_features` with full corrected metadata
+   Opus authors fresh.
+
+2. **Python post-validation on inherited examples**: `_post_validate_
+   inherited` re-applies the local self-consistency rules from
+   `filter_candidates._check_self_consistency` AGAINST OPUS'S REWRITE.
+   For "Token is X" / "Token begins/starts with X" / "Token contains X"
+   patterns:
+   - Positive examples whose highlighted token violates the rewrite
+     are dropped.
+   - Negative examples whose highlighted token DOES match the rewrite
+     (i.e. should have been positive) are dropped.
+   - Examples without a `<<token>>` marker pass through (can't check
+     locally).
+   - If a feature falls below ≥ 2 valid positive AND ≥ 2 valid negative
+     after pruning, the feature is dropped from the final catalog with
+     reason logged in `opus_judge_record.json:drop_log`.
+
+This is belt-and-suspenders: Opus is asked to do the work, Python
+verifies on the cheapest cases as a safety net.
+
+### FVE-rich bundle handling in Opus prompt
+
+Opus prompt explicitly explains the bundle-rewrite path with the
+user's examples:
+
+> Long item lists in Haiku descriptions like "Like/Perhaps/Maybe/Why/
+> Now/So" often share a common residual-stream direction (e.g., "token
+> starts a new discourse unit after sentence punctuation"). Do NOT
+> drop these on sight. Either:
+>   (a) Rewrite the description as the SHARED VARIABLE
+>   (b) Split into 2-3 semantically clean leaves under a parent group
+> Bundles with NO coherent shared variable should be dropped.
+
+### Output
+
+* `feature_catalog.json` (canonical, ready for `--step annotate`)
+* `opus_judge_record.json` (raw Opus response + parsed JSON + drop log
+  + counts: `n_dropped_unknown_haiku_id`, `n_dropped_post_validate`,
+  `n_examples_pruned`)
+
+### CLI
+
+  --step opus-judge
+
+### Files touched
+
+* **NEW** `pipeline/opus_judge.py` — Opus single-shot judge with
+  inheritance + post-validation
+* `pipeline/filter_candidates.py` — split bundle detection into
+  POS-bundle (drop) and list-bundle (tag-only)
+* `pipeline/run.py` — `--step opus-judge`
+
+---
+
 ## [v8.20.2] — filter-candidates: cascade stage 2 (deterministic gates + dedup)
 
 User reviewed `feature_candidates_raw.json` from stage 1 and identified
