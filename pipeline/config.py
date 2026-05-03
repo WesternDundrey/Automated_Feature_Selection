@@ -316,6 +316,19 @@ class Config:
     catalog_validator_model: str = "anthropic/claude-sonnet-4.6"
     validate_concurrency: int = 16
 
+    # ── v8.20.5 corpus splitting (workaround for §3a 4-EngineCore) ───
+    # Skip the first N qualifying sequences before collecting
+    # `n_sequences`. Used to run two parallel 2-GPU annotation jobs on
+    # disjoint corpus halves, then merge — avoids the 4-shard
+    # contention while keeping all GPUs useful. e.g.
+    #   Job A: --corpus-skip 0    --n_sequences 5000  (CVD=0,1)
+    #   Job B: --corpus-skip 5000 --n_sequences 5000  (CVD=2,3)
+    #   then: --step merge-slices --merge-from <dirA> <dirB>
+    corpus_skip: int = 0
+    # Source output_dirs for --step merge-slices. Set by run.py from
+    # --merge-from flag. Empty by default; populated for the merge step.
+    merge_from_dirs: tuple = ()
+
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = True    # v8.19.4: DEFAULT FLIPPED to True.
                                         # Local Qwen3-4B-Base via vLLM is

@@ -136,29 +136,48 @@ def _format_feature_for_annotator(f: dict, max_exclusions: int = 2, include_excl
 # ── Corpus preparation ──────────────────────────────────────────────────────
 
 def prepare_corpus(model, cfg: Config) -> torch.Tensor:
-    """Load corpus, tokenize with transformer_lens, return (N, seq_len) token tensor."""
+    """Load corpus, tokenize with transformer_lens, return (N, seq_len) token tensor.
+
+    `cfg.corpus_skip` (default 0): skip the first N qualifying sequences
+    before collecting `cfg.n_sequences`. Used for splitting a single
+    corpus across multiple parallel annotation jobs (e.g. job A with
+    skip=0 + n=5000, job B with skip=5000 + n=5000, then merge). The
+    skip is computed against QUALIFYING sequences (passes length
+    filter), not raw dataset rows, so two jobs with disjoint
+    [skip, skip+n] ranges produce non-overlapping corpora.
+    """
     from datasets import load_dataset
 
     tokenizer = model.tokenizer
     print(f"Loading corpus: {cfg.corpus_dataset} [{cfg.corpus_split}]")
     dataset = load_dataset(cfg.corpus_dataset, split=cfg.corpus_split, streaming=True)
 
+    skip = int(getattr(cfg, "corpus_skip", 0) or 0)
+    if skip > 0:
+        print(f"  Skipping first {skip:,} qualifying sequences (--corpus-skip)")
+
     sequences = []
+    n_skipped = 0
     pbar = tqdm(total=cfg.n_sequences, desc="Tokenizing")
     for example in dataset:
         text = example.get("text", "")
         if len(text.strip()) < 80:
             continue
         ids = tokenizer.encode(text)
-        if len(ids) >= cfg.seq_len:
-            sequences.append(ids[: cfg.seq_len])
-            pbar.update(1)
+        if len(ids) < cfg.seq_len:
+            continue
+        if n_skipped < skip:
+            n_skipped += 1
+            continue
+        sequences.append(ids[: cfg.seq_len])
+        pbar.update(1)
         if len(sequences) >= cfg.n_sequences:
             break
     pbar.close()
 
     tokens = torch.tensor(sequences, dtype=torch.long)
-    print(f"  Corpus: {tokens.shape[0]} sequences x {tokens.shape[1]} tokens")
+    print(f"  Corpus: {tokens.shape[0]} sequences x {tokens.shape[1]} tokens "
+          f"(skipped {n_skipped:,} upstream)")
     return tokens
 
 
@@ -1868,6 +1887,7 @@ cfg = Config(
     target_layer={cfg.target_layer}, output_dir="{cfg.output_dir}",
     hook_point="{cfg.hook_point}",
     sae_release="{cfg.sae_release}", sae_id="{cfg.sae_id}",
+    corpus_skip={getattr(cfg, "corpus_skip", 0)},
 )
 cfg.output_dir.mkdir(parents=True, exist_ok=True)
 

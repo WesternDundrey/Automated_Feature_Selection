@@ -160,7 +160,7 @@ def main():
                  "pilot", "irr", "oracle-unsup", "unsup-f1", "compare",
                  "dedup-catalog", "curate-fve", "propose-haiku",
                  "filter-candidates", "opus-judge", "validate-catalog",
-                 "recover-judge"],
+                 "recover-judge", "merge-slices"],
         help="Run only this step",
     )
     parser.add_argument(
@@ -347,6 +347,21 @@ def main():
              "8192) if multi-shard prefill contention is the gen-slow "
              "cause. Higher (e.g. 32768-65536) for single-shard GPU-"
              "light scenarios.",
+    )
+    parser.add_argument(
+        "--corpus-skip", type=int, default=None,
+        help="Skip the first N qualifying corpus sequences before "
+             "collecting --n_sequences. Used to split a corpus across "
+             "two parallel 2-GPU annotation jobs (workaround for §3a "
+             "4-shard contention). e.g. job A: skip=0 n=5000; job B: "
+             "skip=5000 n=5000; then --step merge-slices.",
+    )
+    parser.add_argument(
+        "--merge-from", nargs="+", default=None,
+        help="For --step merge-slices: list of source output_dirs to "
+             "concatenate. Order matters (defines sequence order in "
+             "merged tokens.pt / activations.pt / annotations.pt). "
+             "All slices must be annotated against the same catalog.",
     )
     parser.add_argument(
         "--features-per-call", type=int, default=None,
@@ -607,6 +622,10 @@ def main():
         overrides["local_annotation_max_num_seqs"] = args.vllm_max_num_seqs
     if args.vllm_max_num_batched_tokens is not None:
         overrides["local_annotation_max_num_batched_tokens"] = args.vllm_max_num_batched_tokens
+    if args.corpus_skip is not None:
+        overrides["corpus_skip"] = args.corpus_skip
+    if args.merge_from is not None:
+        overrides["merge_from_dirs"] = args.merge_from
     if args.features_per_call is not None:
         overrides["features_per_annotation_call"] = args.features_per_call
     if args.annotation_checkpoint_every is not None:
@@ -973,6 +992,15 @@ def main():
         from .opus_judge import recover_from_raw
         recover_from_raw(cfg)
         print(f"Recover-Judge completed in {time.time() - t0:.1f}s")
+
+    if args.step == "merge-slices":
+        print("\n" + "=" * 70)
+        print(f"STEP: MERGE-SLICES  (concat parallel-job outputs)")
+        print("=" * 70)
+        t0 = time.time()
+        from .merge_slices import run as run_merge_slices
+        run_merge_slices(cfg)
+        print(f"Merge-Slices completed in {time.time() - t0:.1f}s")
 
     if args.step == "validate-catalog":
         print("\n" + "=" * 70)
