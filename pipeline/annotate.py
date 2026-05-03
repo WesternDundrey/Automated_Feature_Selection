@@ -823,20 +823,31 @@ def _annotate_local_vllm_pertoken(
     gc.collect()
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    llm = LLM(
+    # v8.20.0.4 vLLM scheduler knobs. Defaults to 1024 (the v8.19.8 sweet
+    # spot for 2-GPU); shards spawned by `_annotate_local_parallel` get
+    # an auto-scaled value (1024 // n_shards) so total host in-flight
+    # stays roughly constant regardless of GPU count, addressing the
+    # 4-GPU "gen slow" contention.
+    _max_num_seqs = int(getattr(cfg, "local_annotation_max_num_seqs", 0) or 0)
+    if _max_num_seqs <= 0:
+        _max_num_seqs = 1024  # single-shard default
+    _max_num_batched_tokens = int(
+        getattr(cfg, "local_annotation_max_num_batched_tokens", 0) or 0
+    )
+    _llm_kwargs = dict(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=computed_max_len,
         gpu_memory_utilization=0.9,
-        # v8.19.8: nvidia-smi dmon showed both 5090s averaging ~20-25%
-        # util on the chunk=2 run, alternating between active and
-        # idle. Default max_num_seqs=256 was rate-limiting the
-        # scheduler with 30K-61K prompts per chunk. Bumping to 1024
-        # lets vLLM pack ~4x more in-flight, keeping the GPU busy
-        # longer per chunk and reducing the alternating pattern.
-        max_num_seqs=1024,
+        max_num_seqs=_max_num_seqs,
     )
+    if _max_num_batched_tokens > 0:
+        _llm_kwargs["max_num_batched_tokens"] = _max_num_batched_tokens
+    print(f"  vLLM scheduler: max_num_seqs={_max_num_seqs}, "
+          f"max_num_batched_tokens="
+          f"{_max_num_batched_tokens if _max_num_batched_tokens > 0 else 'default'}")
+    llm = LLM(**_llm_kwargs)
     # Base model: no thinking, no chat template. Just completes text.
     # allowed_token_ids forces "0" or "1" — safe on base models.
     params = SamplingParams(
@@ -1438,6 +1449,20 @@ def _annotate_local_parallel(
         features_path = tmp / "features.json"
 
         cfg_child = copy.copy(cfg)
+        # v8.20.0.4: auto-scale max_num_seqs by shard count when the user
+        # leaves it at 0 (auto). The 1024 default was tuned for 2-shard
+        # (postmortem v8.19.8); at n_gpus shards × 1024 in-flight = 4096
+        # active sequences across the host, the per-shard CPU scheduler
+        # thread + EngineCore IPC contend (postmortem §3a, "build fast,
+        # gen slow at 4 GPUs"). Hold total host in-flight roughly
+        # constant by giving each shard 1024 // n_shards. Floor at 256
+        # so a single-shard's scheduler isn't starved.
+        if int(getattr(cfg_child, "local_annotation_max_num_seqs", 0) or 0) <= 0:
+            auto_max = max(256, 1024 // max(1, n_gpus))
+            cfg_child.local_annotation_max_num_seqs = auto_max
+            print(f"  [parent] auto-scaling max_num_seqs to {auto_max} "
+                  f"per shard (n_shards={n_gpus}); override with "
+                  f"--vllm-max-num-seqs N")
         # Each shard writes to its own state dir so partial-checkpoint
         # files don't collide across shards.
         features_path.write_text(json.dumps(features))
@@ -1600,7 +1625,11 @@ def _detect_annotation_gpus(cfg: Config) -> int:
     v8.20.0.2's prefix-block batching reduced the contention enough
     that 4-GPU is now viable.
     """
-    SAFE_CAP = 2
+    # v8.20.0.4: cap raised to 4 — the auto-scaled max_num_seqs (1024 //
+    # n_shards, floor 256) addresses the §3a "gen slow at 4 GPUs"
+    # contention by holding total host in-flight requests constant.
+    # Users who want >4 must opt in explicitly via --n-annotation-gpus N.
+    SAFE_CAP = 4
 
     explicit = int(getattr(cfg, "n_annotation_gpus", 0) or 0)
     if explicit >= 1:

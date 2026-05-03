@@ -352,6 +352,21 @@ class Config:
     #   single-token-output workloads).
     local_annotation_prefix_block: int = 0
     local_annotation_target_prompts: int = 65536
+    # v8.20.0.4 vLLM scheduler knobs (postmortem §3a fix attempt for the
+    # 4-GPU contention). Per the user's "build fast, gen slow at 4 GPUs"
+    # diagnostic, the bottleneck is vLLM scheduler / per-shard contention,
+    # not Python prompt construction. With 1024 in-flight requests per
+    # shard × 4 shards = 4096 simultaneous sequences across the host,
+    # the per-shard CPU scheduler thread and EngineCore IPC contend.
+    #
+    # Auto-scaling: 0 = auto. Parent computes
+    #   max_num_seqs = max(256, 1024 // n_shards)
+    #   max_num_batched_tokens = 0 (use vLLM default)
+    # before pickling shard cfgs, so each shard sees the right value.
+    # Override with --vllm-max-num-seqs / --vllm-max-num-batched-tokens
+    # for tuning.
+    local_annotation_max_num_seqs: int = 0
+    local_annotation_max_num_batched_tokens: int = 0
     # Save annotations_local_partial.pt + progress.txt every N chunks
     # instead of every chunk. At chunk=32, the per-shard annotations
     # tensor is ~610MB; saving 156 times/run is ~95GB of disk I/O,

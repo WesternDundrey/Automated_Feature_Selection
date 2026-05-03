@@ -4,6 +4,86 @@
 
 ---
 
+## [v8.20.0.4] — vLLM max_num_seqs auto-scaling for multi-shard (the §3a real fix)
+
+User reported under v8.20.0.2: "rendering was pretty fast but processing
+was slow (when model annotates)" at 4 GPUs. That's the build-fast /
+gen-slow signature — bottleneck is vLLM scheduler / per-shard
+contention, NOT Python prompt construction.
+
+### Diagnosis
+
+`max_num_seqs=1024` was hardcoded in v8.19.8 as the 2-GPU sweet spot.
+At 4 shards × 1024 = 4096 simultaneous in-flight sequences across the
+host, the per-shard CPU scheduler thread + EngineCore IPC contend.
+GPUs end up "alternating" because scheduler dispatch can't keep up
+with 4× the per-host coordination load.
+
+### Fix
+
+`_annotate_local_parallel` auto-scales `local_annotation_max_num_seqs`
+by shard count before pickling shard cfgs:
+
+  auto_max = max(256, 1024 // n_shards)
+
+This holds total host in-flight roughly constant (≈ 1024) regardless
+of GPU count. At 4 shards: 256 each. At 2 shards: 512 each. At 1 shard
+(legacy): 1024.
+
+### Other knobs exposed
+
+* `--vllm-max-num-seqs N` — manual override of the auto-scaled value
+* `--vllm-max-num-batched-tokens N` — chunked-prefill batch size
+  (vLLM picks default; lower if multi-shard prefill contention shows
+  up; higher for single-shard GPU-light scenarios)
+
+The active values print at LLM construction so the timing log is
+self-documenting:
+
+  vLLM scheduler: max_num_seqs=256, max_num_batched_tokens=default
+
+### SAFE_CAP raised 2 → 4
+
+The v8.20.0.3 cap was defensive while §3a was unaddressed. Now that
+auto-scaling addresses the contention, raise the cap to 4 so users
+running on 4-GPU rented boxes don't have to pass the override flag
+on every command. Users wanting >4 still need explicit
+`--n-annotation-gpus N`.
+
+### Test pattern
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m pipeline.run \
+  --output_dir pipeline_data_scaling \
+  --step annotate
+# Expected output: "auto-scaling max_num_seqs to 256 per shard (n_shards=4)"
+# Expected per-block gen time: comparable to 2-GPU baseline (≈ 100-200s
+# at 64K prompts) rather than the v8.19 27× slowdown.
+```
+
+If `gen` is still slow at 4 GPUs after this:
+* Lower `--vllm-max-num-seqs 128` — possibly per-shard scheduler
+  thread is still loaded
+* Lower `--annotation-target-prompts 32768` — fewer prompts per call
+* Add `--vllm-max-num-batched-tokens 8192` — smaller prefill steps
+  reduce cross-shard CUDA bus contention
+* If none help, the bottleneck is at the vLLM v1 EngineCore layer
+  (internal lock); next fix would be `VLLM_ENABLE_V1_MULTIPROCESSING=0`
+  to run scheduler in-process. Postmortem §7 anti-tunneling: don't
+  ship that without measurement first.
+
+### Files touched
+
+* `pipeline/annotate.py` — auto-scale max_num_seqs in
+  `_annotate_local_parallel`; LLM constructor reads cfg fields;
+  SAFE_CAP raised to 4
+* `pipeline/config.py` — `local_annotation_max_num_seqs`,
+  `local_annotation_max_num_batched_tokens`
+* `pipeline/run.py` — `--vllm-max-num-seqs`,
+  `--vllm-max-num-batched-tokens`
+
+---
+
 ## [v8.20.0.3] — defensive 2-GPU cap on auto-detect (postmortem §3a)
 
 The 4-EngineCore contention bug (postmortem §3a) is the open-question

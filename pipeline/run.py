@@ -306,6 +306,23 @@ def main():
              "is GPU-light.",
     )
     parser.add_argument(
+        "--vllm-max-num-seqs", type=int, default=None,
+        help="vLLM scheduler max_num_seqs per shard (in-flight request "
+             "queue). 0 (default in Config) = auto-scale by shard count: "
+             "max(256, 1024 // n_shards), so total host in-flight stays "
+             "constant. Manually pass e.g. 256 if `gen` is still slow at "
+             "4+ shards (postmortem §3a contention). Don't bump above "
+             "1024 unless single-shard.",
+    )
+    parser.add_argument(
+        "--vllm-max-num-batched-tokens", type=int, default=None,
+        help="vLLM scheduler max_num_batched_tokens per shard (chunked-"
+             "prefill batch size). 0 (default) = vLLM picks. Lower (e.g. "
+             "8192) if multi-shard prefill contention is the gen-slow "
+             "cause. Higher (e.g. 32768-65536) for single-shard GPU-"
+             "light scenarios.",
+    )
+    parser.add_argument(
         "--features-per-call", type=int, default=None,
         help="Feature batch size for annotation. Mostly relevant for API / "
              "batch-position modes, but kept as a CLI override for local "
@@ -560,6 +577,10 @@ def main():
         overrides["local_annotation_prefix_block"] = args.annotation_prefix_block
     if args.annotation_target_prompts is not None:
         overrides["local_annotation_target_prompts"] = args.annotation_target_prompts
+    if args.vllm_max_num_seqs is not None:
+        overrides["local_annotation_max_num_seqs"] = args.vllm_max_num_seqs
+    if args.vllm_max_num_batched_tokens is not None:
+        overrides["local_annotation_max_num_batched_tokens"] = args.vllm_max_num_batched_tokens
     if args.features_per_call is not None:
         overrides["features_per_annotation_call"] = args.features_per_call
     if args.annotation_checkpoint_every is not None:
