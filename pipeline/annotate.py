@@ -1585,35 +1585,69 @@ def _detect_annotation_gpus(cfg: Config) -> int:
     eventually killed by VLLM_ENGINE_READY_TIMEOUT_S).
 
     Priority — strictly env-var / out-of-process only:
-      1. cfg.n_annotation_gpus if explicitly set (>=1)
-      2. CUDA_VISIBLE_DEVICES count if set
-      3. nvidia-smi via subprocess (no Python CUDA init)
+      1. cfg.n_annotation_gpus if explicitly set (>=1) — bypasses cap
+      2. CUDA_VISIBLE_DEVICES count if set, then capped at SAFE_CAP
+      3. nvidia-smi via subprocess (no Python CUDA init), then capped
       4. Fallback: 1
+
+    SAFE_CAP (postmortem §3a 4-EngineCore contention): until root-caused,
+    automatic detection caps at 2 GPUs/arm. The v8.19 scaling run
+    documented 4 EngineCores on one host produces a 27× per-shard
+    slowdown (600 dec/s → 22 dec/s) with GPUs alternating active/sleep,
+    likely Python GIL contention or vLLM v1 internal lock — unprofiled.
+    Set cfg.n_annotation_gpus = N (--n-annotation-gpus N) to opt out
+    of the cap explicitly; this is the path for testing whether
+    v8.20.0.2's prefix-block batching reduced the contention enough
+    that 4-GPU is now viable.
     """
+    SAFE_CAP = 2
+
     explicit = int(getattr(cfg, "n_annotation_gpus", 0) or 0)
     if explicit >= 1:
+        # Explicit override: trust the user, no cap.
         return explicit
+
+    detected = None
+    detection_source = None
 
     import os
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if cvd.strip():
-        return len([x for x in cvd.split(",") if x.strip()])
+        detected = len([x for x in cvd.split(",") if x.strip()])
+        detection_source = f"CUDA_VISIBLE_DEVICES={cvd!r}"
 
-    # Out-of-process probe: nvidia-smi prints one line per GPU.
-    # Subprocess never inherits CUDA state into our parent's torch.
-    try:
-        import subprocess as _sp
-        out = _sp.check_output(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            stderr=_sp.DEVNULL,
-            timeout=5,
-        ).decode().strip()
-        n = len([line for line in out.splitlines() if line.strip()])
-        if n >= 1:
-            return n
-    except Exception:
-        pass
-    return 1
+    if detected is None:
+        # Out-of-process probe: nvidia-smi prints one line per GPU.
+        # Subprocess never inherits CUDA state into our parent's torch.
+        try:
+            import subprocess as _sp
+            out = _sp.check_output(
+                ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                stderr=_sp.DEVNULL,
+                timeout=5,
+            ).decode().strip()
+            n = len([line for line in out.splitlines() if line.strip()])
+            if n >= 1:
+                detected = n
+                detection_source = "nvidia-smi"
+        except Exception:
+            pass
+
+    if detected is None:
+        return 1
+
+    # Apply the safe cap on auto-detected counts only. The user can
+    # always opt out via --n-annotation-gpus N (sets cfg.n_annotation_gpus
+    # explicitly, which short-circuits above).
+    if detected > SAFE_CAP:
+        print(f"  [annotate] auto-detected {detected} GPUs via "
+              f"{detection_source}; capping at {SAFE_CAP} per "
+              f"postmortem §3a (4-EngineCore contention, 27× per-shard "
+              f"slowdown). Pass --n-annotation-gpus {detected} to "
+              f"override and test whether v8.20.0.2 prefix-blocking "
+              f"resolved the contention.")
+        return SAFE_CAP
+    return detected
 
 
 # ── Main entry point ────────────────────────────────────────────────────────

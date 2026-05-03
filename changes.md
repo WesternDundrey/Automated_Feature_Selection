@@ -4,6 +4,54 @@
 
 ---
 
+## [v8.20.0.3] — defensive 2-GPU cap on auto-detect (postmortem §3a)
+
+The 4-EngineCore contention bug (postmortem §3a) is the open-question
+item that v8.20.0.1 + v8.20.0.2 don't directly fix:
+
+* v8.20.0.2 prefix-blocking *may* help indirectly — drops per-process
+  Python construction pressure ~10-15× (600K-1M prompts/call → 32-65K).
+  If the 27× slowdown was driven by 4 Python interpreters all hitting
+  GC/memory simultaneously, this might be enough.
+* If the contention is at the vLLM v1 EngineCore layer (internal
+  scheduler lock, NCCL state, /dev/shm broadcast), prefix-blocking
+  doesn't touch it.
+
+Until measured, the safe default is to cap auto-detect at 2 GPUs/arm.
+`_detect_annotation_gpus` now applies a `SAFE_CAP = 2` to the CVD-count
+and nvidia-smi paths, with a clear warning explaining the cap and
+naming the override.
+
+### Override path
+
+```bash
+# Cap kicks in (auto-detect):
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m pipeline.run --step annotate
+# → "auto-detected 4 GPUs ... capping at 2 ..."
+
+# Test 4-GPU viability post-prefix-block (explicit opt-in):
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m pipeline.run --step annotate \
+  --n-annotation-gpus 4
+# → no cap; runs 4 shards
+```
+
+### What "fixed" means here
+
+* If the 4-GPU explicit run shows per-shard `gen` time ≈ 2-GPU
+  baseline → contention was Python construction, prefix-blocking
+  resolved it, the cap can be raised.
+* If 4-GPU is still 22 dec/s/shard while 2-GPU is 600+ → contention
+  is at the vLLM/CUDA layer; need to profile (py-spy across shards,
+  `nvidia-smi dmon -s u`, vLLM v0 fallback test via `VLLM_USE_V1=0`).
+* The diagnostic data, not speculation, decides the next move.
+
+### Files touched
+
+* `pipeline/annotate.py` — `_detect_annotation_gpus` cap + warning;
+  explicit `cfg.n_annotation_gpus` bypass preserved.
+
+---
+
 ## [v8.20.0.2] — annotate.py: prefix-block batching (the structural throughput fix)
 
 Commit B of the throughput-fix staging. Restructures
