@@ -51,6 +51,10 @@ def main():
                              "explainer (overrides "
                              "cfg.delphi_explainer_model). Default: "
                              "anthropic/claude-sonnet-4.6.")
+    parser.add_argument("--delphi-n-features", type=int, default=None,
+                        help="Number of unsup SAE latents Delphi describes "
+                             "(unsup arm of the comparison run). Default "
+                             "from Config.delphi_n_features (300).")
     parser.add_argument("--output_dir", default=None, help="Output directory")
     parser.add_argument("--device", default=None, help="Device (cuda/cpu)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
@@ -461,6 +465,8 @@ def main():
         overrides["opus_explanation_model"] = args.opus_model
     if args.delphi_model:
         overrides["delphi_explainer_model"] = args.delphi_model
+    if args.delphi_n_features is not None:
+        overrides["delphi_n_features"] = args.delphi_n_features
     if args.shortlist_size is not None:
         overrides["shortlist_size"] = args.shortlist_size
     if args.epochs:
