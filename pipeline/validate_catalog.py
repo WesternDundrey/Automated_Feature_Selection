@@ -41,43 +41,81 @@ from .config import Config
 
 
 _PROMPT_TEMPLATE = """\
-You are validating metadata for a supervised SAE feature. The feature \
-will label individual tokens at annotation time, and the annotator sees \
-ONLY the prefix up to the target token (no future tokens). Examples \
-mark the target token with `<<token>>`.
+You are the FINAL safety gate for a supervised SAE catalog. The features \
+you approve will be used to label millions of tokens at full annotation. \
+A bad feature wastes 8+ GPU-hours and pollutes downstream training. \
+Be strict. The annotator sees ONLY the prefix up to the target token \
+(no future tokens, no full sentence parse). Examples mark the target \
+token with `<<token>>`.
 
 Feature id: {fid}
 Description: {desc}
+Exclusions (annotator-suffix metadata): {exclusions}
 
-Positive examples (each SHOULD match the description for the \
-highlighted token):
+Positive examples (each SHOULD demonstrate the description):
 {pos_block}
 
-Negative examples (each SHOULD NOT match the description; should be \
-genuine boundary cases that look similar but fail one criterion):
+Negative examples (boundary cases that SHOULD NOT match but look \
+similar):
 {neg_block}
 
-For each positive: does the highlighted token, given its left-context \
-prefix, satisfy the description? (Don't peek at right context.)
+Apply these checks IN ORDER:
 
-For each negative: is it a genuine boundary case where a careful \
-annotator might be tempted to label positive but shouldn't? (Or is \
-it actually a positive example mislabeled, or unrelated noise?)
+1. PREFIX-DECIDABILITY: can the description be decided from the \
+target token's surface + the tokens BEFORE it? If the description \
+requires future tokens, full-sentence parse, or document topic, \
+that's a hard drop. Watch for sneaky cases:
+     - "Token is a sentence-final period" (needs next token)
+     - "Token is the subject of a clause" (needs full parse)
+     - "NOT sentence-final periods" exclusion (the exclusion itself \
+        requires future context to apply)
+     - "Token is part of a named entity" (needs full entity span)
+     - "Proper noun" judgments often require external knowledge
 
-Output STRICT JSON, no preface, no commentary:
+2. STYLE: surface-form, exact left-context, or explicit FVE-backbone \
+descriptions are OK. NOT OK: broad POS categories ("noun", "verb", \
+"preposition" without further constraint), proper-name judgment, \
+semantic role, register/genre/domain ("formal writing", "political \
+context").
+
+3. POSITIVE EXAMPLES: does each highlighted token actually demonstrate \
+the description, given ONLY the prefix? E.g., for "Token immediately \
+follows a closing delimiter", does the prefix end with `)`/`]`/`}}`/`"` \
+right before the highlighted token? If positives are openers tagged \
+as if they're after-closers, that's a fundamental description-vs-data \
+mismatch.
+
+4. NEGATIVE EXAMPLES: are they GENUINE boundary cases (look similar \
+but fail one criterion)? Or do they actually MATCH the description \
+(contradiction, e.g., a "for <<PlayStation>>" listed as negative under \
+"capitalization after preposition" when it clearly IS a capital token \
+after "for")? If ≥1 negative actually matches the description, the \
+boundary is broken — annotator can't disambiguate.
+
+5. UNSALVAGEABLE: even with example pruning, can the description as \
+written produce a clean labelable feature? Or is there a fundamental \
+contradiction / over-broadness no pruning can fix?
+
+Output STRICT JSON, no preface:
 
 {{
-  "valid": <true if at least 2 positive examples and 2 negative examples \
-are correct, else false>,
-  "bad_positive_indices": [<list of 0-based indices of positive examples \
-that DON'T demonstrate the description>],
-  "bad_negative_indices": [<list of 0-based indices of negative examples \
-that ARE actually positives, or are off-topic>],
-  "left_context_dependent": <true if description requires checking \
-tokens before the target, which is fine; false if surface-only>,
-  "reason": "<one sentence on what's wrong, or 'metadata clean' if \
-nothing>"
+  "verdict": "keep" | "prune" | "drop",
+  "drop_reason": "requires_future_context" | "style_violation" | \
+"negatives_contradict" | "fundamental_mismatch" | "broad_pos" | null,
+  "bad_positive_indices": [<0-based indices of positives that DON'T \
+demonstrate the description>],
+  "bad_negative_indices": [<0-based indices of negatives that ARE \
+actually positives or off-topic noise>],
+  "reason": "<one sentence>"
 }}
+
+VERDICT SEMANTICS:
+  - "keep":  metadata clean as-is, no pruning
+  - "prune": some bad examples; pruning fixes it (BUT only if ≥2 valid \
+positives AND ≥2 valid negatives remain after pruning)
+  - "drop":  unsalvageable; drop regardless of how many examples \
+survive. Use this for prefix-undecidable, style-violating, contradict- \
+ory-negatives, fundamentally mismatched description-vs-examples.
 """
 
 
@@ -94,6 +132,12 @@ def _format_examples(examples: list) -> str:
             s = s[:200] + "..."
         lines.append(f"  {i}. {s}")
     return "\n".join(lines)
+
+
+def _format_exclusions(exclusions: list) -> str:
+    if not exclusions:
+        return "(none)"
+    return " | ".join(str(e)[:80] for e in exclusions[:5])
 
 
 def _parse_validator_response(text: str) -> dict | None:
@@ -117,9 +161,11 @@ async def _validate_one(
     desc = feature.get("description", "")
     pos = feature.get("positive_examples", []) or []
     neg = feature.get("negative_examples", []) or []
+    exc = feature.get("exclusions", []) or []
     prompt = _PROMPT_TEMPLATE.format(
         fid=fid,
         desc=desc,
+        exclusions=_format_exclusions(exc),
         pos_block=_format_examples(pos),
         neg_block=_format_examples(neg),
     )
@@ -202,9 +248,29 @@ def _apply_verdicts(
             new_features.append(f)
             continue
 
+        # New verdict schema: keep / prune / drop. drop = unsalvageable
+        # regardless of example survival; verdict honored as a hard gate.
+        v_type = str(verdict.get("verdict", "")).strip().lower()
+        # Backward-compat fallback: older `valid: false` responses map
+        # to drop; missing verdict → keep.
+        if not v_type:
+            if verdict.get("valid") is False:
+                v_type = "drop"
+            else:
+                v_type = "keep"
+
+        if v_type == "drop":
+            drop_log.append({
+                "id": fid,
+                "kind": "validator_dropped",
+                "kept": False,
+                "drop_reason": verdict.get("drop_reason"),
+                "reason": str(verdict.get("reason", ""))[:200],
+            })
+            continue
+
         bad_pos_idx = set(verdict.get("bad_positive_indices", []) or [])
         bad_neg_idx = set(verdict.get("bad_negative_indices", []) or [])
-        valid_flag = bool(verdict.get("valid", False))
 
         old_pos = list(f.get("positive_examples", []) or [])
         old_neg = list(f.get("negative_examples", []) or [])
@@ -224,32 +290,14 @@ def _apply_verdicts(
                 "n_pos_kept": len(new_pos),
                 "n_neg_kept": len(new_neg),
                 "n_pruned_total": n_pruned,
-                "valid": valid_flag,
-                "reason": verdict.get("reason", "")[:200],
+                "verdict": v_type,
+                "reason": str(verdict.get("reason", ""))[:200],
             })
             continue
-
-        # If validator marked invalid but enough examples survived, log
-        # but keep — Sonnet's `valid` flag and the example survival count
-        # disagree only when many examples were pruned but the floor still
-        # holds. Trust the example-level judgment over the global flag.
-        if not valid_flag and n_pruned > 0:
-            drop_log.append({
-                "id": fid,
-                "kind": "invalid_but_floor_held",
-                "kept": True,
-                "n_pos_kept": len(new_pos),
-                "n_neg_kept": len(new_neg),
-                "n_pruned_total": n_pruned,
-                "reason": verdict.get("reason", "")[:200],
-            })
 
         f_new = dict(f)
         f_new["positive_examples"] = new_pos
         f_new["negative_examples"] = new_neg
-        f_new["validator_left_context_dependent"] = bool(
-            verdict.get("left_context_dependent", False)
-        )
         new_features.append(f_new)
 
     pruned = dict(catalog)
