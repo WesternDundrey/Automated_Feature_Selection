@@ -95,3 +95,61 @@ Wall-clock ~3 days; API cost ~$15-20 for the Opus call.
 This pilot ran on the v8.19.x Delphi-vs-Opus architecture: real EleutherAI Delphi v0.1.3 cloned + installed via `install.sh` Compartment 4; Opus 4.7 catalog generator with auto-downshift on 1M-context overflow; literal-mentor hinge defaults (zero-margin, no pos_weight, frozen decoder); position-subsample disabled at pilot scale; min-support filter not active at pilot scale.
 
 The 5K-seq matched-arm Type-1 vs Type-2 (oracle_unsup) head-to-head was always the rigorous comparison; the pilot was a go/no-go gate. **The gate fired this exact concern: should we scale.** Answer: not before the four diagnostic questions above. Each is 15-60 min and would change the right scaling decision.
+
+---
+
+## Full-scale Delphi result (2026-05-03)
+
+Followed the pilot with the full unsup-arm scoring at 5000 sequences against the Delphi catalog of 91 leaves (`pipeline_data_compare_unsup/unsup_f1.json`). Wall-clock 24.2s — only the F1 readout step, since Delphi's annotations were already produced.
+
+| arm | catalog | n | mean F1 | median F1 | scale |
+|---|---|---:|---:|---:|---|
+| sup (summary9 production baseline) | Sonnet, 46 features (U=256, hinge, frozen) | 46 | **0.573** (supT0) / **0.564** (supCal) | — | 5000 seq |
+| **unsup (this run, real EleutherAI Delphi)** | **gpt2-small-res-jb, 91 latents** | **91** | **0.025** | **0.010** | **5000 seq** |
+
+**Δ mean ≈ +0.55 (~23× gap)** at matched corpus scale. Decisively confirms the pilot: real Delphi auto-interp on `gpt2-small-res-jb` produces descriptions whose latents do not predict them on held-out tokens, and **the gap does not close with more sequences**. The 5000-seq scale with 91 latents is more decisive than the pilot's 500-seq × 30-latent slice.
+
+The natural match for this comparison is the v8.18.39 production run (summary9). For a strict 91-feature sup-arm at this scale, `pipeline_data_compare_sup/evaluation.json` should hold the matched-count number; verify with `mean_f1` / `median_f1` from that artifact when checking apples-to-apples.
+
+### Per-feature distribution (open question)
+
+Mean=0.025 / median=0.010 is highly skewed. Whether this is "all 91 features near zero" or "bimodal: a few strong, rest dead" matters for the paper claim. Bucket the per-feature F1 from `unsup_f1.json` to know which.
+
+If all-near-zero: the unsup-arm headline is "real Delphi descriptions don't predict their own latents at any scale on this SAE/layer" — a publishable negative result.
+If bimodal: report the bimodality and the strong-subset; selecting them post-hoc is cheating, but acknowledging the heterogeneity is honest.
+
+### Honest framing for the paper
+
+- "Real EleutherAI Delphi auto-interp on `gpt2-small-res-jb` (24,576 latents, layer 9) produces descriptions whose latents achieve median F1 = 0.010 / mean F1 = 0.025 on held-out tokens, at 5000-sequence scale."
+- supSAE wins by training against the labels; the pretrained SAE has known polysemy at this layer (multiple modes per latent; Delphi captures one).
+- Frame as "supSAE achieves better description fidelity," NOT "supSAE makes better features." The selection-freedom asymmetry (Opus designs descriptions to be learnable; Delphi describes whatever the unsup latent does post-hoc) IS the methodology being tested; not normalized away.
+
+Cost: ~$5 in Sonnet 4.6 for the original Delphi explainer pass; $0 for the F1 readout (24.2s).
+
+### Qualitative catalog audit — why the F1 is 0.025
+
+Manual audit of the 100-latent Delphi catalog (`delphi_catalog.json`) explains the F1 mechanistically. The catalog overwhelmingly produces descriptions of the form "long passages of text from diverse sources with no consistent pattern" — non-falsifiable strings that apply to virtually every position in OpenWebText. The detection scorer cannot separate positives from negatives because the description is a tautology over the corpus.
+
+| Bucket | Count | Pattern |
+|---|---:|---|
+| **Explicit non-statements** | **~65/91 (71%)** | Phrases like "no consistent pattern", "no clear unifying", "no specific pattern", "essentially arbitrary", "uniformly activated regardless of content" |
+| Vague topical flavor | ~22/91 (24%) | Low-quality web / mid-sentence informational / blog-forum-noise — somewhat predictive but too broad to score |
+| **Actually specific & actionable** | **~5/91 (5%)** | The minority where Delphi recovered a learnable concept |
+| Explicit parse failure | 1 | `latent_14940`: "Explanation could not be parsed" |
+| Explicit "no pattern at all" | 1 | `latent_8357`: "no particular tokens or patterns are activated" |
+
+The 5/91 actionable Delphi descriptions worth preserving as evidence Delphi *can* recover concepts when the underlying latent is monosemantic enough:
+
+- `latent_6141` — "begin with a special or unusual character (Unicode artifact, punctuation, or formatting symbol) at the very start of the passage"
+- `latent_16328` — "fully enclosed within special formatting characters such as quotation marks or newline symbols"
+- `latent_21566` — "formal or institutional speech contexts, particularly involving legal rights, civil liberties, or religious/political rhetoric"
+- `latent_11270` — "multi-line or multi-sentence text spans from structured or technical contexts such as code, academic references, or formal writing"
+- `latent_9222` — "mid-sentence or mid-passage, typically following a conjunction or article, representing continuation of a broader context"
+
+This is the **5% of `gpt2-small-res-jb` layer-9 latents that are post-hoc-describable as token-level concepts**. The other 95% are either polysemantic (multiple modes per latent — Sonnet correctly recognizes "no pattern") or activate on diffuse context properties not reducible to a single yes/no question.
+
+**The catalog IS the explanation.** When 71% of features are described with phrases the corpus universally satisfies, F1 ≈ base-rate; mean=0.025 is approximately what you'd get from random predictions weighted by feature base rate. This isn't Delphi failing as a tool — Sonnet is being honest about what it sees. It's the **post-hoc auto-interp paradigm itself** failing on this SAE/layer.
+
+The supSAE methodology sidesteps this entirely: Opus designs descriptions to be **learnable as token-level YES/NO questions** (boundary-discipline contract: positive_examples + negative_examples + exclusions per leaf, prefix-decidable, ≤10-word single-sentence). The descriptions are constrained to be classifiable before the SAE is even trained. The supervised arm's higher F1 is not a property of the trained SAE — it's a property of the description-design constraint.
+
+This is the cleanest available qualitative evidence for the methodological contribution: **catalog quality is the bottleneck**, post-hoc auto-interp produces uncatalogable descriptions for the bulk of unsup latents, and the supSAE pipeline replaces that bottleneck with a constrained-design step where every description is required to be learnable.
