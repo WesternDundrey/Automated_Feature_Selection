@@ -364,6 +364,16 @@ def main():
              "All slices must be annotated against the same catalog.",
     )
     parser.add_argument(
+        "--shard-logs-to-files", action="store_true",
+        help="Redirect each shard's stdout/stderr to "
+             "{output_dir}/logs/shard_{N}.log and run an aggregated "
+             "status daemon on the terminal (one line every 10s). "
+             "Default OFF — shards write directly to the terminal so "
+             "tqdm ETA + it/s are live-visible. Useful only at 4+ "
+             "shards on PTYs (vast.ai/SSH) where interleaved tqdm "
+             "refresh causes write-blocking.",
+    )
+    parser.add_argument(
         "--features-per-call", type=int, default=None,
         help="Feature batch size for annotation. Mostly relevant for API / "
              "batch-position modes, but kept as a CLI override for local "
@@ -626,6 +636,8 @@ def main():
         overrides["corpus_skip"] = args.corpus_skip
     if args.merge_from is not None:
         overrides["merge_from_dirs"] = args.merge_from
+    if args.shard_logs_to_files:
+        overrides["shard_logs_to_files"] = True
     if args.features_per_call is not None:
         overrides["features_per_annotation_call"] = args.features_per_call
     if args.annotation_checkpoint_every is not None:

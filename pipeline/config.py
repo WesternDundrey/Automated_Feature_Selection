@@ -328,6 +328,15 @@ class Config:
     # Source output_dirs for --step merge-slices. Set by run.py from
     # --merge-from flag. Empty by default; populated for the merge step.
     merge_from_dirs: tuple = ()
+    # v8.20.6: shard stdout/stderr handling for parallel annotate.
+    # False (default): direct-stdout mode — each shard's tqdm progress
+    #   bar (with ETA + it/s) shows live on the terminal. Best for 1-2
+    #   shards where the terminal can keep up.
+    # True: clean-terminal mode — each shard redirects to
+    #   {output_dir}/logs/shard_{N}.log; an aggregated daemon prints
+    #   ONE status line every 10s. Use at 4+ shards on PTYs (vast.ai/
+    #   SSH) where interleaved tqdm refresh causes write-blocking.
+    shard_logs_to_files: bool = False
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = True    # v8.19.4: DEFAULT FLIPPED to True.

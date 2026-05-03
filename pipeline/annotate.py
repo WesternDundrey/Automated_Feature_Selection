@@ -1522,15 +1522,25 @@ def _annotate_local_parallel(
         procs = []
         out_paths = []
         log_handles: list[tuple[int, Path, object]] = []
-        # v8.20.0.5: announce the clean-terminal plan before any shard
-        # spawn so the user knows where shard logs land and how to tail
-        # them if they want detail.
+
+        # v8.20.6: redirect-to-files is now opt-in (default: shards write
+        # to terminal so tqdm ETA + it/s are visible). The aggregated-
+        # status mode helps when running 4+ shards on a vast.ai PTY where
+        # interleaved tqdm refresh causes write-blocking, but at 1-2 shards
+        # the tqdm output is more useful than a sparse aggregated line.
+        clean_terminal = bool(getattr(cfg, "shard_logs_to_files", False))
         log_dir_announce = cfg.output_dir / "logs"
-        log_dir_announce.mkdir(parents=True, exist_ok=True)
-        print(f"\n  Multi-shard annotation: clean-terminal mode")
-        print(f"  Per-shard logs:   {log_dir_announce}/shard_*.log")
-        print(f"  Aggregated status updates every 10s on this terminal.")
-        print(f"  Detail per shard: tail -f {log_dir_announce}/shard_*.log\n")
+        if clean_terminal:
+            log_dir_announce.mkdir(parents=True, exist_ok=True)
+            print(f"\n  Multi-shard annotation: clean-terminal mode")
+            print(f"  Per-shard logs:   {log_dir_announce}/shard_*.log")
+            print(f"  Aggregated status updates every 10s on this terminal.")
+            print(f"  Detail per shard: tail -f {log_dir_announce}/shard_*.log\n")
+        else:
+            print(f"\n  Multi-shard annotation: direct-stdout mode "
+                  f"(tqdm ETA visible)")
+            print(f"  Pass --shard-logs-to-files to redirect shard output "
+                  f"to per-shard files at 4+ shards.\n")
         for gpu_idx in range(n_gpus):
             shard_tokens = tmp / f"tokens_shard_{gpu_idx}.pt"
             shard_state_dir = tmp / f"state_{gpu_idx}"
@@ -1625,40 +1635,41 @@ torch.save(annotations, {str(shard_out)!r})
             # vLLM crashes with ZeroDivisionError. Keep tqdm on but
             # write to log file so it doesn't flood the parent terminal.
 
-            # v8.20.0.5: redirect each shard's stdout/stderr to its own
-            # log file. With 4 shards on a vast.ai PTY, interleaved
-            # tqdm refresh + per-block prints + vLLM internals cause
-            # writes to block on terminal flushes — a real "2 GPUs
-            # fine, 4 GPUs 20× worse" symptom that doesn't show up in
-            # nvidia-smi (the GPU is correctly idle waiting for
-            # Python's blocking write to flush). Per-shard files
-            # eliminate the contention.
-            log_dir = cfg.output_dir / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            shard_log = log_dir / f"shard_{gpu_idx}.log"
-            shard_log_handle = shard_log.open("w", buffering=1)
-            log_handles.append((gpu_idx, shard_log, shard_log_handle))
-
-            print(f"  [shard {gpu_idx}] launching on GPU "
-                  f"{env['CUDA_VISIBLE_DEVICES']} (host-absolute) → "
-                  f"{shard_log}")
-            proc = subprocess.Popen(
-                [sys.executable, "-c", script],
-                env=env,
-                stdout=shard_log_handle,
-                stderr=subprocess.STDOUT,
-            )
+            if clean_terminal:
+                log_dir = cfg.output_dir / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                shard_log = log_dir / f"shard_{gpu_idx}.log"
+                shard_log_handle = shard_log.open("w", buffering=1)
+                log_handles.append((gpu_idx, shard_log, shard_log_handle))
+                print(f"  [shard {gpu_idx}] launching on GPU "
+                      f"{env['CUDA_VISIBLE_DEVICES']} (host-absolute) → "
+                      f"{shard_log}")
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", script],
+                    env=env,
+                    stdout=shard_log_handle,
+                    stderr=subprocess.STDOUT,
+                )
+            else:
+                print(f"  [shard {gpu_idx}] launching on GPU "
+                      f"{env['CUDA_VISIBLE_DEVICES']} (host-absolute) "
+                      f"→ stdout (tqdm visible)")
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", script],
+                    env=env,
+                    stdout=sys.stdout,
+                    stderr=sys.stderr,
+                )
             procs.append(proc)
             out_paths.append(shard_out)
 
-        # v8.20.0.5: aggregated status thread. Polls each shard's
-        # _annotate_status.json every 10s and prints ONE clean line to
-        # the parent terminal showing per-shard progress + rates.
-        # Shards still write detailed per-block timing to their log
-        # files (tail -f shard_*.log to inspect).
+        # v8.20.6: aggregated status thread only runs in clean-terminal
+        # mode. In direct-stdout mode, tqdm shows live progress per shard
+        # already, so no aggregated line is needed.
         import threading as _threading
         import json as _json_status
         stop_status = _threading.Event()
+        status_thread = None
 
         def _status_loop():
             shard_state_dirs = [
@@ -1707,8 +1718,9 @@ torch.save(annotations, {str(shard_out)!r})
                 if stop_status.wait(timeout=10.0):
                     break
 
-        status_thread = _threading.Thread(target=_status_loop, daemon=True)
-        status_thread.start()
+        if clean_terminal:
+            status_thread = _threading.Thread(target=_status_loop, daemon=True)
+            status_thread.start()
 
         # Wait for all shards. If any fails, kill the rest and raise.
         first_failure = None
@@ -1719,7 +1731,8 @@ torch.save(annotations, {str(shard_out)!r})
                     first_failure = (gpu_idx, ret)
         finally:
             stop_status.set()
-            status_thread.join(timeout=12.0)
+            if status_thread is not None:
+                status_thread.join(timeout=12.0)
             for _, _, h in log_handles:
                 try:
                     h.close()
@@ -1727,16 +1740,22 @@ torch.save(annotations, {str(shard_out)!r})
                     pass
         if first_failure is not None:
             failed_gpu, failed_code = first_failure
-            failed_log = log_dir / f"shard_{failed_gpu}.log"
             for p in procs:
                 if p.poll() is None:
                     p.kill()
-            raise RuntimeError(
-                f"Annotation subprocess on shard {failed_gpu} exited "
-                f"with code {failed_code}. Last lines of "
-                f"{failed_log}:\n  See `tail -100 {failed_log}` for "
-                f"the full traceback."
-            )
+            if clean_terminal:
+                failed_log = log_dir_announce / f"shard_{failed_gpu}.log"
+                raise RuntimeError(
+                    f"Annotation subprocess on shard {failed_gpu} exited "
+                    f"with code {failed_code}. See "
+                    f"`tail -100 {failed_log}` for the full traceback."
+                )
+            else:
+                raise RuntimeError(
+                    f"Annotation subprocess on shard {failed_gpu} exited "
+                    f"with code {failed_code}. Traceback was on stdout "
+                    f"above (scroll up)."
+                )
 
         # Gather per-shard tensors and concatenate along sequence axis.
         print(f"  Gathering {n_gpus} shards into final annotations tensor...")
