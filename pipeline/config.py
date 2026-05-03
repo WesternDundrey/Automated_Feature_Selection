@@ -321,6 +321,12 @@ class Config:
     # (~1.5 minutes at current throughput) while reclaiming ~80% of
     # checkpoint I/O time.
     annotation_checkpoint_every_n_chunks: int = 5
+    # Dedup-catalog cosine threshold. Two features whose target_dirs
+    # have cosine >= threshold are treated as duplicates and merged
+    # into one canonical leaf. 0.95 is conservative (catches the
+    # digit-family dups produced by chunked Sonnet generation, leaves
+    # legitimately-correlated-but-distinct features alone).
+    dedup_cos_threshold: float = 0.95
 
     # Positions to mask out at analysis time (starting from position 0).
     #

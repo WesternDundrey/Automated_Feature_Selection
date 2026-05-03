@@ -157,7 +157,8 @@ def main():
                  "audit-feature", "rewrite-catalog",
                  "extend-corpus", "probe-causal", "polysemy-report",
                  "shortlist", "delphi-run", "opus-catalog",
-                 "pilot", "irr", "oracle-unsup", "unsup-f1", "compare"],
+                 "pilot", "irr", "oracle-unsup", "unsup-f1", "compare",
+                 "dedup-catalog"],
         help="Run only this step",
     )
     parser.add_argument(
@@ -812,6 +813,16 @@ def main():
         from .compare import run as run_compare
         run_compare(cfg)
         print(f"Compare completed in {time.time() - t0:.1f}s")
+
+    if args.step == "dedup-catalog":
+        print("\n" + "=" * 70)
+        print(f"STEP: DEDUP-CATALOG  (cos ≥ {cfg.dedup_cos_threshold} → "
+              f"merge to canonical)")
+        print("=" * 70)
+        t0 = time.time()
+        from .dedup_catalog import run as run_dedup
+        run_dedup(cfg)
+        print(f"Dedup catalog completed in {time.time() - t0:.1f}s")
 
     # Step 2: Annotation
     if args.step is None or args.step == "annotate":
