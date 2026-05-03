@@ -1037,15 +1037,27 @@ def _annotate_local_vllm_pertoken(
             chunk_parse += block_parse
             chunk_n_prompts += len(prompts)
 
-            # Per-block timing line: lets you see if block 0 (cold) is
-            # slower than blocks 1+ (warm). If all blocks have constant
-            # generate time, cross-call prefix cache isn't helping.
+            # v8.20.7: per-block ETA so the user doesn't have to wait for
+            # the first chunk's 32 blocks to finish (~30 min) to see a
+            # run-total estimate. ETA uses cumulative completed-so-far /
+            # cumulative elapsed; first few blocks will be cold-biased
+            # (overestimate ETA) but stabilizes within ~5 blocks.
+            block_completed = completed + chunk_n_prompts
+            elapsed_total = time.time() - t_start
+            rate_overall = (
+                block_completed / elapsed_total if elapsed_total > 0 else 0
+            )
+            remaining = max(0, total_decisions - block_completed)
+            eta_total_sec = remaining / rate_overall if rate_overall > 0 else 0
+
             print(f"{shard_prefix}chunk{chunk_idx:>3} block{block_count:>2}/"
                   f"{(n_prefixes + prefix_block_size - 1) // prefix_block_size:<2}  "
                   f"build={block_build:5.1f}s  gen={block_gen:6.1f}s  "
                   f"parse={block_parse:5.1f}s  "
                   f"n_prompts={len(prompts):>6,}  "
-                  f"rate={len(prompts)/max(1e-6, block_gen):.0f}/s")
+                  f"rate={len(prompts)/max(1e-6, block_gen):.0f}/s  "
+                  f"ETA {eta_total_sec/3600:.1f}h "
+                  f"({100*block_completed/max(1, total_decisions):.1f}%)")
 
         completed += chunk_n_prompts
         elapsed = time.time() - t_start
