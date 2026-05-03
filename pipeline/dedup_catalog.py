@@ -105,7 +105,7 @@ def run(cfg: Config = None) -> dict:
     print("=" * 70)
 
     catalog_path = cfg.catalog_path
-    target_dirs_path = cfg.target_directions_path
+    target_dirs_path = cfg.target_dirs_path
     if not catalog_path.exists():
         raise FileNotFoundError(f"Need {catalog_path}")
     if not target_dirs_path.exists():
