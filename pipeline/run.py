@@ -158,7 +158,7 @@ def main():
                  "extend-corpus", "probe-causal", "polysemy-report",
                  "shortlist", "delphi-run", "opus-catalog",
                  "pilot", "irr", "oracle-unsup", "unsup-f1", "compare",
-                 "dedup-catalog", "curate-fve"],
+                 "dedup-catalog", "curate-fve", "propose-haiku"],
         help="Run only this step",
     )
     parser.add_argument(
@@ -191,6 +191,30 @@ def main():
              "feature for which SOME single direction can hit the "
              "threshold, even if the configured training method "
              "doesn't reach it).",
+    )
+    parser.add_argument(
+        "--propose-n-latents", type=int, default=None,
+        help="For --step propose-haiku: cap on number of latents to "
+             "send to Haiku. 0 (default) = all latents in "
+             "top_activations.json. Use a small value (e.g. 100-500) "
+             "to validate the prompt cheaply before scaling.",
+    )
+    parser.add_argument(
+        "--propose-candidates-per-latent", type=int, default=None,
+        help="For --step propose-haiku: max candidates Haiku may "
+             "propose per latent (default 3). Higher = more recall, "
+             "more downstream filter work.",
+    )
+    parser.add_argument(
+        "--haiku-proposer-model", default=None,
+        help="For --step propose-haiku: OpenRouter model slug for the "
+             "proposer. Default `anthropic/claude-haiku-4.5`.",
+    )
+    parser.add_argument(
+        "--propose-concurrency", type=int, default=None,
+        help="For --step propose-haiku: max concurrent OpenRouter "
+             "requests (default 16). Raise for faster fan-out if your "
+             "key isn't rate-limited.",
     )
     parser.add_argument(
         "--catalog-gate-mode", default=None,
@@ -622,6 +646,14 @@ def main():
         overrides["fve_curate_threshold"] = args.fve_curate_threshold
     if args.fve_curate_source is not None:
         overrides["fve_curate_source"] = args.fve_curate_source
+    if args.propose_n_latents is not None:
+        overrides["propose_n_latents"] = args.propose_n_latents
+    if args.propose_candidates_per_latent is not None:
+        overrides["propose_candidates_per_latent"] = args.propose_candidates_per_latent
+    if args.haiku_proposer_model is not None:
+        overrides["haiku_proposer_model"] = args.haiku_proposer_model
+    if args.propose_concurrency is not None:
+        overrides["propose_concurrency"] = args.propose_concurrency
     if args.catalog_gate_mode is not None:
         overrides["catalog_gate_mode"] = args.catalog_gate_mode
     if args.catalog_gate_strict:
@@ -903,6 +935,15 @@ def main():
         from .curate_fve import run as run_curate_fve
         run_curate_fve(cfg)
         print(f"Curate-FVE completed in {time.time() - t0:.1f}s")
+
+    if args.step == "propose-haiku":
+        print("\n" + "=" * 70)
+        print(f"STEP: PROPOSE-HAIKU  (v8.21 cascade stage 1)")
+        print("=" * 70)
+        t0 = time.time()
+        from .propose_haiku import run as run_propose
+        run_propose(cfg)
+        print(f"Propose-Haiku completed in {time.time() - t0:.1f}s")
 
     # Step 2: Annotation
     if args.step is None or args.step == "annotate":

@@ -295,6 +295,18 @@ class Config:
     fve_curate_threshold: float = 0.5
     fve_curate_source: str = ""  # empty → use cfg.target_dir_method
 
+    # ── v8.21 cascade catalog generation (stage 1: Haiku proposer) ───
+    # Cascade architecture: Haiku proposes high-recall candidates over
+    # 1K-20K latents → cheap filters drop junk → Opus selects + rewrites
+    # canonical catalog. This avoids the v8.19 chunked-Opus dups problem
+    # by separating proposal (cheap, broad) from selection (expensive,
+    # strict). Stage 1 (this proposer) is shipped; filter and judge
+    # stages deferred to v8.21+.
+    haiku_proposer_model: str = "anthropic/claude-haiku-4.5"
+    propose_n_latents: int = 0          # 0 = all latents in top_activations
+    propose_candidates_per_latent: int = 3
+    propose_concurrency: int = 16       # async semaphore for OpenRouter
+
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = True    # v8.19.4: DEFAULT FLIPPED to True.
                                         # Local Qwen3-4B-Base via vLLM is

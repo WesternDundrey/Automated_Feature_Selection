@@ -4,6 +4,88 @@
 
 ---
 
+## [v8.20.1] — propose-haiku: cascade stage 1 (high-recall candidate proposer)
+
+User architectural improvement: cascade catalog generation. Haiku as
+high-recall proposer → cheap deterministic filters → Opus as strict
+judge → mini-gate validation → full annotation. Replaces the v8.19
+"Opus-does-everything chunked" path that produced ~21% catalog dups
+(postmortem §1).
+
+This commit ships ONLY stage 1 (Haiku proposer) so the prompt can be
+validated at low cost (~$1-3 on 100-500 latents) before building out
+stages 2-4. The downstream filter and judge steps are deferred.
+
+### What's NOT in this commit
+
+* `--step filter-candidates` (regex hard-fail + embedding dedup +
+  min-support feasibility) — deferred to next iteration
+* `--step opus-judge` (canonical selection + family completion +
+  rewrite to crisp annotation prompts) — deferred
+* Mini-gate plumbing — already exists as `--step pilot`; just needs
+  candidate-list integration
+
+### What IS in this commit
+
+`pipeline/propose_haiku.py`: async fan-out Haiku proposer. For each
+latent in `top_activations.json`:
+
+* Haiku sees top-K activating contexts (same render as `opus-catalog`).
+* Haiku proposes 1-3 candidate descriptions with the boundary-discipline
+  schema (positive_examples, negative_examples, exclusions).
+* Token-level + prefix-decidable per `inventory.explain_features`'s
+  established prompt rules (ACCEPT/REJECT lists copied verbatim).
+* Haiku may output `{"skip": true, "reason": "..."}` for latents whose
+  contexts don't support a token-level description.
+* Async via `pipeline.llm.get_async_client` with semaphore-bounded
+  concurrency (default 16). Per-latent failure logged + skipped, no
+  abort.
+
+Output: `{output_dir}/feature_candidates_raw.json` — JUNK-RICH proposal
+pool. Do NOT feed directly into annotation; downstream cascade stages
+filter + select before annotation. Output is stable JSON shape so
+future filter/judge steps can be wired without re-running the proposer.
+
+### Why this is the right architecture (per user analysis)
+
+* **High-recall proposer + strict judge** is the established pattern.
+  Current opus-catalog violates it: Opus does both proposal AND final
+  selection in chunked calls with no cross-chunk coordination, hence
+  the digits.0/digits.zero/digits.d0/digit.d0 dups.
+* **Cost works at 10× latent coverage.** Haiku at 10K latents ≈ $30-50;
+  Opus on filtered ~1500 candidates ≈ $15. Total ~$45-65 vs current
+  ~$15, but 10× more coverage AND eliminates downstream annotation-of-
+  dups waste (~5-7 hr saved per postmortem).
+* **Hard filters between Haiku and Opus are deterministic and free.**
+  catalog_quality.py already has the hard-fail regex set; slot it
+  between propose and judge.
+
+### Caveat (per user)
+
+Haiku must be the proposer ONLY. Letting Haiku define final descriptions
+produces annotation poison — vague predicates like "various punctuation
+contexts" or "associated with formal writing" that have no clear
+positive/negative boundary. The boundary-discipline schema in the
+prompt + the planned downstream filter + Opus judge are what keep
+quality high.
+
+### CLI
+
+  --step propose-haiku
+  --propose-n-latents N            (default 0 = all in top_activations)
+  --propose-candidates-per-latent K  (default 3)
+  --haiku-proposer-model MODEL     (default anthropic/claude-haiku-4.5)
+  --propose-concurrency N          (default 16)
+
+### Files touched
+
+* **NEW** `pipeline/propose_haiku.py` — async Haiku proposer
+* `pipeline/config.py` — `haiku_proposer_model`, `propose_n_latents`,
+  `propose_candidates_per_latent`, `propose_concurrency`
+* `pipeline/run.py` — `--step propose-haiku` + 4 CLI flags
+
+---
+
 ## [v8.20.0.5] — clean terminal: per-shard logs + aggregated status thread
 
 User caught a real cause for "2 GPUs fine, 4 GPUs 20× worse": with
