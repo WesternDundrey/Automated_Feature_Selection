@@ -270,6 +270,58 @@ async def _run_proposals(
     }
 
 
+def _load_or_collect_top_activations(cfg: Config) -> tuple[dict, object]:
+    """Load top_activations.json if it exists; otherwise compute it from
+    the shortlist (which is what `--step shortlist` produced) using the
+    same `inventory.collect_top_activations` path that `opus-catalog`
+    uses internally. Persist the result so re-runs / other cascade
+    stages can reuse it.
+
+    Returns (top_activations_dict, tokenizer).
+    """
+    if cfg.top_activations_path.exists():
+        print(f"  Loading cached top activations: {cfg.top_activations_path}")
+        top_acts = json.loads(cfg.top_activations_path.read_text())
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+        return top_acts, tokenizer
+
+    # Need to compute. Requires a shortlist first.
+    shortlist_path = cfg.output_dir / "latent_shortlist.json"
+    if not shortlist_path.exists():
+        raise FileNotFoundError(
+            f"Need either {cfg.top_activations_path} (cached top "
+            f"activations) or {shortlist_path} (latent shortlist). "
+            f"Run `--step shortlist` first."
+        )
+
+    print(f"  No cached top_activations.json — computing from "
+          f"{shortlist_path}...")
+    from .inventory import (
+        load_sae, load_target_model, collect_top_activations,
+    )
+    from .shortlist_latents import load_shortlist
+
+    shortlist = load_shortlist(cfg)
+    print(f"  Loaded shortlist: {len(shortlist)} latents")
+
+    sae, _ = load_sae(cfg)
+    model = load_target_model(cfg)
+    tokenizer = model.tokenizer
+    print(f"  Collecting top-{cfg.top_k_examples} contexts for "
+          f"{len(shortlist)} latents over "
+          f"{cfg.n_tokens_for_activation_collection:,} tokens...")
+    top_activations = collect_top_activations(
+        model, sae, tokenizer, shortlist, cfg,
+    )
+
+    # Persist for re-runs and downstream cascade stages.
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    cfg.top_activations_path.write_text(json.dumps(top_activations, indent=2))
+    print(f"  Saved: {cfg.top_activations_path}")
+    return top_activations, tokenizer
+
+
 def run(cfg: Config | None = None) -> dict:
     if cfg is None:
         cfg = Config()
@@ -278,17 +330,7 @@ def run(cfg: Config | None = None) -> dict:
     print("PROPOSE-HAIKU  (v8.21 cascade stage 1: high-recall proposals)")
     print("=" * 70)
 
-    if not cfg.top_activations_path.exists():
-        raise FileNotFoundError(
-            f"Need {cfg.top_activations_path}. Run --step shortlist or "
-            f"--step inventory first to collect top activations."
-        )
-    top_activations = json.loads(cfg.top_activations_path.read_text())
-
-    # Tokenizer is needed for context rendering (decode token IDs to
-    # readable strings). Use the target model's tokenizer.
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+    top_activations, tokenizer = _load_or_collect_top_activations(cfg)
 
     out = asyncio.run(_run_proposals(top_activations, tokenizer, cfg))
 
