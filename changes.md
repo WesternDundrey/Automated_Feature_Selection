@@ -4,6 +4,98 @@
 
 ---
 
+## [v8.20.0.2] — annotate.py: prefix-block batching (the structural throughput fix)
+
+Commit B of the throughput-fix staging. Restructures
+`_annotate_local_vllm_pertoken`'s per-chunk loop from
+"all-features-in-flight" to prefix-block batching, addressing the
+million-prompt construction stalls that produced 22 dec/s in v8.19.
+
+### Old shape (what blew up)
+
+```
+for seq_chunk:                       # one generate() call per chunk
+    for seq, pos, feature:           # build all prompts in one list
+        prompts.append(...)
+    llm.generate(prompts)            # 600K-1M prompts/call → Python GC + scheduler stalls
+```
+
+### New shape
+
+```
+for seq_chunk:                       # checkpoint granularity only
+    chunk_prefixes = [(seq, pos, prefix_token_ids) ...]   # built once per chunk
+    for prefix_block in chunk_prefixes:                   # multiple generate() per chunk
+        prompts = prefix_block × all_features            # ~32-65K prompts/call
+        llm.generate(prompts)
+```
+
+### Why prefix-blocking and not feature-blocking
+
+User correctly pointed out feature-blocking (split features across
+multiple generate() calls per chunk) requires vLLM's prefix cache to
+survive across calls within a chunk — works in principle but depends
+on KV-block eviction policy under pressure. Prefix-blocking puts all
+features for a given (seq, pos) in the SAME generate() call where
+vLLM's within-call prefix sharing is deterministic and doesn't depend
+on cross-call cache survival.
+
+### Adaptive sizing (postmortem §1's "tune for target prompt count")
+
+```
+prefix_block_size = max(1, target_prompts // n_features)  # default 65K target
+prefix_block_size = min(prefix_block_size, 128)           # KV cache cap
+```
+
+At 300 features → 128-prefix block → 38K prompts/call (in band).
+At 1000 features → 64-prefix block → 64K prompts/call (in band).
+At 2000 features → 32-prefix block → 64K prompts/call (still in band).
+
+`seq_chunk` no longer controls per-call prompt count — only
+checkpoint granularity. The v8.19 thrash (chunk 2→8→2→4→32) was
+trying to indirectly tune what's now a separate, properly-named knob.
+
+### Memory check (Qwen3-4B-Base on 5090)
+
+KV per token ≈ 2 (K,V) × 36 layers × 8 KV heads (GQA) × 128 head_dim
+× 2 bytes (bf16) = 144 KB. ~70-token prefix → ~10 MB KV per prefix.
+At prefix_block=128: 128 × 10 MB = 1.3 GB. Comfortable on 5090's 32 GB
+after model (~8 GB) and activations.
+
+### Per-block timing (cold/warm visible)
+
+Block 0 of each chunk is the cold-start. If blocks 1+ have lower
+generate time than block 0 → KV cache warmth IS helping across calls
+within the chunk. If all blocks have constant generate time → cache
+isn't reused; the within-call prefix sharing is doing all the work
+(which is fine, but tells you cross-call optimization isn't a lever
+to pull). Per-block log line makes this directly visible.
+
+### Removed coupling
+
+The user's old `local_annotation_seq_chunk` thrash (postmortem §2)
+came from `seq_chunk × T × F` setting per-call prompt count. That
+coupling is gone. seq_chunk=32 + prefix_block=128 produces consistent
+~64K-prompt generate() calls regardless of feature count — the
+correct shape for vLLM's continuous batcher.
+
+### CLI
+
+  --annotation-prefix-block INT       (0 = adaptive, default)
+  --annotation-target-prompts INT     (default 65536)
+
+### Files touched
+
+* `pipeline/annotate.py` — prefix-block restructured chunk loop in
+  `_annotate_local_vllm_pertoken`
+* `pipeline/config.py` — `local_annotation_prefix_block`,
+  `local_annotation_target_prompts`
+* `pipeline/run.py` — `--annotation-prefix-block`,
+  `--annotation-target-prompts`; updated `--annotation-seq-chunk`
+  help text to clarify it now controls checkpoint granularity only
+
+---
+
 ## [v8.20.0.1] — annotate.py: build/generate/parse timing + CVD nested mapping fix
 
 Commit A of the throughput-fix staging plan (postmortem §6 forward fixes).

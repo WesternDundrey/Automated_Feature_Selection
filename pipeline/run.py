@@ -280,10 +280,30 @@ def main():
     )
     parser.add_argument(
         "--annotation-seq-chunk", type=int, default=None,
-        help="Sequences per vLLM generate() chunk in local per-token "
-             "annotation. Larger values reduce scheduler/Python overhead and "
-             "can improve GPU utilization; too large can increase prompt "
-             "construction stalls or KV pressure. Default from Config.",
+        help="Sequences per chunk in local per-token annotation. "
+             "Controls checkpoint granularity (post v8.20.0.2 each chunk "
+             "may issue multiple generate() calls via prefix-block "
+             "batching). Default from Config.",
+    )
+    parser.add_argument(
+        "--annotation-prefix-block", type=int, default=None,
+        help="Prefixes (sampled (seq, pos) pairs) per vLLM generate() "
+             "call in local annotation. 0 (default) = adaptive: "
+             "target_prompts // n_features, capped at 128. Each "
+             "generate() call submits prefix_block × n_features prompts, "
+             "keeping all features for a single prefix in one call so "
+             "vLLM's within-call prefix cache deterministically amortizes "
+             "K/V across features. Override only if you know your "
+             "workload (e.g. 16 for memory-tight; 64-128 for big GPUs).",
+    )
+    parser.add_argument(
+        "--annotation-target-prompts", type=int, default=None,
+        help="Target prompts per vLLM generate() call when "
+             "--annotation-prefix-block is 0 (adaptive). Default 65536 "
+             "(vLLM continuous-batching sweet spot for our short-suffix / "
+             "single-token-output workload). Lower this if build-phase "
+             "timing dominates per-chunk wall; raise if generate-phase "
+             "is GPU-light.",
     )
     parser.add_argument(
         "--features-per-call", type=int, default=None,
@@ -536,6 +556,10 @@ def main():
         overrides["n_annotation_gpus"] = args.annotation_gpus
     if args.annotation_seq_chunk is not None:
         overrides["local_annotation_seq_chunk"] = args.annotation_seq_chunk
+    if args.annotation_prefix_block is not None:
+        overrides["local_annotation_prefix_block"] = args.annotation_prefix_block
+    if args.annotation_target_prompts is not None:
+        overrides["local_annotation_target_prompts"] = args.annotation_target_prompts
     if args.features_per_call is not None:
         overrides["features_per_annotation_call"] = args.features_per_call
     if args.annotation_checkpoint_every is not None:

@@ -891,97 +891,144 @@ def _annotate_local_vllm_pertoken(
         1, int(getattr(cfg, "annotation_checkpoint_every_n_chunks", 5))
     )
 
+    # v8.20.0.2 prefix-block batching: structural fix for postmortem §1's
+    # million-prompt stalls. Each generate() call gets all features for a
+    # single block of prefixes (seq, pos pairs). This guarantees prefix
+    # cache reuse within the call (vLLM's deterministic within-call prefix
+    # sharing) and bounds Python prompt-construction cost. seq_chunk now
+    # controls checkpoint granularity only; per-generate prompt count is
+    # controlled by prefix_block_size.
+    cfg_prefix_block = int(getattr(cfg, "local_annotation_prefix_block", 0) or 0)
+    target_prompts = int(
+        getattr(cfg, "local_annotation_target_prompts", 65536) or 65536
+    )
+
     for seq_start in range(resume_from, N, seq_chunk):
         seq_end = min(seq_start + seq_chunk, N)
         chunk_idx += 1
 
-        prompts = []
-        positions = []
-
-        # v8.20.0 timing: split the per-chunk wall into build / generate /
-        # parse phases. Diagnostic discipline from postmortem §4 — without
-        # this we can't tell whether bottleneck is Python prompt construction,
-        # vLLM scheduling, or output parsing, and tuning is speculation.
-        t_chunk_start = time.time()
-
+        # Pass 1: enumerate sampled-position prefixes for this chunk.
+        # Each entry: (seq_j, tok_k, pos_prefix_tuple). Built ONCE per chunk
+        # and reused across prefix-blocks; the per-prefix construction cost
+        # (system + text + token name) is paid once.
+        chunk_prefixes: list[tuple[int, int, tuple]] = []
         for seq_j in range(seq_start, seq_end):
             prefix = sys_tuple + text_open_tuple
             for tok_k in range(T):
                 prefix = prefix + tok_id_tuples[seq_j][tok_k]
-                # v8.19.6 lever-7: skip unsampled positions. Prefix
-                # still accumulates so later (sampled) positions get
-                # correct context.
+                # v8.19.6 lever-7: skip unsampled positions. Prefix still
+                # accumulates so later (sampled) positions get correct context.
                 if position_mask is not None and not bool(position_mask[seq_j, tok_k]):
                     continue
                 tok_str = all_token_strs[seq_j][tok_k]  # preserve whitespace
-                # Token name in prefix: cached across all features at this position
                 pos_prefix = prefix + tok_name_cache[tok_str]
+                chunk_prefixes.append((seq_j, tok_k, pos_prefix))
+
+        n_prefixes = len(chunk_prefixes)
+        if n_prefixes == 0:
+            # Fully unsampled chunk (rare; possible at low subsample rates).
+            continue
+
+        # Adaptive prefix_block_size: pick it so each generate() call lands
+        # near `target_prompts` (default 64K). Explicit
+        # `local_annotation_prefix_block` overrides. Capped at 128 prefixes
+        # (~10 MB KV per prefix on Qwen3-4B → 1.3 GB at 128, comfortable),
+        # and clamped to chunk size so we don't iterate past the end.
+        if cfg_prefix_block > 0:
+            prefix_block_size = cfg_prefix_block
+        else:
+            prefix_block_size = max(1, target_prompts // max(1, n_features))
+            prefix_block_size = min(prefix_block_size, 128)
+        prefix_block_size = min(prefix_block_size, n_prefixes)
+
+        # Phase timing: build / generate / parse summed across all blocks
+        # in this chunk. Block 0 is the cold-start; blocks 1+ should benefit
+        # from prefix-cache warmth IF KV survives across generate() calls.
+        # The per-block timing line lets you see this directly.
+        chunk_build = chunk_gen = chunk_parse = 0.0
+        chunk_n_prompts = 0
+        block_count = 0
+        shard_id = os.environ.get("SUPSAE_SHARD_ID", "")
+        shard_prefix = f"  [shard {shard_id}] " if shard_id else "  "
+
+        for pf_start in range(0, n_prefixes, prefix_block_size):
+            pf_end = min(pf_start + prefix_block_size, n_prefixes)
+            block_count += 1
+
+            t0 = time.time()
+            prompts = []
+            positions = []
+            for pi in range(pf_start, pf_end):
+                seq_j, tok_k, pos_prefix = chunk_prefixes[pi]
                 for fi in range(n_features):
                     prompts.append({
                         "prompt_token_ids": list(pos_prefix + feat_suffix_list[fi])
                     })
                     positions.append((seq_j, tok_k, fi))
+            t_build = time.time()
 
-        t_build = time.time()
+            outputs = llm.generate(prompts, params)
+            t_gen = time.time()
 
-        outputs = llm.generate(prompts, params)
+            # First-block-of-first-chunk debug + cache check.
+            if seq_start == 0 and pf_start == 0:
+                print("\n  First 10 raw outputs:")
+                for di in range(min(10, len(outputs))):
+                    sj, tk, fi_d = positions[di]
+                    raw = outputs[di].outputs[0].text
+                    tok = all_token_strs[sj][tk].strip()
+                    print(f"    [{di}] tok='{tok}' feat={fi_d} -> '{raw}'")
+                t_cold = t_gen - t_build
+                t0_warm = time.time()
+                llm.generate(prompts[:min(512, len(prompts))], params)
+                t_warm = time.time() - t0_warm
+                speedup = t_cold / max(t_warm, 1e-6)
+                n_check = min(512, len(prompts))
+                print(f"\n  PREFIX CACHE CHECK ({n_check} prompts):")
+                print(f"    Cold: {t_cold:.2f}s  Warm: {t_warm:.2f}s  "
+                      f"Speedup: {speedup:.1f}x")
+                if speedup < 1.5:
+                    print("    WARNING: prefix caching may not be working!")
+                else:
+                    print("    OK — caching is active.")
+                print()
 
-        t_generate = time.time()
-        batch_time = t_generate
+            for idx, output in enumerate(outputs):
+                seq_j, tok_k, fi = positions[idx]
+                tid = output.outputs[0].token_ids[0]
+                annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1_id else 0.0
+            t_parse = time.time()
 
-        # Debug + cache verification on first chunk
-        if seq_start == 0:
-            print("\n  First 10 raw outputs:")
-            for di in range(min(10, len(outputs))):
-                sj, tk, fi_d = positions[di]
-                raw = outputs[di].outputs[0].text
-                tok = all_token_strs[sj][tk].strip()
-                print(f"    [{di}] tok='{tok}' feat={fi_d} -> '{raw}'")
+            block_build = t_build - t0
+            block_gen = t_gen - t_build
+            block_parse = t_parse - t_gen
+            chunk_build += block_build
+            chunk_gen += block_gen
+            chunk_parse += block_parse
+            chunk_n_prompts += len(prompts)
 
-            # Prefix cache check: re-run same batch, should be 2-10x faster
-            t_cold = batch_time - t_start
-            t0 = time.time()
-            llm.generate(prompts[:min(512, len(prompts))], params)
-            t_warm = time.time() - t0
-            speedup = t_cold / max(t_warm, 1e-6)
-            n_check = min(512, len(prompts))
-            print(f"\n  PREFIX CACHE CHECK ({n_check} prompts):")
-            print(f"    Cold: {t_cold:.2f}s  Warm: {t_warm:.2f}s  Speedup: {speedup:.1f}x")
-            if speedup < 1.5:
-                print("    WARNING: prefix caching may not be working!")
-            else:
-                print("    OK — caching is active.")
-            print()
+            # Per-block timing line: lets you see if block 0 (cold) is
+            # slower than blocks 1+ (warm). If all blocks have constant
+            # generate time, cross-call prefix cache isn't helping.
+            print(f"{shard_prefix}chunk{chunk_idx:>3} block{block_count:>2}/"
+                  f"{(n_prefixes + prefix_block_size - 1) // prefix_block_size:<2}  "
+                  f"build={block_build:5.1f}s  gen={block_gen:6.1f}s  "
+                  f"parse={block_parse:5.1f}s  "
+                  f"n_prompts={len(prompts):>6,}  "
+                  f"rate={len(prompts)/max(1e-6, block_gen):.0f}/s")
 
-        for idx, output in enumerate(outputs):
-            seq_j, tok_k, fi = positions[idx]
-            tid = output.outputs[0].token_ids[0]
-            annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1_id else 0.0
-
-        t_parse = time.time()
-
-        completed += len(prompts)
+        completed += chunk_n_prompts
         elapsed = time.time() - t_start
         rate = completed / elapsed if elapsed > 0 else 0
         remaining = max(0, total_decisions - completed)
         eta_sec = remaining / rate if rate > 0 else 0
-        # Shard prefix when running multi-GPU so interleaved shard
-        # output is clearly attributed.
-        shard_id = os.environ.get("SUPSAE_SHARD_ID", "")
-        prefix = f"  [shard {shard_id}] " if shard_id else "  "
-        # v8.20.0 timing print: build / generate / parse split per chunk.
-        # Reading: build dominates → reduce per-call prompt count (feature/
-        # prefix blocking, lower seq_chunk). generate dominates → tune vLLM
-        # knobs. parse dominates → output handling (rare).
-        build_dt = t_build - t_chunk_start
-        gen_dt = t_generate - t_build
-        parse_dt = t_parse - t_generate
-        print(f"{prefix}chunk{chunk_idx:>3}  "
-              f"build={build_dt:5.1f}s  gen={gen_dt:6.1f}s  "
-              f"parse={parse_dt:5.1f}s  "
-              f"n_prompts={len(prompts):>7,}  "
-              f"rate={len(prompts)/max(1e-6, gen_dt):.0f}/s")
-        print(f"{prefix}{completed:,}/{total_decisions:,} decisions  "
+        print(f"{shard_prefix}chunk{chunk_idx:>3} TOTAL  "
+              f"prefixes={n_prefixes}  blocks={block_count}  "
+              f"prefix_block={prefix_block_size}  "
+              f"build={chunk_build:5.1f}s  gen={chunk_gen:6.1f}s  "
+              f"parse={chunk_parse:5.1f}s  "
+              f"rate={chunk_n_prompts/max(1e-6, chunk_gen):.0f}/s")
+        print(f"{shard_prefix}{completed:,}/{total_decisions:,} decisions  "
               f"rate={rate:.0f}/s  ETA {eta_sec/3600:.1f}h")
 
         # Save checkpoint every N chunks (crash recovery). Every-chunk

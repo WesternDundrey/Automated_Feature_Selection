@@ -337,6 +337,21 @@ class Config:
     # to override; 16 might suffice on memory-tight GPUs, 64 if
     # construction overhead is fine.
     local_annotation_seq_chunk: int = 32
+    # v8.20.0.2 prefix-block batching. Each generate() call submits
+    # `prefix_block_size` prefixes × `n_features` prompts, keeping all
+    # features for a given (seq, pos) prefix in the SAME generate() call.
+    # This guarantees vLLM's deterministic within-call prefix sharing
+    # and avoids the million-prompt construction stalls of the prior
+    # all-features-in-flight design.
+    #
+    # `local_annotation_prefix_block` (0 = adaptive): if positive, used
+    #   directly. If 0, computed from `local_annotation_target_prompts`
+    #   as `target / n_features`, capped at 128 prefixes.
+    # `local_annotation_target_prompts`: target per-call prompt count,
+    #   default 65536 (vLLM continuous-batching sweet spot for short
+    #   single-token-output workloads).
+    local_annotation_prefix_block: int = 0
+    local_annotation_target_prompts: int = 65536
     # Save annotations_local_partial.pt + progress.txt every N chunks
     # instead of every chunk. At chunk=32, the per-shard annotations
     # tensor is ~610MB; saving 156 times/run is ~95GB of disk I/O,
