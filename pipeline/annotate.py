@@ -1042,6 +1042,37 @@ def _annotate_local_vllm_pertoken(
         print(f"{shard_prefix}{completed:,}/{total_decisions:,} decisions  "
               f"rate={rate:.0f}/s  ETA {eta_sec/3600:.1f}h")
 
+        # v8.20.0.5: write per-chunk status JSON so the parent can
+        # display a clean aggregated terminal view without parsing
+        # interleaved shard stdout. Atomic write (tmp + rename) so a
+        # mid-write read from the parent never sees a partial file.
+        try:
+            import json as _json
+            status = {
+                "chunk_idx": chunk_idx,
+                "seq_end": seq_end,
+                "N": N,
+                "completed": completed,
+                "total": total_decisions,
+                "rate": float(rate),
+                "rate_gen": float(chunk_n_prompts / max(1e-6, chunk_gen)),
+                "eta_sec": float(eta_sec),
+                "build_s": float(chunk_build),
+                "gen_s": float(chunk_gen),
+                "parse_s": float(chunk_parse),
+                "prefix_block": int(prefix_block_size),
+                "n_prompts": int(chunk_n_prompts),
+                "elapsed_s": float(elapsed),
+                "shard_id": os.environ.get("SUPSAE_SHARD_ID", ""),
+                "ts": time.time(),
+            }
+            status_path = cfg.output_dir / "_annotate_status.json"
+            status_tmp = cfg.output_dir / "_annotate_status.json.tmp"
+            status_tmp.write_text(_json.dumps(status))
+            status_tmp.replace(status_path)
+        except Exception:
+            pass  # never fail annotation over a status write
+
         # Save checkpoint every N chunks (crash recovery). Every-chunk
         # saves are wasteful at scale: with 5K seqs/shard at chunk=32,
         # that's 156 saves/shard each writing a ~610MB tensor — pure
@@ -1471,6 +1502,16 @@ def _annotate_local_parallel(
 
         procs = []
         out_paths = []
+        log_handles: list[tuple[int, Path, object]] = []
+        # v8.20.0.5: announce the clean-terminal plan before any shard
+        # spawn so the user knows where shard logs land and how to tail
+        # them if they want detail.
+        log_dir_announce = cfg.output_dir / "logs"
+        log_dir_announce.mkdir(parents=True, exist_ok=True)
+        print(f"\n  Multi-shard annotation: clean-terminal mode")
+        print(f"  Per-shard logs:   {log_dir_announce}/shard_*.log")
+        print(f"  Aggregated status updates every 10s on this terminal.")
+        print(f"  Detail per shard: tail -f {log_dir_announce}/shard_*.log\n")
         for gpu_idx in range(n_gpus):
             shard_tokens = tmp / f"tokens_shard_{gpu_idx}.pt"
             shard_state_dir = tmp / f"state_{gpu_idx}"
@@ -1555,36 +1596,127 @@ torch.save(annotations, {str(shard_out)!r})
             # throughput cost vs out-of-process; far better than
             # hanging. setdefault lets the user opt back in.
             env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+            # v8.20.0.5: quiet vLLM info logs in shards. Each shard's
+            # output now goes to its own log file; this just keeps the
+            # logs from being dominated by per-step vLLM internals.
+            env.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
             # v8.19.8: do NOT set TQDM_DISABLE=1 here. vLLM 0.20.0's
             # _run_engine reads pbar.format_dict["elapsed"] to compute
             # input throughput; when tqdm is disabled, elapsed=0 and
-            # vLLM crashes with ZeroDivisionError. Keep tqdm on; user
-            # accepts visual interleaving in exchange for live progress.
+            # vLLM crashes with ZeroDivisionError. Keep tqdm on but
+            # write to log file so it doesn't flood the parent terminal.
+
+            # v8.20.0.5: redirect each shard's stdout/stderr to its own
+            # log file. With 4 shards on a vast.ai PTY, interleaved
+            # tqdm refresh + per-block prints + vLLM internals cause
+            # writes to block on terminal flushes — a real "2 GPUs
+            # fine, 4 GPUs 20× worse" symptom that doesn't show up in
+            # nvidia-smi (the GPU is correctly idle waiting for
+            # Python's blocking write to flush). Per-shard files
+            # eliminate the contention.
+            log_dir = cfg.output_dir / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            shard_log = log_dir / f"shard_{gpu_idx}.log"
+            shard_log_handle = shard_log.open("w", buffering=1)
+            log_handles.append((gpu_idx, shard_log, shard_log_handle))
 
             print(f"  [shard {gpu_idx}] launching on GPU "
-                  f"{env['CUDA_VISIBLE_DEVICES']} (host-absolute)...")
+                  f"{env['CUDA_VISIBLE_DEVICES']} (host-absolute) → "
+                  f"{shard_log}")
             proc = subprocess.Popen(
                 [sys.executable, "-c", script],
                 env=env,
-                stdout=sys.stdout,
-                stderr=sys.stderr,
+                stdout=shard_log_handle,
+                stderr=subprocess.STDOUT,
             )
             procs.append(proc)
             out_paths.append(shard_out)
 
+        # v8.20.0.5: aggregated status thread. Polls each shard's
+        # _annotate_status.json every 10s and prints ONE clean line to
+        # the parent terminal showing per-shard progress + rates.
+        # Shards still write detailed per-block timing to their log
+        # files (tail -f shard_*.log to inspect).
+        import threading as _threading
+        import json as _json_status
+        stop_status = _threading.Event()
+
+        def _status_loop():
+            shard_state_dirs = [
+                tmp / f"state_{i}" for i in range(n_gpus)
+            ]
+            t_status_start = time.time()
+            while not stop_status.is_set():
+                try:
+                    lines = []
+                    total_completed = 0
+                    total_total = 0
+                    for i, sd in enumerate(shard_state_dirs):
+                        sp = sd / "_annotate_status.json"
+                        if not sp.exists():
+                            lines.append(f"s{i}:starting")
+                            continue
+                        try:
+                            st = _json_status.loads(sp.read_text())
+                        except Exception:
+                            lines.append(f"s{i}:?")
+                            continue
+                        chunk_idx = st.get("chunk_idx", 0)
+                        completed = int(st.get("completed", 0))
+                        total = int(st.get("total", 0))
+                        rate_gen = st.get("rate_gen", 0.0)
+                        eta = st.get("eta_sec", 0.0)
+                        total_completed += completed
+                        total_total += total
+                        lines.append(
+                            f"s{i}:c{chunk_idx} "
+                            f"{100*completed/max(1,total):.0f}% "
+                            f"{rate_gen:.0f}/s "
+                            f"eta{eta/3600:.1f}h"
+                        )
+                    if total_total > 0:
+                        pct = 100 * total_completed / total_total
+                        elapsed = time.time() - t_status_start
+                        print(f"  [agg] {pct:.1f}%  "
+                              f"({total_completed:,}/{total_total:,})  "
+                              f"elapsed={elapsed/3600:.1f}h  | "
+                              + "  ".join(lines), flush=True)
+                except Exception as _e:
+                    # Status loop must never bring down the parent.
+                    print(f"  [agg] status loop error: {_e}", flush=True)
+                # Sleep with stop-event check so cleanup is prompt.
+                if stop_status.wait(timeout=10.0):
+                    break
+
+        status_thread = _threading.Thread(target=_status_loop, daemon=True)
+        status_thread.start()
+
         # Wait for all shards. If any fails, kill the rest and raise.
         first_failure = None
-        for gpu_idx, proc in enumerate(procs):
-            ret = proc.wait()
-            if ret != 0 and first_failure is None:
-                first_failure = (gpu_idx, ret)
+        try:
+            for gpu_idx, proc in enumerate(procs):
+                ret = proc.wait()
+                if ret != 0 and first_failure is None:
+                    first_failure = (gpu_idx, ret)
+        finally:
+            stop_status.set()
+            status_thread.join(timeout=12.0)
+            for _, _, h in log_handles:
+                try:
+                    h.close()
+                except Exception:
+                    pass
         if first_failure is not None:
+            failed_gpu, failed_code = first_failure
+            failed_log = log_dir / f"shard_{failed_gpu}.log"
             for p in procs:
                 if p.poll() is None:
                     p.kill()
             raise RuntimeError(
-                f"Annotation subprocess on GPU {first_failure[0]} exited "
-                f"with code {first_failure[1]}; aborting parallel annotate."
+                f"Annotation subprocess on shard {failed_gpu} exited "
+                f"with code {failed_code}. Last lines of "
+                f"{failed_log}:\n  See `tail -100 {failed_log}` for "
+                f"the full traceback."
             )
 
         # Gather per-shard tensors and concatenate along sequence axis.

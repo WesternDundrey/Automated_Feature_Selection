@@ -4,6 +4,94 @@
 
 ---
 
+## [v8.20.0.5] — clean terminal: per-shard logs + aggregated status thread
+
+User caught a real cause for "2 GPUs fine, 4 GPUs 20× worse": with
+4 shards × tqdm refresh + per-block prints + vLLM internal logs all
+writing to the same PTY (vast.ai/SSH terminal), Python's blocking
+write to stdout stalls the shard processes when the terminal renderer
+can't keep up. GPUs sit idle waiting for the parent's `print()` to
+flush. Doesn't show in `nvidia-smi dmon` (correctly idle, just blocked
+on I/O).
+
+### What this commit does
+
+* Each shard's stdout/stderr now redirects to
+  `{output_dir}/logs/shard_{N}.log` (line-buffered, full detail
+  preserved including per-block timing and vLLM internals).
+* Parent terminal gets ONE aggregated status line every 10s via a
+  daemon thread that polls each shard's `_annotate_status.json`:
+
+  ```
+  [agg] 47.2%  (32,145,678/68,123,456)  elapsed=4.3h  |
+        s0:c12 47% 612/s eta3.4h  s1:c11 44% 588/s eta3.5h
+        s2:c12 47% 605/s eta3.4h  s3:c12 47% 598/s eta3.4h
+  ```
+
+* Each shard writes `_annotate_status.json` (atomic via tmp+rename)
+  per chunk completion with chunk_idx, completed/total, rate, eta,
+  build/gen/parse phase split, prefix_block.
+* `VLLM_LOGGING_LEVEL=WARNING` set in shard env (no longer keeps the
+  log files dominated by per-step vLLM internals; per-block timing
+  prints we added remain visible).
+* Failure handling: on shard exit code != 0, parent prints the
+  shard log path so the user can `tail -100 {log}` for the traceback
+  instead of scrolling through interleaved 4-shard noise.
+
+### Why this matters more than knob-tuning
+
+Before this commit, even with the v8.20.0.4 max_num_seqs auto-scaling,
+the underlying I/O contention would still degrade 4-shard runs vs
+2-shard runs. The other knobs (max_num_seqs, target_prompts, etc.)
+control vLLM-internal load; the terminal redirect controls Python-side
+I/O blocking, which is independent. Both are needed.
+
+### How the user sees it now
+
+Launch banner:
+```
+  Multi-shard annotation: clean-terminal mode
+  Per-shard logs:   pipeline_data*/logs/shard_*.log
+  Aggregated status updates every 10s on this terminal.
+  Detail per shard: tail -f pipeline_data*/logs/shard_*.log
+```
+
+Then ONLY the aggregated status lines on the terminal. Detailed
+per-block timing (build / gen / parse) is in the log files.
+
+### Files touched
+
+* `pipeline/annotate.py`:
+  - Per-chunk `_annotate_status.json` write in
+    `_annotate_local_vllm_pertoken` (atomic, defensive)
+  - In `_annotate_local_parallel`:
+    - Open per-shard log files
+    - Pass as `stdout=file_handle, stderr=subprocess.STDOUT`
+    - Spawn daemon status thread polling status JSONs every 10s
+    - Stop event + thread join in try/finally for clean shutdown
+    - Defensive try/except in status loop
+    - `VLLM_LOGGING_LEVEL=WARNING` in shard env
+    - Failure path points user at the relevant shard log
+
+### Test pattern
+
+```bash
+git pull
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m pipeline.run \
+  --output_dir pipeline_data_scaling \
+  --step annotate
+# Terminal shows ONLY: launch banner + [agg] lines every 10s.
+# Detail: tail -f pipeline_data_scaling/logs/shard_*.log
+```
+
+If 4-GPU is still slow after this AND v8.20.0.4 max_num_seqs scaling,
+the bottleneck is genuinely at the vLLM/CUDA layer (not Python I/O,
+not Python construction). Next escalation:
+`VLLM_ENABLE_V1_MULTIPROCESSING=0` to disable v1 internal scheduler,
+but only with measurement first per postmortem §7.
+
+---
+
 ## [v8.20.0.4] — vLLM max_num_seqs auto-scaling for multi-shard (the §3a real fix)
 
 User reported under v8.20.0.2: "rendering was pretty fast but processing
