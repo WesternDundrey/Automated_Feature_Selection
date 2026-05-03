@@ -4,6 +4,103 @@
 
 ---
 
+## [v8.20.2] — filter-candidates: cascade stage 2 (deterministic gates + dedup)
+
+User reviewed `feature_candidates_raw.json` from stage 1 and identified
+~10-25% precision: real crisp candidates mixed with hallucinated examples,
+context-level slop, multi-concept bundles, vague descriptors. Stage 2
+ships the deterministic + free filters that collapse the pool to clean
+~1500 candidates before Opus-judge sees them.
+
+### Filters applied (in order)
+
+1. **catalog_quality lexical scan** (existing): vague phrases
+   ("various", "associated with", "in general"), context-level
+   predicates ("text is", "passage about"), prefix-undecidable
+   constructs ("subject of", "followed by", "named entity"). Reuses
+   `pipeline.catalog_quality._lexical_scan` so the cascade and the
+   existing post-Opus quality gate apply the same hard-fail set.
+
+2. **User-requested word blacklist**: "context", "political",
+   "financial", "official", "high/low-information", "function word",
+   "common word", "noun phrase", "relative clause", "grammatical
+   head/role/category", "semantic role/domain/category", "formal/
+   informal writing/prose/register". These signal context-level /
+   register / domain orientation that Haiku produces despite the
+   prompt asking for token-local features.
+
+3. **Word-count cap**: > 25 words → almost always over-broad.
+
+4. **Multi-concept bundle detection**:
+   - List-bundle: > 4 items separated by commas / "or" / slashes /
+     colons / semicolons (catches "Like/Perhaps/Maybe/Why/Now/So/...").
+   - POS-bundle: ≥ 2 distinct POS terms (catches "noun or verb in a
+     clause"; surface families like "comma or period" with only 2
+     items pass through).
+
+5. **Boundary-discipline minimum**: ≥ 2 positive_examples + ≥ 2
+   negative_examples. Lower than the inventory-time `_MIN_*=3` since
+   Haiku is a proposer, not the final author — Opus-judge can
+   regenerate examples at the next stage.
+
+6. **Local self-consistency check**: catches Haiku hallucinations
+   for the cheapest cases:
+   - "Token is X" / "Token is the word X" → highlighted token must
+     equal X
+   - "Token begins with X" / "Token starts with X" → highlighted
+     token must start with X
+   - "Token contains X" → highlighted token must contain X
+   Catches the cand_00009 / cand_00010 type errors (description
+   says "first-person pronoun" but example is `<<Like>>`). Doesn't
+   catch all violations — semantic ones like "first-person pronoun"
+   require LLM judgment, deferred to Opus-judge.
+
+7. **Lexical dedup**: normalize description (lowercase, strip punct,
+   drop stopwords, sort tokens) → group identicals → keep canonical
+   (shortest description, alphabetical tie-break). No embedding
+   dependency; catches exact-paraphrase dups and word-order variants.
+
+### Drop reasons reported
+
+`filter_candidates_report.json` records IDs by drop reason so the user
+can audit each gate's effect:
+
+```
+{
+  "n_input": 3000,
+  "n_output": 1547,
+  "drops_by_reason": {
+    "catalog_quality:associated with": ["haiku.cand_00012", ...],
+    "user_blacklist:context": [...],
+    "multi_concept_bundle": [...],
+    "self_consistency:'Token is X' but highlighted 'Y'": [...],
+    "lexical_dedup": ["haiku.cand_00045 (kept haiku.cand_00007)", ...],
+    ...
+  }
+}
+```
+
+### What's next (cascade stage 3)
+
+`--step opus-judge` (deferred): reads `feature_candidates_filtered.json`,
+sends to Opus 4.7 for canonical selection + rewrite to crisp annotation
+prompts + symmetry-family completion. Output: `feature_catalog.json`
+with the standard schema, ~500 features (locked plan).
+
+### CLI
+
+  --step filter-candidates
+
+(no per-filter knobs in v0; all thresholds are hardcoded based on the
+user's spec. Tunable knobs deferred until we see real survival rates.)
+
+### Files touched
+
+* **NEW** `pipeline/filter_candidates.py` — deterministic filters
+* `pipeline/run.py` — `--step filter-candidates`
+
+---
+
 ## [v8.20.1] — propose-haiku: cascade stage 1 (high-recall candidate proposer)
 
 User architectural improvement: cascade catalog generation. Haiku as

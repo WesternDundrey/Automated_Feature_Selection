@@ -158,7 +158,8 @@ def main():
                  "extend-corpus", "probe-causal", "polysemy-report",
                  "shortlist", "delphi-run", "opus-catalog",
                  "pilot", "irr", "oracle-unsup", "unsup-f1", "compare",
-                 "dedup-catalog", "curate-fve", "propose-haiku"],
+                 "dedup-catalog", "curate-fve", "propose-haiku",
+                 "filter-candidates"],
         help="Run only this step",
     )
     parser.add_argument(
@@ -944,6 +945,15 @@ def main():
         from .propose_haiku import run as run_propose
         run_propose(cfg)
         print(f"Propose-Haiku completed in {time.time() - t0:.1f}s")
+
+    if args.step == "filter-candidates":
+        print("\n" + "=" * 70)
+        print(f"STEP: FILTER-CANDIDATES  (v8.21 cascade stage 2)")
+        print("=" * 70)
+        t0 = time.time()
+        from .filter_candidates import run as run_filter
+        run_filter(cfg)
+        print(f"Filter-Candidates completed in {time.time() - t0:.1f}s")
 
     # Step 2: Annotation
     if args.step is None or args.step == "annotate":
