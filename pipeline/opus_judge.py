@@ -199,17 +199,121 @@ def _build_judge_prompt(
         """)
 
 
-def _parse_judge_response(text: str) -> dict:
-    """Parse Opus's JSON response. Tolerates code-fence wrapping."""
+def _strip_code_fences(text: str) -> str:
+    """Remove ```json ... ``` or ``` ... ``` wrappers if present."""
+    s = text.strip()
+    s = re.sub(r"^```(?:json)?\s*\n?", "", s)
+    s = re.sub(r"\n?```\s*$", "", s)
+    return s.strip()
+
+
+def _truncate_at_last_complete_bracket(text: str) -> str | None:
+    """Walk backwards through `}` positions, trying to close hanging
+    outer brackets with simple closing suffixes. For our schema,
+    truncation typically happens mid-`new_features`, so we try
+    appending `]}` (close inner array + outer object), then plain `}`,
+    etc. First candidate that parses wins. Caps at first 200 attempts
+    to bound runtime on huge responses."""
+    # Closing suffixes ordered by likelihood for our schema:
+    # outer object always ends with `}`, inner arrays with `]`.
+    suffixes = [
+        "",
+        "]}",      # close array + outer object (most common at our schema)
+        "}]}",     # close current feature + array + outer
+        "}}",      # close current obj + outer (no array open)
+        "]",
+        "}",
+        "\"]}",    # truncation inside a string at array tail
+        "\"}]}",   # string mid-feature + close everything
+    ]
+    close_positions = [i for i, c in enumerate(text) if c == "}"]
+    if not close_positions:
+        return None
+    n_attempts = 0
+    for end in reversed(close_positions):
+        base = text[:end + 1]
+        for suffix in suffixes:
+            candidate = base + suffix
+            n_attempts += 1
+            if n_attempts > 200:
+                return None
+            try:
+                json.loads(candidate)
+                return candidate
+            except Exception:
+                continue
+    return None
+
+
+def _repair_and_parse(text: str) -> tuple[dict, str]:
+    """Try multiple recovery strategies. Returns (parsed_dict, strategy_name).
+
+    Strategies in order:
+      1. Strict parse on the raw text.
+      2. Strip code fences, parse.
+      3. Extract first {...} block and parse.
+      4. Repair trailing commas in arrays/objects.
+      5. Truncate at the last complete `}` boundary that parses cleanly
+         (loses the unfinished tail of features but salvages everything
+         before the truncation point).
+    """
     if not text:
         raise RuntimeError("empty Opus judge response")
-    m = _JSON_OBJECT_RE.search(text.strip())
+
+    # 1. Direct
+    try:
+        return json.loads(text), "strict"
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Strip code fences
+    cleaned = _strip_code_fences(text)
+    try:
+        return json.loads(cleaned), "code_fence_strip"
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Extract first {...} block (greedy)
+    m = _JSON_OBJECT_RE.search(cleaned)
     if m is None:
         raise RuntimeError(
-            f"no JSON object found in Opus response. First 200 chars:\n"
-            f"{text[:200]}"
+            f"no JSON object found in Opus response. First 300 chars:\n"
+            f"{text[:300]}"
         )
-    return json.loads(m.group(0))
+    block = m.group(0)
+    try:
+        return json.loads(block), "first_block"
+    except json.JSONDecodeError:
+        pass
+
+    # 4. Repair trailing commas: `, ]` or `, }` → `]`/`}`
+    repaired = re.sub(r",(\s*[\]\}])", r"\1", block)
+    try:
+        return json.loads(repaired), "trailing_comma_repair"
+    except json.JSONDecodeError:
+        pass
+
+    # 5. Truncate at last complete `}` boundary. This loses any half-
+    # written feature in the middle/end but saves whatever was complete.
+    truncated = _truncate_at_last_complete_bracket(repaired)
+    if truncated is not None:
+        return json.loads(truncated), "truncate_at_last_bracket"
+
+    # All recovery strategies failed.
+    raise RuntimeError(
+        f"All JSON recovery strategies failed. Raw response saved to "
+        f"opus_judge_raw_response.txt; inspect manually or pass to "
+        f"--step recover-judge after fixing."
+    )
+
+
+def _parse_judge_response(text: str) -> dict:
+    """Parse Opus's JSON response with multiple recovery strategies.
+    Returns the parsed dict; raises RuntimeError on total failure."""
+    parsed, strategy = _repair_and_parse(text)
+    if strategy != "strict":
+        print(f"  [parse] used recovery strategy: {strategy}")
+    return parsed
 
 
 def _post_validate_inherited(
@@ -478,7 +582,13 @@ def run(cfg: Config | None = None) -> dict:
     )
     print(f"  Sending to {model}...")
     text = chat(client, model=model, prompt=prompt, max_tokens=64000)
-    print(f"  Response: {len(text):,} chars")
+
+    # CRITICAL: save raw response IMMEDIATELY, before any parse attempt.
+    # If parsing fails, the user can iterate on parser fixes (or run
+    # --step recover-judge) without paying for another Opus call.
+    raw_path = cfg.output_dir / "opus_judge_raw_response.txt"
+    raw_path.write_text(text)
+    print(f"  Raw response saved: {raw_path} ({len(text):,} chars)")
 
     parsed = _parse_judge_response(text)
     n_groups = len(parsed.get("groups", []) or [])
@@ -520,4 +630,76 @@ def run(cfg: Config | None = None) -> dict:
 
     print(f"\n  Next: review feature_catalog.json, then proceed with "
           f"--step annotate.")
+    return catalog
+
+
+def recover_from_raw(cfg: Config | None = None) -> dict:
+    """Re-parse a previously-saved opus_judge_raw_response.txt without
+    making another Opus call. Use this when the parser failed but the
+    raw response was successfully captured (any run after the
+    save-raw-immediately fix).
+
+    Reads:  {output_dir}/opus_judge_raw_response.txt
+            {output_dir}/feature_candidates_filtered.json (for merge)
+    Writes: feature_catalog.json + opus_judge_record.json (same as run)
+    """
+    if cfg is None:
+        cfg = Config()
+
+    print("\n" + "=" * 70)
+    print("RECOVER-JUDGE  (re-parse saved Opus response, no API call)")
+    print("=" * 70)
+
+    raw_path = cfg.output_dir / "opus_judge_raw_response.txt"
+    if not raw_path.exists():
+        raise FileNotFoundError(
+            f"Need {raw_path}. This file is saved at the start of "
+            f"--step opus-judge after the Opus call returns. If your "
+            f"opus-judge run predates the save-raw-immediately fix, "
+            f"the response is unrecoverable and you'll need to re-run "
+            f"--step opus-judge."
+        )
+    text = raw_path.read_text()
+    print(f"  Loaded raw response: {raw_path} ({len(text):,} chars)")
+
+    cand_path = cfg.output_dir / "feature_candidates_filtered.json"
+    if not cand_path.exists():
+        raise FileNotFoundError(
+            f"Need {cand_path} for metadata merging."
+        )
+    filtered = json.loads(cand_path.read_text())
+    candidates = filtered.get("candidates", []) or []
+    candidates_by_id = {c["id"]: c for c in candidates if "id" in c}
+    print(f"  Loaded candidates for merge: {len(candidates_by_id)}")
+
+    parsed = _parse_judge_response(text)
+    n_groups = len(parsed.get("groups", []) or [])
+    n_selected = len(parsed.get("selected", []) or [])
+    n_new = len(parsed.get("new_features", []) or [])
+    print(f"  Opus picked: {n_selected} selected + {n_new} symmetry = "
+          f"{n_selected + n_new} leaves across {n_groups} groups")
+
+    catalog = _merge_into_catalog(parsed, candidates_by_id)
+
+    if catalog["n_dropped_unknown_haiku_id"] > 0:
+        print(f"  WARNING: {catalog['n_dropped_unknown_haiku_id']} "
+              f"selected entries referenced unknown haiku IDs.")
+    if catalog.get("n_dropped_post_validate", 0) > 0:
+        print(f"  Post-validate dropped: "
+              f"{catalog['n_dropped_post_validate']} features.")
+    if catalog.get("n_examples_pruned", 0) > 0:
+        print(f"  Examples pruned: {catalog['n_examples_pruned']}")
+    print(f"  Final catalog: {catalog['n_leaves']} leaves, "
+          f"{catalog['n_groups']} groups")
+
+    cfg.catalog_path.write_text(json.dumps(catalog, indent=2))
+    print(f"  Saved: {cfg.catalog_path}")
+
+    record = dict(catalog)
+    record["raw_opus_response"] = text
+    record["raw_opus_parsed"] = parsed
+    record["recovered_from_raw"] = True
+    record_path = cfg.output_dir / "opus_judge_record.json"
+    record_path.write_text(json.dumps(record, indent=2))
+    print(f"  Saved: {record_path}")
     return catalog

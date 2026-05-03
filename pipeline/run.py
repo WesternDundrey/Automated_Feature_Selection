@@ -159,7 +159,8 @@ def main():
                  "shortlist", "delphi-run", "opus-catalog",
                  "pilot", "irr", "oracle-unsup", "unsup-f1", "compare",
                  "dedup-catalog", "curate-fve", "propose-haiku",
-                 "filter-candidates", "opus-judge", "validate-catalog"],
+                 "filter-candidates", "opus-judge", "validate-catalog",
+                 "recover-judge"],
         help="Run only this step",
     )
     parser.add_argument(
@@ -963,6 +964,15 @@ def main():
         from .opus_judge import run as run_judge
         run_judge(cfg)
         print(f"Opus-Judge completed in {time.time() - t0:.1f}s")
+
+    if args.step == "recover-judge":
+        print("\n" + "=" * 70)
+        print(f"STEP: RECOVER-JUDGE  (re-parse saved Opus raw, no API call)")
+        print("=" * 70)
+        t0 = time.time()
+        from .opus_judge import recover_from_raw
+        recover_from_raw(cfg)
+        print(f"Recover-Judge completed in {time.time() - t0:.1f}s")
 
     if args.step == "validate-catalog":
         print("\n" + "=" * 70)
