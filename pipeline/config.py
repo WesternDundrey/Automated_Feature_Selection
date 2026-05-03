@@ -267,9 +267,33 @@ class Config:
     #                 with shrinkage λ. Suppresses high-variance junk.
     #                 Needs strong shrinkage at our 768d / rare-positive
     #                 sample size.
+    #   "pc1":        first principal component of x | y=1 (positive class).
+    #                 v8.20.0: this is the FVE-UPPER-BOUND direction —
+    #                 by definition no other unit direction explains more
+    #                 variance at positive positions. Useful as both a
+    #                 diagnostic (how close are mean_shift / LDA / logistic
+    #                 to the FVE ceiling?) and a knob for FVE-focused runs.
+    #                 NOT discriminative — captures the dominant
+    #                 within-class axis, which may be context noise rather
+    #                 than the concept direction. Use with eyes open;
+    #                 pair with `--freeze-decoder` for clean FVE numbers,
+    #                 and report concept-fidelity diagnostics (causal KL,
+    #                 cosine to mean_shift) alongside.
     target_dir_method: str = "mean_shift"
     target_dir_logistic_lambda: float = 1.0
     target_dir_lda_shrinkage: float = 0.1
+
+    # ── v8.20.0 FVE curation ──────────────────────────────────────
+    # `--step curate-fve` ranks catalog leaves by per-feature FVE under
+    # the configured target_dir_method (or `fve_curate_source` if set)
+    # and filters to features with FVE ≥ `fve_curate_threshold`. This
+    # is OPERATIONAL (selection) not METHODOLOGICAL (no loss change);
+    # it lets the paper report mean FVE on a transparently-defined
+    # backbone subset rather than over the long tail. Default
+    # threshold 0.5 picks the surface-feature backbone summary9
+    # showed; raise to 0.7 for stricter "near-PC1" subsets.
+    fve_curate_threshold: float = 0.5
+    fve_curate_source: str = ""  # empty → use cfg.target_dir_method
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = True    # v8.19.4: DEFAULT FLIPPED to True.

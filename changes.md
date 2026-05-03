@@ -4,6 +4,106 @@
 
 ---
 
+## [v8.20.0] — FVE curation + PC1 target_dir method (no supervised-loss change)
+
+Goal: lift mean FVE on the production catalog without violating the
+hinge-formulation invariants from `supervised_saes_hinge_loss.md`. The
+mentor's design says reconstruction MSE alone shapes magnitude; user
+correctly pushed back on a per-feature magnitude-alignment term as a
+deviation that would re-introduce calibration drift. Two principled
+levers shipped here; both leave the supervised loss path untouched.
+
+### Lever 1: PC1 target_dir method (FVE upper bound)
+
+`compute_target_directions_pc1` (train.py): for each feature, top
+eigenvector of `Cov(x | y_k = 1)`. By Rayleigh's principle this is the
+single direction that explains the most variance at positive positions
+— i.e. the FVE upper bound for one-direction-per-feature.
+
+* **Sign disambiguation** against mean_shift, so "positive activation =
+  concept present" is preserved (intervention/composition code that
+  expects this convention isn't silently broken on half the features).
+* **Methodological caveat** (documented in code + docstring): PC1
+  maximizes WITHIN-class variance explained, not discriminative power.
+  For surface features (semicolons, opening quotes) PC1 ≈ mean_shift
+  and the direction is both high-FVE and concept-bearing. For
+  polysemantic features (bracket_opening across many syntactic
+  contexts), PC1 may capture the dominant context axis rather than the
+  concept axis. Always cross-reference with concept-fidelity diagnostics
+  (cosine to mean_shift, per-feature causal KL) before using PC1 as the
+  default training direction.
+* **Dispatch wired** in `compute_target_directions_dispatch` with the
+  same rare-feature fallback (n_pos < 5 → mean_shift) used by
+  logistic/lda. Meta sidecar records `method=pc1` so cache reuse is
+  safe across method switches.
+* **CLI:** `--target-dir-method pc1`.
+
+### Lever 2: --step curate-fve (operational catalog filter)
+
+New `pipeline/curate_fve.py`. Reads activations + annotations + meta,
+computes per-feature FVE under the configured target_dir_method (and
+PC1 as the upper bound for headroom reporting), filters to features
+with FVE ≥ `fve_curate_threshold`, writes
+`feature_catalog.fve_curated.json` + `fve_curation_report.json`. Same
+pattern as dedup_catalog: doesn't overwrite the original catalog —
+user opts in by replacing.
+
+* **annotations_meta.json validation:** column→id mapping required;
+  catalog leaves not present in the meta sidecar raise an error
+  rather than silently misbinding columns. Pre-v8.1 runs without the
+  meta sidecar can't be safely curated.
+* **Position-mask aware:** if `position_mask.pt` exists, restricts FVE
+  computation to sampled positions for honest numbers consistent with
+  evaluate.py's reporting.
+* **Reports both** mean FVE under the configured method AND PC1 mean
+  FVE. The headroom (PC1 − configured) tells you how much FVE is left
+  on the table by the discriminative-but-not-FVE-optimal mean_shift /
+  LDA / logistic methods.
+* **CLI:** `--step curate-fve [--fve-curate-threshold FLOAT]
+  [--fve-curate-source METHOD]`. `fve_curate_source` lets curation use
+  a different method than training (e.g. curate against PC1 = "is
+  there ANY single direction that hits FVE ≥ 0.7?", train with
+  mean_shift = "but use the concept direction in the actual run").
+
+### What was NOT shipped (and why)
+
+* **Per-feature magnitude alignment loss for hinge mode.** Initially
+  proposed; reverted on user pushback. The hinge formulation's
+  natural-threshold property (summary9: naive L0 ratio = 1.015,
+  t=0 F1 wins probe by +0.187 GROWING with corpus size) rests on
+  reconstruction MSE alone shaping magnitude in the correctly-classified
+  region. A per-feature magnitude term re-couples firing magnitude to
+  a synthetic target (`x · target_dir_k`), which would re-introduce
+  the calibration drift the formulation eliminates. The doc explicitly
+  rules it out: "no penalty on the magnitude when the feature is
+  correctly on: whether z_i = 0.1 or z_i = 100, the hinge is indifferent."
+  Future FVE work should pursue architectural changes (multi-direction
+  subspace decoder per feature, anti-siphoning U regularizer per
+  summary9 deferred #6) rather than supervised-loss changes.
+
+### Honest expectation on the 70% mean-FVE target
+
+* Single-direction-per-feature ceiling: PC1 mean across the full
+  46-feature production catalog is likely 0.55-0.65; concept-direction
+  methods (mean_shift / LDA / logistic) trail PC1 by 0.05-0.15.
+* Mean FVE = 0.70 across the FULL heterogeneous catalog requires
+  multi-direction subspace decoders (K=3 per feature). Defer to v8.21.
+* Mean FVE > 0.7-0.85 over a CURATED backbone (FVE ≥ 0.5 threshold) is
+  trivially achievable via `--step curate-fve` and is the honest path
+  for the workshop paper, with transparent inclusion criteria.
+
+### Files touched
+
+* **NEW** `pipeline/curate_fve.py` — operational FVE curation
+* `pipeline/train.py` — `compute_target_directions_pc1` + dispatch wire
+* `pipeline/config.py` — added `fve_curate_threshold`,
+  `fve_curate_source`; documented PC1 in `target_dir_method` comment
+* `pipeline/run.py` — `--target-dir-method pc1`,
+  `--fve-curate-threshold`, `--fve-curate-source`,
+  `--step curate-fve`
+
+---
+
 ## [v8.19.3] — Audit fixes + literal mentor defaults + multi-GPU note
 
 Reviewer caught seven real defects in the v8.19.2 refactor + the

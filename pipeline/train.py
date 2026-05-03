@@ -222,11 +222,92 @@ def compute_target_directions_lda(
     return target_dirs, raw_norms, counts
 
 
+def compute_target_directions_pc1(
+    x_flat: torch.Tensor, y_flat: torch.Tensor, n_supervised: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """First principal component of the positive-class activations per feature.
+
+    For each feature k, the FVE-OPTIMAL unit direction at positive positions
+    is the top eigenvector of Cov(x | y_k = 1). This is the upper bound on
+    per-feature FVE — by Rayleigh's principle, no other unit direction
+    explains more variance at positive positions than the top eigenvector.
+
+    Sign disambiguation: the eigenvector is sign-flipped to align with the
+    mean-shift direction (μ_pos - μ_all). This makes the resulting direction
+    interpretable as "the dominant axis along which positive activations
+    deviate from the corpus mean," consistent with mean_shift's sign
+    convention. Without this, the eigenvector's sign is arbitrary and
+    intervention/composition code that expects "positive activation = concept
+    present" would silently flip half the features.
+
+    IMPORTANT methodological caveat: PC1 maximizes within-class variance
+    explained, NOT discriminative power. For surface features whose positive
+    activations are tightly clustered (e.g., semicolons, opening quotes), PC1
+    ≈ mean_shift and the direction is both high-FVE and concept-bearing. For
+    polysemantic features whose positive activations are heterogeneous (e.g.,
+    bracket_opening across many syntactic contexts), PC1 may capture the
+    dominant context axis rather than the concept axis — high FVE, low
+    interpretability. Always report concept-fidelity diagnostics (cosine to
+    mean_shift, per-feature causal ablation KL) alongside.
+
+    Computation: for n_pos < d_model the SVD of the centered positive-class
+    matrix is cheaper than the d_model × d_model covariance. For n_pos ≥
+    d_model, eigh on the covariance is comparable. We dispatch on shape.
+    Features with n_pos < 5 fall back to mean_shift (handled by the dispatch
+    layer, not here — we return zero rows).
+
+    Returns:
+        target_dirs: (n_supervised, d_model) unit-norm PC1 directions
+        raw_norms:   (n_supervised,) all 1.0 for valid features, 0.0 for skipped
+        counts:      (n_supervised,) number of positive examples per feature
+    """
+    n_features = n_supervised
+    d_model = x_flat.shape[1]
+    target_dirs = torch.zeros(n_features, d_model, dtype=x_flat.dtype)
+    raw_norms = torch.zeros(n_features, dtype=x_flat.dtype)
+    counts = torch.zeros(n_features, dtype=x_flat.dtype)
+
+    x = x_flat.float()
+    mean_all = x.mean(dim=0)
+
+    for k in range(n_features):
+        y = y_flat[:, k].float()
+        n_pos = int(y.sum().item())
+        counts[k] = n_pos
+        if n_pos < 5:
+            # Skip; dispatch layer will fall back to mean_shift for these.
+            continue
+        x_pos = x[y > 0]                                          # (n_pos, d_model)
+        x_pos_centered = x_pos - x_pos.mean(dim=0, keepdim=True)
+
+        if x_pos_centered.shape[0] >= d_model:
+            # Covariance approach (d_model × d_model).
+            cov = (x_pos_centered.T @ x_pos_centered) / max(1, n_pos - 1)
+            evals, evecs = torch.linalg.eigh(cov)                 # ascending
+            pc1 = evecs[:, -1]                                    # top eigenvector
+        else:
+            # SVD on centered data is cheaper when n_pos < d_model.
+            U, S, Vh = torch.linalg.svd(x_pos_centered, full_matrices=False)
+            pc1 = Vh[0]
+
+        # Sign disambiguation against mean shift so "positive activation =
+        # concept present" is preserved, matching mean_shift's convention.
+        mean_pos = x_pos.mean(dim=0)
+        shift = mean_pos - mean_all
+        if (pc1 @ shift) < 0:
+            pc1 = -pc1
+
+        target_dirs[k] = pc1.to(x_flat.dtype)
+        raw_norms[k] = 1.0  # eigenvector is unit-norm by construction
+
+    return target_dirs, raw_norms, counts
+
+
 def compute_target_directions_dispatch(
     x_flat: torch.Tensor, y_flat: torch.Tensor, n_supervised: int, cfg,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dispatch to the right target_dir computation based on
-    cfg.target_dir_method ∈ {'mean_shift', 'logistic', 'lda'}.
+    cfg.target_dir_method ∈ {'mean_shift', 'logistic', 'lda', 'pc1'}.
 
     v8.18.21: writes a `target_directions.pt.meta.json` sidecar
     capturing method + regularization parameters so re-runs with a
@@ -254,6 +335,17 @@ def compute_target_directions_dispatch(
         dirs, norms, counts = compute_target_directions_lda(
             x_flat, y_flat, n_supervised,
             shrinkage=float(getattr(cfg, "target_dir_lda_shrinkage", 0.1)),
+        )
+    elif method == "pc1":
+        # FVE-upper-bound direction. Top eigenvector of Cov(x | y_k = 1).
+        # Sign-disambiguated against mean_shift so "positive activation =
+        # concept present" is preserved. Note: maximizes within-class
+        # variance explained, NOT discriminative power — for polysemantic
+        # features it may capture context noise rather than concept axis.
+        # Always cross-reference with concept-fidelity diagnostics
+        # (cosine to mean_shift, per-feature causal KL).
+        dirs, norms, counts = compute_target_directions_pc1(
+            x_flat, y_flat, n_supervised,
         )
     else:
         raise ValueError(f"unknown target_dir_method {method!r}")

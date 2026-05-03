@@ -158,17 +158,39 @@ def main():
                  "extend-corpus", "probe-causal", "polysemy-report",
                  "shortlist", "delphi-run", "opus-catalog",
                  "pilot", "irr", "oracle-unsup", "unsup-f1", "compare",
-                 "dedup-catalog"],
+                 "dedup-catalog", "curate-fve"],
         help="Run only this step",
     )
     parser.add_argument(
         "--target-dir-method", default=None,
-        choices=["mean_shift", "logistic", "lda"],
+        choices=["mean_shift", "logistic", "lda", "pc1"],
         help="Target direction method for frozen decoder. mean_shift "
              "(default, simplest, robust); logistic (ridge LR per "
              "feature, optimal classifier direction but uses confounds); "
              "lda (whitened mean-shift, suppresses high-variance junk, "
-             "needs shrinkage at 768d / rare positives).",
+             "needs shrinkage at 768d / rare positives); pc1 (top "
+             "eigenvector of positive-class covariance, FVE upper bound, "
+             "may capture context noise on polysemantic features — use "
+             "with concept-fidelity diagnostics).",
+    )
+    parser.add_argument(
+        "--fve-curate-threshold", type=float, default=None,
+        help="For --step curate-fve: keep features whose per-feature FVE "
+             "(under the chosen source method) is ≥ THRESHOLD. Default "
+             "0.5 (surface-backbone subset). Raise to 0.7 for a stricter "
+             "near-PC1 subset suitable for the paper's headline FVE "
+             "number.",
+    )
+    parser.add_argument(
+        "--fve-curate-source", default=None,
+        choices=["mean_shift", "logistic", "lda", "pc1"],
+        help="For --step curate-fve: which target_dir method to use for "
+             "computing per-feature FVE during curation. Defaults to the "
+             "configured --target-dir-method. Pass `pc1` to curate "
+             "against the FVE upper bound (most permissive — keeps any "
+             "feature for which SOME single direction can hit the "
+             "threshold, even if the configured training method "
+             "doesn't reach it).",
     )
     parser.add_argument(
         "--catalog-gate-mode", default=None,
@@ -551,6 +573,10 @@ def main():
         overrides["hinge_freeze_decoder"] = True
     if args.target_dir_method is not None:
         overrides["target_dir_method"] = args.target_dir_method
+    if args.fve_curate_threshold is not None:
+        overrides["fve_curate_threshold"] = args.fve_curate_threshold
+    if args.fve_curate_source is not None:
+        overrides["fve_curate_source"] = args.fve_curate_source
     if args.catalog_gate_mode is not None:
         overrides["catalog_gate_mode"] = args.catalog_gate_mode
     if args.catalog_gate_strict:
@@ -823,6 +849,15 @@ def main():
         from .dedup_catalog import run as run_dedup
         run_dedup(cfg)
         print(f"Dedup catalog completed in {time.time() - t0:.1f}s")
+
+    if args.step == "curate-fve":
+        print("\n" + "=" * 70)
+        print(f"STEP: CURATE-FVE  (rank features by FVE potential, filter)")
+        print("=" * 70)
+        t0 = time.time()
+        from .curate_fve import run as run_curate_fve
+        run_curate_fve(cfg)
+        print(f"Curate-FVE completed in {time.time() - t0:.1f}s")
 
     # Step 2: Annotation
     if args.step is None or args.step == "annotate":
