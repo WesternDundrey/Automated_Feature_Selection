@@ -898,6 +898,12 @@ def _annotate_local_vllm_pertoken(
         prompts = []
         positions = []
 
+        # v8.20.0 timing: split the per-chunk wall into build / generate /
+        # parse phases. Diagnostic discipline from postmortem §4 — without
+        # this we can't tell whether bottleneck is Python prompt construction,
+        # vLLM scheduling, or output parsing, and tuning is speculation.
+        t_chunk_start = time.time()
+
         for seq_j in range(seq_start, seq_end):
             prefix = sys_tuple + text_open_tuple
             for tok_k in range(T):
@@ -916,9 +922,12 @@ def _annotate_local_vllm_pertoken(
                     })
                     positions.append((seq_j, tok_k, fi))
 
+        t_build = time.time()
+
         outputs = llm.generate(prompts, params)
 
-        batch_time = time.time()
+        t_generate = time.time()
+        batch_time = t_generate
 
         # Debug + cache verification on first chunk
         if seq_start == 0:
@@ -949,6 +958,8 @@ def _annotate_local_vllm_pertoken(
             tid = output.outputs[0].token_ids[0]
             annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1_id else 0.0
 
+        t_parse = time.time()
+
         completed += len(prompts)
         elapsed = time.time() - t_start
         rate = completed / elapsed if elapsed > 0 else 0
@@ -958,6 +969,18 @@ def _annotate_local_vllm_pertoken(
         # output is clearly attributed.
         shard_id = os.environ.get("SUPSAE_SHARD_ID", "")
         prefix = f"  [shard {shard_id}] " if shard_id else "  "
+        # v8.20.0 timing print: build / generate / parse split per chunk.
+        # Reading: build dominates → reduce per-call prompt count (feature/
+        # prefix blocking, lower seq_chunk). generate dominates → tune vLLM
+        # knobs. parse dominates → output handling (rare).
+        build_dt = t_build - t_chunk_start
+        gen_dt = t_generate - t_build
+        parse_dt = t_parse - t_generate
+        print(f"{prefix}chunk{chunk_idx:>3}  "
+              f"build={build_dt:5.1f}s  gen={gen_dt:6.1f}s  "
+              f"parse={parse_dt:5.1f}s  "
+              f"n_prompts={len(prompts):>7,}  "
+              f"rate={len(prompts)/max(1e-6, gen_dt):.0f}/s")
         print(f"{prefix}{completed:,}/{total_decisions:,} decisions  "
               f"rate={rate:.0f}/s  ETA {eta_sec/3600:.1f}h")
 
@@ -1419,7 +1442,29 @@ annotations = annotate_local(tokens, features, tokenizer, cfg)
 torch.save(annotations, {str(shard_out)!r})
 """
             env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+            # v8.20.0: respect a parent-restricted CUDA_VISIBLE_DEVICES.
+            # If the parent already has e.g. CUDA_VISIBLE_DEVICES=4,5,6,7
+            # (rented box; subset of host's GPUs), then setting the
+            # child's CUDA_VISIBLE_DEVICES=str(gpu_idx) where gpu_idx is
+            # the Python-relative index 0..n-1 silently selects ABSOLUTE
+            # device gpu_idx (e.g. host GPU 2) instead of parent-visible
+            # device gpu_idx (e.g. host GPU 6). On rented boxes that's
+            # someone else's GPU, or a non-existent one. Re-map through
+            # the parent's visible list so child gets the host-absolute
+            # ID for the parent-relative index it was assigned.
+            parent_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if parent_cvd.strip():
+                visible = [x.strip() for x in parent_cvd.split(",") if x.strip()]
+                if gpu_idx < len(visible):
+                    env["CUDA_VISIBLE_DEVICES"] = visible[gpu_idx]
+                else:
+                    raise RuntimeError(
+                        f"shard {gpu_idx} requested but parent "
+                        f"CUDA_VISIBLE_DEVICES={parent_cvd!r} only "
+                        f"exposes {len(visible)} GPUs"
+                    )
+            else:
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
             env["SUPSAE_LOCAL_ANNOTATION_SUBPROCESS"] = "1"
             env["SUPSAE_SHARD_ID"] = str(gpu_idx)
             # v8.19.8: bump vLLM EngineCore ready timeout from 600s to
@@ -1444,7 +1489,8 @@ torch.save(annotations, {str(shard_out)!r})
             # vLLM crashes with ZeroDivisionError. Keep tqdm on; user
             # accepts visual interleaving in exchange for live progress.
 
-            print(f"  [shard {gpu_idx}] launching on GPU {gpu_idx}...")
+            print(f"  [shard {gpu_idx}] launching on GPU "
+                  f"{env['CUDA_VISIBLE_DEVICES']} (host-absolute)...")
             proc = subprocess.Popen(
                 [sys.executable, "-c", script],
                 env=env,

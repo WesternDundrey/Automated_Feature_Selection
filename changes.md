@@ -4,6 +4,73 @@
 
 ---
 
+## [v8.20.0.1] — annotate.py: build/generate/parse timing + CVD nested mapping fix
+
+Commit A of the throughput-fix staging plan (postmortem §6 forward fixes).
+Pure instrumentation + bug fix; no behavior change beyond what the bug fix
+corrects. Diagnostic discipline first, structural changes second.
+
+### Build / generate / parse timing per chunk
+
+`_annotate_local_vllm_pertoken` now splits each chunk's wall-clock into
+three phases and prints them:
+
+  build={dt}s  gen={dt}s  parse={dt}s  n_prompts={N}  rate={N/gen_dt}/s
+
+Reading guide:
+- build dominates → reduce per-call prompt count (postmortem §1's million-
+  prompt stalls). Next move: prefix-block batching (per-prefix all-features
+  per `generate()` call, structurally cleaner than feature-block since it
+  doesn't depend on cross-call KV survival).
+- generate dominates → tune vLLM scheduler knobs (`max_num_seqs`,
+  `max_num_batched_tokens`). Don't tune blind — read the timing first.
+- parse dominates → output handling (rare; only matters at million-
+  prompt scale).
+
+Block 0 of each chunk is the cold-start; later blocks under the same
+seq_chunk should benefit from prefix-cache warmth IF KV survives across
+generate() calls. The timing print makes this directly observable rather
+than inferred — if all blocks under one seq_chunk have constant generate
+time, cache reuse isn't helping enough and the structural change in
+v8.20.0.2 is required.
+
+### CUDA_VISIBLE_DEVICES nested-mapping fix
+
+`_annotate_local_parallel` previously did `env["CUDA_VISIBLE_DEVICES"] =
+str(gpu_idx)` unconditionally. On rented boxes where the parent already
+has `CUDA_VISIBLE_DEVICES=4,5,6,7`, the child's `CUDA_VISIBLE_DEVICES=2`
+was interpreted as *host-absolute* device 2 — not the parent's 3rd
+visible device (host-absolute 6). Result: the second concurrent run from
+postmortem §3b OOM'd because it landed on host-absolute GPU 0 (which
+was outside the parent's restriction but matched the literal env var
+the child saw), or worse, on someone else's GPU on a shared rental box.
+
+Fix: re-map through the parent's visible list when set, so the child
+gets the host-absolute ID for the parent-relative index it was assigned.
+Falls through to the raw `str(gpu_idx)` only when parent has no
+restriction. Raises if the requested shard exceeds the parent's visible
+count rather than silently wrapping.
+
+The launch print now shows `GPU {host_absolute_id} (host-absolute)`
+instead of `GPU {gpu_idx}` so post-mortem traceability is preserved
+across rented-box scenarios.
+
+### What's NOT in this commit
+
+- Prefix-block batching (commit B): the structural change after timing
+  data confirms build dominates. ~50 LOC; will land separately.
+- vLLM scheduler knobs (commit C): defer until timing data lands.
+- Two-process producer/consumer (commit D): only if Python construction
+  remains dominant after prefix-block batching.
+
+### Files touched
+
+* `pipeline/annotate.py` — build/generate/parse timing in
+  `_annotate_local_vllm_pertoken`; nested CVD remap in
+  `_annotate_local_parallel`
+
+---
+
 ## [v8.20.0] — FVE curation + PC1 target_dir method (no supervised-loss change)
 
 Goal: lift mean FVE on the production catalog without violating the
