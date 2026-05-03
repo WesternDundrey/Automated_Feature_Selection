@@ -159,7 +159,7 @@ def main():
                  "shortlist", "delphi-run", "opus-catalog",
                  "pilot", "irr", "oracle-unsup", "unsup-f1", "compare",
                  "dedup-catalog", "curate-fve", "propose-haiku",
-                 "filter-candidates", "opus-judge"],
+                 "filter-candidates", "opus-judge", "validate-catalog"],
         help="Run only this step",
     )
     parser.add_argument(
@@ -963,6 +963,15 @@ def main():
         from .opus_judge import run as run_judge
         run_judge(cfg)
         print(f"Opus-Judge completed in {time.time() - t0:.1f}s")
+
+    if args.step == "validate-catalog":
+        print("\n" + "=" * 70)
+        print(f"STEP: VALIDATE-CATALOG  (v8.21 cascade stage 3.5)")
+        print("=" * 70)
+        t0 = time.time()
+        from .validate_catalog import run as run_validate
+        run_validate(cfg)
+        print(f"Validate-Catalog completed in {time.time() - t0:.1f}s")
 
     # Step 2: Annotation
     if args.step is None or args.step == "annotate":

@@ -307,6 +307,15 @@ class Config:
     propose_candidates_per_latent: int = 3
     propose_concurrency: int = 16       # async semaphore for OpenRouter
 
+    # ── v8.21 cascade stage 3.5 (Sonnet catalog validator) ───────────
+    # Per-feature LLM metadata check. Catches the leakage cases Python
+    # post-validate misses: left-context-dependent descriptions where
+    # the highlighted token's left context doesn't actually demonstrate
+    # the description (e.g. positive examples for "Token immediately
+    # follows a closing delimiter" that are actually opener tokens).
+    catalog_validator_model: str = "anthropic/claude-sonnet-4.6"
+    validate_concurrency: int = 16
+
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = True    # v8.19.4: DEFAULT FLIPPED to True.
                                         # Local Qwen3-4B-Base via vLLM is
