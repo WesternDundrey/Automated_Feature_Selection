@@ -349,6 +349,21 @@ def main():
              "light scenarios.",
     )
     parser.add_argument(
+        "--annotation-prefix-block-max", type=int, default=None,
+        help="Cap on adaptive prefix_block_size (default 128). On high-"
+             "VRAM GPUs (RTX 6000 Pro 96GB, H100 80GB) bump to 256-512 "
+             "to fit more cached prefixes per generate() call → higher "
+             "prefix-cache hit rate + bigger batch shape. Each prefix "
+             "≈ 10 MB KV; 512 prefixes ≈ 5 GB. Scale with available "
+             "KV budget.",
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization", type=float, default=None,
+        help="vLLM gpu_memory_utilization per shard. Default 0.9. On "
+             "96GB cards push to 0.93-0.95 for more KV cache budget. "
+             "On 32GB cards keep 0.9.",
+    )
+    parser.add_argument(
         "--corpus-skip", type=int, default=None,
         help="Skip the first N qualifying corpus sequences before "
              "collecting --n_sequences. Used to split a corpus across "
@@ -632,6 +647,10 @@ def main():
         overrides["local_annotation_max_num_seqs"] = args.vllm_max_num_seqs
     if args.vllm_max_num_batched_tokens is not None:
         overrides["local_annotation_max_num_batched_tokens"] = args.vllm_max_num_batched_tokens
+    if args.annotation_prefix_block_max is not None:
+        overrides["local_annotation_prefix_block_max"] = args.annotation_prefix_block_max
+    if args.vllm_gpu_memory_utilization is not None:
+        overrides["local_annotation_gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
     if args.corpus_skip is not None:
         overrides["corpus_skip"] = args.corpus_skip
     if args.merge_from is not None:

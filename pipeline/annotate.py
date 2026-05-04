@@ -853,12 +853,20 @@ def _annotate_local_vllm_pertoken(
     _max_num_batched_tokens = int(
         getattr(cfg, "local_annotation_max_num_batched_tokens", 0) or 0
     )
+    # v8.20.8: gpu_memory_utilization is now configurable. On 96 GB
+    # cards (RTX 6000 Pro Blackwell, H100 80GB+), pushing to 0.93-0.95
+    # gives vLLM more headroom for the KV cache, increasing prefix-
+    # cache hit rate at large prefix_block sizes. On 32 GB cards
+    # (5090) keep 0.9 to leave model + activations breathing room.
+    _gpu_mem_util = float(
+        getattr(cfg, "local_annotation_gpu_memory_utilization", 0.9) or 0.9
+    )
     _llm_kwargs = dict(
         model=cfg.local_annotator_model,
         dtype="bfloat16",
         enable_prefix_caching=True,
         max_model_len=computed_max_len,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=_gpu_mem_util,
         max_num_seqs=_max_num_seqs,
     )
     if _max_num_batched_tokens > 0:
@@ -964,11 +972,18 @@ def _annotate_local_vllm_pertoken(
         # `local_annotation_prefix_block` overrides. Capped at 128 prefixes
         # (~10 MB KV per prefix on Qwen3-4B → 1.3 GB at 128, comfortable),
         # and clamped to chunk size so we don't iterate past the end.
+        # v8.20.8: cap is now configurable (default 128, but high-VRAM
+        # GPUs like RTX 6000 Pro 96GB can comfortably handle 256-512).
+        # Each cached prefix is ~10 MB KV on Qwen3-4B GQA, so 512
+        # prefixes ≈ 5 GB out of ~85 GB available KV cache budget.
+        cfg_prefix_block_max = int(
+            getattr(cfg, "local_annotation_prefix_block_max", 128) or 128
+        )
         if cfg_prefix_block > 0:
             prefix_block_size = cfg_prefix_block
         else:
             prefix_block_size = max(1, target_prompts // max(1, n_features))
-            prefix_block_size = min(prefix_block_size, 128)
+            prefix_block_size = min(prefix_block_size, cfg_prefix_block_max)
         prefix_block_size = min(prefix_block_size, n_prefixes)
 
         # Phase timing: build / generate / parse summed across all blocks
@@ -986,15 +1001,23 @@ def _annotate_local_vllm_pertoken(
             block_count += 1
 
             t0 = time.time()
-            prompts = []
-            positions = []
-            for pi in range(pf_start, pf_end):
-                seq_j, tok_k, pos_prefix = chunk_prefixes[pi]
-                for fi in range(n_features):
-                    prompts.append({
-                        "prompt_token_ids": list(pos_prefix + feat_suffix_list[fi])
-                    })
-                    positions.append((seq_j, tok_k, fi))
+            # v8.20.8 Python prompt construction:
+            # - List comprehension (~30% faster than .append loop)
+            # - Bind feat_suffix_list inner refs once per outer iter via
+            #   nested comprehension (Python micro-optim; avoids dict
+            #   lookup per inner iter).
+            # - Tight tuple-add then list cast; no interim variables.
+            prefix_block_data = chunk_prefixes[pf_start:pf_end]
+            prompts = [
+                {"prompt_token_ids": list(pos_prefix + suffix)}
+                for (_seq_j, _tok_k, pos_prefix) in prefix_block_data
+                for suffix in feat_suffix_list
+            ]
+            positions = [
+                (seq_j, tok_k, fi)
+                for (seq_j, tok_k, _pos_prefix) in prefix_block_data
+                for fi in range(n_features)
+            ]
             t_build = time.time()
 
             outputs = llm.generate(prompts, params)

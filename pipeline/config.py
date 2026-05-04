@@ -410,6 +410,13 @@ class Config:
     # for tuning.
     local_annotation_max_num_seqs: int = 0
     local_annotation_max_num_batched_tokens: int = 0
+    # v8.20.8 RTX 6000 Pro / H100 high-VRAM tuning. On 96 GB cards
+    # the KV-cache budget is 5-10× the 32GB 5090's, so the historic
+    # cap of 128 prefixes/block leaves a lot of cache hit rate on the
+    # table. 256-512 is comfortable; pair with raised
+    # max_num_seqs and gpu_memory_utilization.
+    local_annotation_prefix_block_max: int = 128
+    local_annotation_gpu_memory_utilization: float = 0.9
     # Save annotations_local_partial.pt + progress.txt every N chunks
     # instead of every chunk. At chunk=32, the per-shard annotations
     # tensor is ~610MB; saving 156 times/run is ~95GB of disk I/O,
