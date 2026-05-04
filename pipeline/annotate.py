@@ -868,12 +868,20 @@ def _annotate_local_vllm_pertoken(
         max_model_len=computed_max_len,
         gpu_memory_utilization=_gpu_mem_util,
         max_num_seqs=_max_num_seqs,
+        # v8.20.9.1: force stats logging ON so per-step
+        # "Avg prompt throughput / Avg generation throughput" lines
+        # are visible in shard logs. vLLM v0.20 defaults this to True
+        # (no stats), which hid the true bottleneck.
+        disable_log_stats=False,
     )
     if _max_num_batched_tokens > 0:
         _llm_kwargs["max_num_batched_tokens"] = _max_num_batched_tokens
-    print(f"  vLLM scheduler: max_num_seqs={_max_num_seqs}, "
-          f"max_num_batched_tokens="
-          f"{_max_num_batched_tokens if _max_num_batched_tokens > 0 else 'default'}")
+    # v8.20.9.1: print FULL kwargs dict so misconfiguration is
+    # visible at startup. The earlier diagnostic print only showed two
+    # values; vLLM's "non-default args" log line is the truth.
+    print(f"  vLLM LLM() kwargs:")
+    for _k, _v in sorted(_llm_kwargs.items()):
+        print(f"    {_k} = {_v!r}")
     llm = LLM(**_llm_kwargs)
     # Base model: no thinking, no chat template. Just completes text.
     # allowed_token_ids forces "0" or "1" — safe on base models.
