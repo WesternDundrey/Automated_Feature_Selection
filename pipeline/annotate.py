@@ -1558,12 +1558,24 @@ def _annotate_local_parallel(
         out_paths = []
         log_handles: list[tuple[int, Path, object]] = []
 
-        # v8.20.6: redirect-to-files is now opt-in (default: shards write
-        # to terminal so tqdm ETA + it/s are visible). The aggregated-
-        # status mode helps when running 4+ shards on a vast.ai PTY where
-        # interleaved tqdm refresh causes write-blocking, but at 1-2 shards
-        # the tqdm output is more useful than a sparse aggregated line.
+        # v8.20.9: three modes for shard output management.
+        #   default               — all shards stdout/stderr → terminal
+        #                           (vLLM tqdm flood, but live ETA visible)
+        #   --quiet-shards        — LEADER (shard 0) stdout → terminal so
+        #                           our per-block ETA prints are live, but
+        #                           leader stderr → log file (vLLM tqdm
+        #                           silenced). Non-leader shards: both
+        #                           stdout/stderr → log files.
+        #   --shard-logs-to-files — all shards both streams → log files,
+        #                           parent prints aggregated status line
+        #                           every 10s. Use at 4+ shards.
         clean_terminal = bool(getattr(cfg, "shard_logs_to_files", False))
+        quiet_shards = bool(getattr(cfg, "quiet_shards", False))
+        # quiet_shards is a strict subset of clean_terminal in terms of
+        # filesystem layout, but with leader's stdout passed through.
+        # If both flags are set, clean_terminal wins (full silence).
+        if clean_terminal:
+            quiet_shards = False
         log_dir_announce = cfg.output_dir / "logs"
         if clean_terminal:
             log_dir_announce.mkdir(parents=True, exist_ok=True)
@@ -1571,11 +1583,19 @@ def _annotate_local_parallel(
             print(f"  Per-shard logs:   {log_dir_announce}/shard_*.log")
             print(f"  Aggregated status updates every 10s on this terminal.")
             print(f"  Detail per shard: tail -f {log_dir_announce}/shard_*.log\n")
+        elif quiet_shards:
+            log_dir_announce.mkdir(parents=True, exist_ok=True)
+            print(f"\n  Multi-shard annotation: quiet-shards mode")
+            print(f"  Leader (shard 0): per-block ETA on terminal, "
+                  f"vLLM tqdm hidden in log")
+            print(f"  Other shards:     silent on terminal, full output in "
+                  f"{log_dir_announce}/shard_*.log")
+            print(f"  Detail per shard: tail -f {log_dir_announce}/shard_*.log\n")
         else:
             print(f"\n  Multi-shard annotation: direct-stdout mode "
-                  f"(tqdm ETA visible)")
-            print(f"  Pass --shard-logs-to-files to redirect shard output "
-                  f"to per-shard files at 4+ shards.\n")
+                  f"(vLLM tqdm + our prints both visible)")
+            print(f"  Pass --quiet-shards to silence vLLM tqdm but keep "
+                  f"leader's per-block ETA on terminal.\n")
         for gpu_idx in range(n_gpus):
             shard_tokens = tmp / f"tokens_shard_{gpu_idx}.pt"
             shard_state_dir = tmp / f"state_{gpu_idx}"
@@ -1685,6 +1705,33 @@ torch.save(annotations, {str(shard_out)!r})
                     stdout=shard_log_handle,
                     stderr=subprocess.STDOUT,
                 )
+            elif quiet_shards:
+                log_dir = cfg.output_dir / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                shard_log = log_dir / f"shard_{gpu_idx}.log"
+                shard_log_handle = shard_log.open("w", buffering=1)
+                log_handles.append((gpu_idx, shard_log, shard_log_handle))
+                if gpu_idx == 0:
+                    # Leader: stdout → terminal (our per-block ETA prints
+                    # visible), stderr → log file (vLLM tqdm + info logs
+                    # silenced from terminal but captured for diagnosis).
+                    print(f"  [shard 0] LEADER → stdout (terminal), "
+                          f"stderr (vLLM tqdm) → {shard_log}")
+                    proc = subprocess.Popen(
+                        [sys.executable, "-c", script],
+                        env=env,
+                        stdout=sys.stdout,
+                        stderr=shard_log_handle,
+                    )
+                else:
+                    # Non-leader: silent — both streams → log file.
+                    print(f"  [shard {gpu_idx}] silent → {shard_log}")
+                    proc = subprocess.Popen(
+                        [sys.executable, "-c", script],
+                        env=env,
+                        stdout=shard_log_handle,
+                        stderr=subprocess.STDOUT,
+                    )
             else:
                 print(f"  [shard {gpu_idx}] launching on GPU "
                       f"{env['CUDA_VISIBLE_DEVICES']} (host-absolute) "

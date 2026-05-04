@@ -337,6 +337,13 @@ class Config:
     #   ONE status line every 10s. Use at 4+ shards on PTYs (vast.ai/
     #   SSH) where interleaved tqdm refresh causes write-blocking.
     shard_logs_to_files: bool = False
+    # v8.20.9: middle-ground option between default (everything to
+    # terminal, tqdm flood) and shard_logs_to_files (everything silent,
+    # aggregated status only). Quiet mode keeps LEADER shard's stdout
+    # on terminal so our per-block ETA prints are live, but routes
+    # leader's stderr (where vLLM tqdm lives) to a log file. Other
+    # shards: both streams → log files.
+    quiet_shards: bool = False
 
     # ── v2: Local model annotation ────────────────────────────────
     use_local_annotator: bool = True    # v8.19.4: DEFAULT FLIPPED to True.

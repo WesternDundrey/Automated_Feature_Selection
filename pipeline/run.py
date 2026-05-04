@@ -389,6 +389,17 @@ def main():
              "refresh causes write-blocking.",
     )
     parser.add_argument(
+        "--quiet-shards", action="store_true",
+        help="Middle ground between default and --shard-logs-to-files. "
+             "Leader shard (shard 0): stdout → terminal (our per-block "
+             "ETA prints visible), stderr → log file (vLLM tqdm hidden, "
+             "still captured for diagnosis). Other shards: both streams "
+             "→ log files. Eliminates vLLM tqdm flooding while keeping "
+             "minimal live ETA on terminal. Recommended when "
+             "stdout/stderr write-blocking is the throughput "
+             "bottleneck (e.g. vast.ai SSH PTYs).",
+    )
+    parser.add_argument(
         "--features-per-call", type=int, default=None,
         help="Feature batch size for annotation. Mostly relevant for API / "
              "batch-position modes, but kept as a CLI override for local "
@@ -657,6 +668,8 @@ def main():
         overrides["merge_from_dirs"] = args.merge_from
     if args.shard_logs_to_files:
         overrides["shard_logs_to_files"] = True
+    if args.quiet_shards:
+        overrides["quiet_shards"] = True
     if args.features_per_call is not None:
         overrides["features_per_annotation_call"] = args.features_per_call
     if args.annotation_checkpoint_every is not None:
