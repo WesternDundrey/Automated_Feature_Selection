@@ -1,21 +1,21 @@
 """
 vLLM throughput smoke test — diagnose pod-vs-pipeline bottleneck.
 
-Runs four isolated benchmarks on a single GPU using vLLM directly,
+Runs isolated benchmarks on a single GPU using vLLM directly,
 bypassing our entire annotation pipeline:
 
-  1. PREFIX-CACHE TEST: 1000 prompts sharing a prefix.
-     Expected: high throughput (cache hit on every prompt past #1).
-  2. NO-CACHE TEST: 1000 unique-prefix prompts.
-     Expected: lower than #1 (no prefix reuse).
-  3. REAL-SHAPE TEST: 13,312 prompts modelled on our annotation
-     workload: ~70-token prefix, ~10-token suffix, 1-token output.
-     Expected: comparable to production annotate run.
-  4. MAX-NUM-SEQS ABLATION: same as #1 with 256/512/1024/2048.
+  TEST 1  PREFIX-CACHE: 1000 prompts sharing a prefix
+  TEST 2  NO-CACHE:     1000 prompts with unique suffixes
+  TEST 3  REAL-SHAPE:   13,312 prompts (128 prefixes × ~104 features),
+                        UNCONSTRAINED sampling (no allowed_token_ids)
+  TEST 3-CON  REAL-SHAPE + CONSTRAINED:
+                        same as Test 3 but with allowed_token_ids=[0,1]
+                        — the smoking-gun A/B for our production path
+  TEST 4  MAX-NUM-SEQS ABLATION: 256/512/1024/2048 (skipped with --skip-ablation)
 
-If #1 and #4 are >1000 prompts/sec, vLLM is fine — bug is in the
-pipeline. If everything is <100 prompts/sec, vLLM/CUDA stack is
-broken on this pod.
+If Test 3-CON is much slower than Test 3, allowed_token_ids logits-
+processor is the bottleneck (the actual fix is to drop it and parse
+the output token in Python).
 
 Run with:
   CUDA_VISIBLE_DEVICES=0 python tools/vllm_smoke.py
@@ -108,6 +108,17 @@ def main():
     )
     params = SamplingParams(max_tokens=1, temperature=0)
 
+    # v8.20.10.1: also build a CONSTRAINED params object using
+    # allowed_token_ids — the smoking-gun A/B for our production path.
+    tok_0_id = tokenizer.encode("0", add_special_tokens=False)[0]
+    tok_1_id = tokenizer.encode("1", add_special_tokens=False)[0]
+    params_constrained = SamplingParams(
+        max_tokens=1,
+        temperature=0,
+        allowed_token_ids=[tok_0_id, tok_1_id],
+    )
+    print(f"  tok_0_id = {tok_0_id}, tok_1_id = {tok_1_id}")
+
     results = []
 
     # ─── Test 1: prefix cache ───
@@ -157,7 +168,16 @@ def main():
     real_prompts = real_prompts[:args.n_real]
     results.append(_bench(
         llm, real_prompts, params,
-        f"TEST 3 — REAL SHAPE: {len(real_prompts):,} prompts (128 prefixes × ~features each)",
+        f"TEST 3 — REAL SHAPE (UNCONSTRAINED): {len(real_prompts):,} prompts",
+    ))
+
+    # ─── Test 3-CON: SAME prompts WITH allowed_token_ids constraint ───
+    # This is the A/B that isolates whether constrained decoding is
+    # the bottleneck. If 3-CON is much slower than 3, that's the bug
+    # in our production path.
+    results.append(_bench(
+        llm, real_prompts, params_constrained,
+        f"TEST 3-CON — REAL SHAPE + CONSTRAINED (allowed_token_ids=[0,1])",
     ))
 
     # ─── Test 4: max_num_seqs ablation (skipped with --skip-ablation) ───
@@ -209,26 +229,32 @@ def main():
     t1 = results[0]['prompts_per_sec']
     t2 = results[1]['prompts_per_sec']
     t3 = results[2]['prompts_per_sec']
-    print(f"    Test 1 (cache hit):    {t1:>6.0f} p/s  "
-          f"{'GOOD' if t1 > 1000 else 'SLOW' if t1 > 100 else 'BROKEN'}")
-    print(f"    Test 2 (no cache):     {t2:>6.0f} p/s  "
-          f"{'GOOD' if t2 > 500 else 'SLOW' if t2 > 50 else 'BROKEN'}")
-    print(f"    Test 3 (real shape):   {t3:>6.0f} p/s  "
-          f"{'GOOD' if t3 > 500 else 'SLOW' if t3 > 100 else 'BROKEN'}")
-    if t1 > 0:
-        print(f"    Cache speedup (1/2):   {t1/max(t2,1):>6.1f}×  "
-              f"{'(working)' if t1/max(t2,1) > 2 else '(cache not helping)'}")
+    t3con = results[3]['prompts_per_sec']
+    print(f"    Test 1 (cache hit):                  {t1:>7.0f} p/s")
+    print(f"    Test 2 (no cache):                   {t2:>7.0f} p/s")
+    print(f"    Test 3 (real shape, unconstrained):  {t3:>7.0f} p/s")
+    print(f"    Test 3-CON (real + allowed_tokens):  {t3con:>7.0f} p/s")
+    if t3 > 0:
+        slowdown = t3 / max(t3con, 1)
+        print(f"    Constraint slowdown (3 / 3-CON):     {slowdown:>7.1f}×")
 
     print(f"\n  Interpretation:")
-    if t1 > 1000:
-        print(f"    vLLM is fine. If our pipeline gets <100 p/s, the bug is")
-        print(f"    in our pipeline (prompt construction or scheduler config).")
-    elif t1 > 100:
-        print(f"    vLLM works but is slower than expected. Tune")
-        print(f"    max_num_batched_tokens higher; check max_num_seqs.")
+    if t3con < t3 * 0.3 and t3 > 1000:
+        print(f"    >>> SMOKING GUN: allowed_token_ids constrained decoding")
+        print(f"        is {t3/max(t3con,1):.0f}× SLOWER than unconstrained.")
+        print(f"        Production uses allowed_token_ids → that's the bug.")
+        print(f"        FIX: drop allowed_token_ids, parse the generated")
+        print(f"        token's first char (it's almost always '0' or '1'")
+        print(f"        on a base model with binary-question prompts).")
+    elif t3 > 1000 and t3con > 1000:
+        print(f"    Both unconstrained and constrained are fast. The")
+        print(f"    production slowdown is elsewhere — check max_model_len,")
+        print(f"    subprocess config, or actual prompt lengths in production.")
+    elif t3 > 100:
+        print(f"    vLLM works but is slower than expected even unconstrained.")
+        print(f"    Tune max_num_batched_tokens higher; check max_num_seqs.")
     else:
-        print(f"    vLLM is broken on this pod (likely CUDA 13/Blackwell")
-        print(f"    compat issue with vLLM 0.20.1). Switch pod or downgrade.")
+        print(f"    vLLM broken on this pod (CUDA/driver compat issue).")
 
 
 if __name__ == "__main__":
