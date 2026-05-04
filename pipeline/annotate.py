@@ -885,11 +885,23 @@ def _annotate_local_vllm_pertoken(
     llm = LLM(**_llm_kwargs)
     # Base model: no thinking, no chat template. Just completes text.
     # allowed_token_ids forces "0" or "1" — safe on base models.
-    params = SamplingParams(
+    # v8.20.10: detokenize=False + output_kind=FINAL_ONLY skip wasted
+    # output processing. We only read output.token_ids[0] downstream;
+    # we never need the decoded text. Saves per-prompt CPU work.
+    try:
+        from vllm.sampling_params import RequestOutputKind
+        _output_kind = RequestOutputKind.FINAL_ONLY
+    except Exception:
+        _output_kind = None
+    _params_kwargs = dict(
         max_tokens=1,
         temperature=0,
         allowed_token_ids=[tok_0_id, tok_1_id],
+        detokenize=False,
     )
+    if _output_kind is not None:
+        _params_kwargs["output_kind"] = _output_kind
+    params = SamplingParams(**_params_kwargs)
 
     if position_mask is not None:
         total_decisions = int(position_mask.sum().item()) * n_features
@@ -1028,7 +1040,11 @@ def _annotate_local_vllm_pertoken(
             ]
             t_build = time.time()
 
-            outputs = llm.generate(prompts, params)
+            # v8.20.10: use_tqdm=False suppresses vLLM's high-frequency
+            # per-prompt progress bar that was flooding stdout on PTYs.
+            # Our per-block ETA print covers progress; vLLM's tqdm was
+            # pure overhead.
+            outputs = llm.generate(prompts, params, use_tqdm=False)
             t_gen = time.time()
 
             # First-block-of-first-chunk debug + cache check.
@@ -1551,11 +1567,26 @@ def _annotate_local_parallel(
         # constant by giving each shard 1024 // n_shards. Floor at 256
         # so a single-shard's scheduler isn't starved.
         if int(getattr(cfg_child, "local_annotation_max_num_seqs", 0) or 0) <= 0:
-            auto_max = max(256, 1024 // max(1, n_gpus))
+            # v8.20.10: bumped from max(256, 1024//n_gpus) per smoke test
+            # data on RTX 6000 Pro Blackwell — at max_num_seqs=2048 +
+            # max_num_batched_tokens=65536, single GPU achieves 5249 p/s
+            # on real-shape workload (128 cold same-prefix × 104 features).
+            # Lower budgets choke the scheduler at 47 p/s. 96GB VRAM
+            # comfortably supports 2048 in-flight at our 384-tok seqs.
+            auto_max = 2048 if n_gpus <= 2 else max(512, 4096 // n_gpus)
             cfg_child.local_annotation_max_num_seqs = auto_max
             print(f"  [parent] auto-scaling max_num_seqs to {auto_max} "
                   f"per shard (n_shards={n_gpus}); override with "
                   f"--vllm-max-num-seqs N")
+        # v8.20.10: also default max_num_batched_tokens to 65536 if user
+        # didn't override. vLLM's default of 16384 was the actual prefill
+        # bottleneck — at our 13K-prompt blocks that forced 8+ scheduler
+        # steps per generate() instead of 2-3.
+        if int(getattr(cfg_child, "local_annotation_max_num_batched_tokens", 0) or 0) <= 0:
+            cfg_child.local_annotation_max_num_batched_tokens = 65536
+            print(f"  [parent] defaulting max_num_batched_tokens to 65536 "
+                  f"(was vLLM's 16384); override with "
+                  f"--vllm-max-num-batched-tokens N")
         # Each shard writes to its own state dir so partial-checkpoint
         # files don't collide across shards.
         features_path.write_text(json.dumps(features))
