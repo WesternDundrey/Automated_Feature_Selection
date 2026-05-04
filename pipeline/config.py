@@ -417,6 +417,14 @@ class Config:
     # for tuning.
     local_annotation_max_num_seqs: int = 0
     local_annotation_max_num_batched_tokens: int = 0
+    # v8.20.11: smoke-test confirmed allowed_token_ids constrained
+    # decoding is 4.4× slower than unconstrained on RTX 6000 Pro
+    # Blackwell (1582 vs 7021 p/s on real-shape workload). Default
+    # OFF — unconstrained sampling + Python-side parse of the
+    # generated token. Qwen3-4B-Base on binary-question prompts
+    # emits "0"/"1" naturally; we accept leading-space variants.
+    # Pass --constrained-decode to opt back in (for ablation).
+    local_annotation_constrained_decode: bool = False
     # v8.20.8 RTX 6000 Pro / H100 high-VRAM tuning. On 96 GB cards
     # the KV-cache budget is 5-10× the 32GB 5090's, so the historic
     # cap of 128 prefixes/block leaves a lot of cache hit rate on the

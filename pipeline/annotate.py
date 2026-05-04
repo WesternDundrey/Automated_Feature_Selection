@@ -883,11 +883,16 @@ def _annotate_local_vllm_pertoken(
     for _k, _v in sorted(_llm_kwargs.items()):
         print(f"    {_k} = {_v!r}")
     llm = LLM(**_llm_kwargs)
-    # Base model: no thinking, no chat template. Just completes text.
-    # allowed_token_ids forces "0" or "1" — safe on base models.
-    # v8.20.10: detokenize=False + output_kind=FINAL_ONLY skip wasted
-    # output processing. We only read output.token_ids[0] downstream;
-    # we never need the decoded text. Saves per-prompt CPU work.
+    # v8.20.11: drop allowed_token_ids — smoke test confirmed it's a 4.4×
+    # slowdown via vLLM's logits-processor path. Use unconstrained
+    # sampling and parse the generated token in Python. Qwen3-4B-Base
+    # on binary-question prompts emits "0"/"1" naturally; we accept
+    # "0", " 0", "1", " 1" token-IDs to handle leading-space variants.
+    # Anything else counts as a parse-failure (defaults to label 0).
+    # Opt back into constrained mode via cfg.local_annotation_constrained_decode.
+    _constrained = bool(
+        getattr(cfg, "local_annotation_constrained_decode", False)
+    )
     try:
         from vllm.sampling_params import RequestOutputKind
         _output_kind = RequestOutputKind.FINAL_ONLY
@@ -896,12 +901,40 @@ def _annotate_local_vllm_pertoken(
     _params_kwargs = dict(
         max_tokens=1,
         temperature=0,
-        allowed_token_ids=[tok_0_id, tok_1_id],
         detokenize=False,
     )
+    if _constrained:
+        _params_kwargs["allowed_token_ids"] = [tok_0_id, tok_1_id]
+        print(f"  [params] CONSTRAINED decode: allowed_token_ids=[0,1] "
+              f"(4.4× slower than unconstrained per smoke test)")
+    else:
+        print(f"  [params] UNCONSTRAINED decode: parse output token "
+              f"in Python (default v8.20.11; 4.4× faster)")
     if _output_kind is not None:
         _params_kwargs["output_kind"] = _output_kind
     params = SamplingParams(**_params_kwargs)
+
+    # Build sets of acceptable "0" and "1" token IDs to handle
+    # leading-space variants in the generated output.
+    _tok_0_set = {tok_0_id}
+    _tok_1_set = {tok_1_id}
+    for _variant in [" 0", "0 ", "0\n"]:
+        try:
+            _ids = tokenizer.encode(_variant, add_special_tokens=False)
+            if len(_ids) == 1:
+                _tok_0_set.add(_ids[0])
+        except Exception:
+            pass
+    for _variant in [" 1", "1 ", "1\n"]:
+        try:
+            _ids = tokenizer.encode(_variant, add_special_tokens=False)
+            if len(_ids) == 1:
+                _tok_1_set.add(_ids[0])
+        except Exception:
+            pass
+    print(f"  [parse] tok_0 ids: {sorted(_tok_0_set)}, "
+          f"tok_1 ids: {sorted(_tok_1_set)}")
+    n_parse_failures = 0  # tracked across full run
 
     if position_mask is not None:
         total_decisions = int(position_mask.sum().item()) * n_features
@@ -1070,10 +1103,19 @@ def _annotate_local_vllm_pertoken(
                     print("    OK — caching is active.")
                 print()
 
+            # v8.20.11: parse against {tok_0_set, tok_1_set} to accept
+            # leading-space variants. Anything else = parse failure
+            # (counted, defaults to label 0).
             for idx, output in enumerate(outputs):
                 seq_j, tok_k, fi = positions[idx]
                 tid = output.outputs[0].token_ids[0]
-                annotations[seq_j, tok_k, fi] = 1.0 if tid == tok_1_id else 0.0
+                if tid in _tok_1_set:
+                    annotations[seq_j, tok_k, fi] = 1.0
+                elif tid in _tok_0_set:
+                    annotations[seq_j, tok_k, fi] = 0.0
+                else:
+                    n_parse_failures += 1
+                    annotations[seq_j, tok_k, fi] = 0.0
             t_parse = time.time()
 
             block_build = t_build - t0
@@ -1167,6 +1209,24 @@ def _annotate_local_vllm_pertoken(
         partial_path.unlink()
     if progress_path.exists():
         progress_path.unlink()
+
+    # v8.20.11: report parse-failure rate (unconstrained-decode mode).
+    # Failures default to label 0; if rate > 1% the prompt format may
+    # need adjustment to nudge the model toward emitting bare 0/1.
+    if not _constrained:
+        total_parsed = total_decisions
+        failure_rate = n_parse_failures / max(1, total_parsed)
+        shard_id = os.environ.get("SUPSAE_SHARD_ID", "")
+        prefix_log = f"  [shard {shard_id}] " if shard_id else "  "
+        if failure_rate > 0.01:
+            print(f"{prefix_log}WARN: parse failure rate "
+                  f"{100*failure_rate:.2f}% ({n_parse_failures:,}/"
+                  f"{total_parsed:,} decisions). >1% suggests the "
+                  f"prompt isn't reliably eliciting 0/1. Consider "
+                  f"--constrained-decode for ablation.")
+        else:
+            print(f"{prefix_log}parse-failure rate: {100*failure_rate:.3f}% "
+                  f"({n_parse_failures:,}/{total_parsed:,} decisions) — OK.")
 
     del llm
     torch.cuda.empty_cache() if torch.cuda.is_available() else None

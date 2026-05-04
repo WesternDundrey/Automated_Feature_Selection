@@ -389,6 +389,13 @@ def main():
              "refresh causes write-blocking.",
     )
     parser.add_argument(
+        "--constrained-decode", action="store_true",
+        help="Use vLLM allowed_token_ids=[tok_0, tok_1] constrained "
+             "decoding. Default OFF (v8.20.11) — smoke test confirmed "
+             "constrained is 4.4× slower than unconstrained + Python "
+             "parse. Pass this flag for ablation only.",
+    )
+    parser.add_argument(
         "--quiet-shards", action="store_true",
         help="Middle ground between default and --shard-logs-to-files. "
              "Leader shard (shard 0): stdout → terminal (our per-block "
@@ -670,6 +677,8 @@ def main():
         overrides["shard_logs_to_files"] = True
     if args.quiet_shards:
         overrides["quiet_shards"] = True
+    if args.constrained_decode:
+        overrides["local_annotation_constrained_decode"] = True
     if args.features_per_call is not None:
         overrides["features_per_annotation_call"] = args.features_per_call
     if args.annotation_checkpoint_every is not None:
