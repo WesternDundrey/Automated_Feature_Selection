@@ -842,17 +842,21 @@ def _annotate_local_vllm_pertoken(
     gc.collect()
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # v8.20.0.4 vLLM scheduler knobs. Defaults to 1024 (the v8.19.8 sweet
-    # spot for 2-GPU); shards spawned by `_annotate_local_parallel` get
-    # an auto-scaled value (1024 // n_shards) so total host in-flight
-    # stays roughly constant regardless of GPU count, addressing the
-    # 4-GPU "gen slow" contention.
+    # v8.20.12 vLLM scheduler knobs. Smoke-test-validated defaults apply
+    # to BOTH single-shard (extend-corpus path via _annotate_local_subprocess)
+    # AND multi-shard (parent-side override via _annotate_local_parallel).
+    # On 96GB Blackwell, max_num_seqs=2048 + max_num_batched_tokens=65536
+    # gave 7021 p/s on real-shape workload (vs 47 p/s at the prior 512 +
+    # vLLM-default 16384). Multi-shard parent overrides for n_gpus > 2 to
+    # avoid §3a contention.
     _max_num_seqs = int(getattr(cfg, "local_annotation_max_num_seqs", 0) or 0)
     if _max_num_seqs <= 0:
-        _max_num_seqs = 1024  # single-shard default
+        _max_num_seqs = 2048  # smoke-test default (covers single-shard + extend-corpus)
     _max_num_batched_tokens = int(
         getattr(cfg, "local_annotation_max_num_batched_tokens", 0) or 0
     )
+    if _max_num_batched_tokens <= 0:
+        _max_num_batched_tokens = 65536  # smoke-test default; vLLM's was 16384
     # v8.20.8: gpu_memory_utilization is now configurable. On 96 GB
     # cards (RTX 6000 Pro Blackwell, H100 80GB+), pushing to 0.93-0.95
     # gives vLLM more headroom for the KV cache, increasing prefix-

@@ -416,13 +416,29 @@ def run(cfg: Config = None) -> dict:
         if ann_path.exists():
             n_target_features = len(cached_feature_ids) if cached_feature_ids \
                                  else len(leaf_features)
+            # v8.20.12: use multi-shard when GPUs available — extend-corpus
+            # was always single-shard, leaving the second GPU idle on a
+            # 2-GPU box. _annotate_local_parallel auto-falls-back to
+            # single-shard if n_gpus < 2.
+            from .annotate import (
+                _annotate_local_subprocess, _annotate_local_parallel,
+                _detect_annotation_gpus,
+            )
+            n_gpus_for_extend = _detect_annotation_gpus(cfg)
             print(f"  [extend-corpus] step 2/3: annotate tail [{n_old}:{target_n}] "
-                  f"for {len(leaf_features)} leaves (subprocess)")
+                  f"for {len(leaf_features)} leaves "
+                  f"({n_gpus_for_extend} GPU{'s' if n_gpus_for_extend != 1 else ''})")
             t0 = time.time()
-            from .annotate import _annotate_local_subprocess
 
             tokens_tail = tokens_full[n_old:].contiguous()
-            ann_tail = _annotate_local_subprocess(tokens_tail, leaf_features, cfg)
+            if n_gpus_for_extend > 1:
+                ann_tail = _annotate_local_parallel(
+                    tokens_tail, leaf_features, cfg, n_gpus_for_extend,
+                )
+            else:
+                ann_tail = _annotate_local_subprocess(
+                    tokens_tail, leaf_features, cfg,
+                )
             print(f"    annotation done in {time.time() - t0:.1f}s")
 
             if ann_tail.shape[0] != n_added or ann_tail.shape[1] != cfg.seq_len \
