@@ -1,3 +1,139 @@
+# 10K-seq production run @ 104-feature curated catalog (v8.20.12)
+
+**Date:** 2026-05-05
+**Target:** GPT-2 Small @ layer 9, `blocks.9.hook_resid_pre`.
+**Annotator:** Qwen3-4B-Base via vLLM v0.20.1, unconstrained decode (v8.20.11).
+**Catalog:** 104 leaves curated from a 445-feature Opus-judge run (qwen-decidable filter: lexically-simple POS + surface + position-relative).
+**Hardware:** 2× RTX 6000 Pro Blackwell (96 GB each), Granite Rapids host.
+
+## Headline numbers (10000 seqs × 128 positions × 104 features = 33.2M decisions per shard)
+
+| Metric | Supervised SAE | Linear probe | Notes |
+|---|---:|---:|---|
+| **Mean F1 (t=0)** | **0.554** | 0.474 | sup wins t=0 by **+0.080** (calibration-honesty property) |
+| Mean calibrated F1 | 0.556 | **0.607** | probe wins calibrated by +0.051 (capacity asymmetry) |
+| Mean oracle F1 | 0.554 | — | natural threshold ≈ optimal threshold |
+| Mean AUROC | 0.899 | 0.939 | probe higher AUROC; SAE has tighter F1 at z=0 |
+| **R² (full SAE)** | **0.9702** | — | 103+256 = 359 latents |
+| Pretrained SAE R² (24,576 latents) | 0.9843 | — | reconstruction cost of supervision = **−0.0141 R²** for **68× fewer latents** |
+| ΔR²(supervised slice) | **+0.9351** | — | sup carries 94% of recon |
+| ΔR²(unsupervised slice) | +0.1455 | — | U adds 15% headroom |
+| Mean cosine to target | **1.0000** | — | frozen-decoder, by construction (103/103 features) |
+| Mean FVE (per-feature) | 0.186 | — | heterogeneous: see backbone subset below |
+| L0 (sup, naive >0) | 13.30 | — | matches GT L0 = 13.34 |
+| L0 (sup, calibrated) | 17.38 | — | calibrated overshoots GT by +30% |
+| **Naive L0 ratio** | **0.997** | — | calibration-honest at production scale |
+
+## Per-group F1 (by id prefix)
+
+| Group | n | Mean F1 (t=0) | Mean cal F1 | Notes |
+|---|---:|---:|---:|---|
+| **days_of_week** | 1 | **0.712** | 0.707 | single-feature, near-perfect AUROC 0.999 |
+| **months** | 1 | **0.702** | 0.730 | single-feature, AUROC 0.998 |
+| **prepositions** | 5 | **0.652** | 0.674 | small lexical sets (`to/in/for/with/by/at`) |
+| **punctuation** | 18 | **0.621** | 0.616 | surface tokens: comma, newline, hyphen, quote variants |
+| **position** | 33 | **0.595** | 0.581 | left-context-relative ("after X", "cap after Y") |
+| **morphology** | 11 | **0.564** | 0.561 | numeric/ordinal/cardinal + hyphen continuation |
+| **articles** | 7 | **0.507** | 0.515 | `the` variants (the/a/an, with-context); the_after_comma/prep weaker |
+| **copula** | 2 | **0.502** | 0.526 | `be_form` + contractions |
+| **conjunctions** | 3 | **0.475** | 0.480 | and/or/coordinator |
+| **discovery** | 22 | **0.425** | 0.434 | weakest group; many low-base-rate or context-richer features |
+| **TOTAL** | **103** | **0.554** | **0.556** | |
+
+## High-FVE backbone (FVE > 0.5)
+
+19 features land in the high-FVE backbone — these are the cleanest concept-direction recoveries:
+
+| Feature | F1 | FVE | n_pos |
+|---|---:|---:|---:|
+| punctuation.newline | 0.958 | 0.987 | 14,963 |
+| punctuation.open_quote | 0.891 | 0.999 | 4,079 |
+| articles.the | 0.849 | 0.999 | 4,377 |
+| punctuation.after_quote_boundary | 0.736 | 0.902 | 152,026 |
+| position.after_period_or_para | 0.731 | 0.903 | 144,249 |
+| punctuation.period_end_quote | 0.707 | 0.912 | 127,677 |
+| position.after_newline | 0.707 | 0.982 | 25,669 |
+| punctuation.space_after_emdash | 0.695 | 0.566 | 146,525 |
+| position.quoted_speech_start | 0.691 | 0.900 | 179,700 |
+| position.after_endoftext | 0.679 | 0.995 | 11,389 |
+| position.first_after_doc_start | 0.626 | 0.992 | 16,291 |
+| position.after_close_angle | 0.601 | 0.578 | 96,264 |
+| punctuation.close_quote | 0.603 | 0.958 | 76,233 |
+| punctuation.open_quote_speech | 0.584 | 0.997 | 6,793 |
+| position.cap_the_after_period | 0.563 | 0.990 | 23,711 |
+| punctuation.period_after_paren | 0.482 | 0.972 | 49,794 |
+| punctuation.close_angle | 0.480 | 0.990 | 20,073 |
+| articles.the_lowercase | 0.740 | 0.651 | 18,365 |
+| punctuation.close_paren_aside | 0.389 | 0.781 | 31,698 |
+
+**Backbone mean F1 = 0.669** (19 features, +0.115 over full-catalog mean). These are surface/position features where the activation at positive positions IS the mean-shift direction.
+
+## Per-feature standouts
+
+| Class | Strongest features | Weakest features |
+|---|---|---|
+| **Surface** | `discovery.foreign_word` (F1=0.897), `punctuation.newline` (0.958), `articles.the` (0.849), `morphology.numeric_digit` (0.836), `morphology.lower_after_space` (0.805) | `articles.a_after_comma` (0.218), `position.pronoun_after_period` (0.187), `discovery.relative_after_comma` (0.188) |
+| **Specific lexical** | `discovery.unit_measurement` (0.783), `morphology.cardinal_number` (0.763), `discovery.cap_after_endoftext` (0.687) | `discovery.or_after_may` (0.149), `discovery.to_after_according` (0.162) |
+| **Position-relative** | `position.after_comma` (0.850), `position.lower_after_the` (0.777), `position.after_period_or_para` (0.731) | `position.after_open_bracket` (0.366), `position.connector_after_period` (0.368) |
+
+## Reconstruction story
+
+```
+Full SAE (103 sup + 256 unsup):  R² = 0.9702
+Without supervised slice:        R² = 0.0351   (drop = 0.9351)
+Without unsupervised slice:      R² = 0.8247   (drop = 0.1455)
+Pretrained SAE (24,576 latents): R² = 0.9843
+
+→ Cost of supervision: −0.0141 R² for 68× fewer latents
+→ Supervised slice carries 94% of reconstruction work
+→ Top-3 reconstruction-relevant features (per ΔR²):
+    articles.the              ΔR² = +0.135
+    punctuation.open_quote    ΔR² = +0.102
+    punctuation.newline       ΔR² = +0.016
+   These three alone account for ~25% of the supervised slice's R² contribution.
+
+3/103 features have ΔR² ≥ 0.01 (strong recon contribution)
+5/103 features have ΔR² ≥ 0.001
+Mean per-feature ΔR² = 0.00254
+```
+
+The "long-tail features barely participate in reconstruction" finding holds: the supervised SAE's reconstruction quality rests on a very small backbone, while the rest of the named features serve as crisp classifiers without significant recon load. This matches summary9's "FVE and causal effect partially decoupled" finding.
+
+## Calibration honesty
+
+```
+Naive L0 ratio (predicted >0 / GT):    0.997   ← essentially perfect
+Calibrated L0 ratio:                   1.302   ← overshoots by 30%
+49/103 features fire within 0.01 of GT positive rate at the natural zero
+Median |r@cal - r@gt|:                 0.011
+
+Mean F1 t=0:    0.554   ← natural threshold
+Mean F1 cal:    0.556   ← per-feature tuning gain: +0.002
+Mean F1 val-promo (held-out half): 0.554
+```
+
+The natural threshold ≈ optimal threshold — calibration buys essentially nothing. This is the load-bearing property of literal hinge + frozen decoder + no pos_weight: per-feature scores are calibrated by construction, no per-feature threshold tuning needed.
+
+## What this run validates (v8.20.x technical wins)
+
+This 10K-seq run completed in ~3 hours wall-clock at ~5000 dec/s aggregate (2 shards × ~2500 dec/s). The throughput required all of v8.20.x's fixes:
+
+* **v8.20.10 — bumped vLLM scheduler defaults**: `max_num_seqs=2048` (was auto-scaled to 512), `max_num_batched_tokens=65536` (was vLLM-default 16384). Smoke test isolated this as the prefill bottleneck.
+* **v8.20.11 — dropped `allowed_token_ids` constrained decode**: 4.4× slowdown via vLLM's logits-processor path. Replaced with Python-side parsing of `output.token_ids[0]` against `{tok_0_set, tok_1_set}` (with leading-space variants). Parse-failure fallback rate well under 1% on Qwen3-4B-Base binary-question prompts.
+* **v8.20.12 — extend-corpus uses multi-shard**: previously always single-shard, leaving the second GPU idle on a 2-GPU box. Now auto-shards via `_annotate_local_parallel`.
+* Smoke test (`tools/vllm_smoke.py`): TEST 3-CON ablation showed 7021 → 1582 p/s when constrained decoding is active. Diagnostic infra that turned a hand-wavy "vLLM is slow" into a concrete fix in <10 minutes.
+
+Without these fixes, the run was projected at 95+ hours wall-clock. The combined throughput multiplier from v8.20.10/11/12 was ~30-100× over the prior defaults.
+
+## What's next
+
+* **train + evaluate already complete** (this artifact). The 0.554 mean F1 at 10K seqs is consistent with summary9's 5K-seq production at U=256 (0.573), modestly lower because the curated 104-feature catalog skews harder toward boundary cases (no scaffold filler).
+* **FVE backbone reporting** is the cleanest paper headline: 19 features with FVE > 0.5 hit 0.669 mean F1. This is the equivalent of summary9's "16-feature backbone at 0.677 cal F1" framing.
+* **Probe comparison**: probe wins calibrated F1 by +0.051 but loses t=0 F1 by 0.080. Per the locked framing in `project_next_actions.md`: claim "supSAE achieves better description fidelity at the natural threshold," not "better features."
+* **Causal validation** (`--step causal`) is the missing third leg — expected per-feature KL ablation analogous to summary9's 12/46 features with measurable causal effect. Not yet run on this artifact.
+
+---
+
 # Pilot result: Delphi auto-interp F1 = 0.034 vs supSAE F1 = 0.547 (v8.19.x)
 
 **Date:** 2026-05-01
