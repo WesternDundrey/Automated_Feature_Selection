@@ -521,11 +521,67 @@ def train_hinge_sae(
     y_flat = labels.reshape(-1, n_supervised)
 
     n_total_vecs = x_flat.shape[0]
-    perm = torch.randperm(n_total_vecs)
-    split_idx = int(cfg.train_fraction * n_total_vecs)
-    train_idx, test_idx = perm[:split_idx], perm[split_idx:]
+    split_meta = None
+    if cfg.split_mode == "sequence":
+        # Sequence-level split: whole sequences go to train|val|test.
+        # The held-out test sequences are never seen during training, so F1
+        # measures cross-document generalization (no within-context leakage).
+        # split_indices.pt is still a flat permutation, ordered as
+        # [train_seqs' positions, val_seqs' positions, test_seqs' positions];
+        # split_meta.pt records the boundaries since sequence-aligned splits
+        # don't generally land at int(train_fraction * n_perm).
+        seq_perm = torch.randperm(N)
+        n_train_seqs = int(cfg.train_fraction * N)
+        remaining_seqs = N - n_train_seqs
+        n_val_seqs = remaining_seqs // 2
+        train_seqs = seq_perm[:n_train_seqs]
+        val_seqs = seq_perm[n_train_seqs:n_train_seqs + n_val_seqs]
+        test_seqs = seq_perm[n_train_seqs + n_val_seqs:]
+
+        def _seqs_to_flat(seqs):
+            chunks = []
+            for s in seqs.tolist():
+                positions = torch.arange(s * T, (s + 1) * T)
+                if positions.numel():
+                    positions = positions[torch.randperm(positions.numel())]
+                    chunks.append(positions)
+            return torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.long)
+
+        train_flat = _seqs_to_flat(train_seqs)
+        val_flat = _seqs_to_flat(val_seqs)
+        test_flat = _seqs_to_flat(test_seqs)
+        perm = torch.cat([train_flat, val_flat, test_flat])
+        n_train_flat = int(train_flat.numel())
+        n_val_flat = int(val_flat.numel())
+        n_test_flat = int(test_flat.numel())
+        split_meta = {
+            "split_mode": "sequence",
+            "n_train_flat": n_train_flat,
+            "n_val_flat": n_val_flat,
+            "n_test_flat": n_test_flat,
+            "n_train_seqs": int(n_train_seqs),
+            "n_val_seqs": int(n_val_seqs),
+            "n_test_seqs": int(N - n_train_seqs - n_val_seqs),
+            "train_seqs": train_seqs,
+            "val_seqs": val_seqs,
+            "test_seqs": test_seqs,
+        }
+        print(f"  split_mode=sequence: {n_train_seqs:,} train / "
+              f"{n_val_seqs:,} val / {N - n_train_seqs - n_val_seqs:,} test sequences")
+        print(f"  flat positions: {n_train_flat:,} train / "
+              f"{n_val_flat:,} val / {n_test_flat:,} test")
+        train_idx = perm[:n_train_flat]
+        test_idx = perm[n_train_flat:]
+    else:
+        perm = torch.randperm(n_total_vecs)
+        split_idx = int(cfg.train_fraction * n_total_vecs)
+        train_idx, test_idx = perm[:split_idx], perm[split_idx:]
     if save_checkpoint:
         torch.save(perm, cfg.split_path)
+        if split_meta is not None:
+            torch.save(split_meta, cfg.split_meta_path)
+        elif cfg.split_meta_path.exists():
+            cfg.split_meta_path.unlink()
     x_train, x_test = x_flat[train_idx], x_flat[test_idx]
     y_train, y_test = y_flat[train_idx], y_flat[test_idx]
     print(f"Training data: {x_train.shape[0]:,} vectors, "
