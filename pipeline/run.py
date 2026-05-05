@@ -58,6 +58,14 @@ def main():
     parser.add_argument("--output_dir", default=None, help="Output directory")
     parser.add_argument("--device", default=None, help="Device (cuda/cpu)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument(
+        "--split-mode",
+        choices=["token", "sequence"],
+        default=None,
+        help="Train/val/test split granularity. 'token' (default) is iid "
+             "over flat positions; 'sequence' holds out whole sequences "
+             "for a stronger generalization claim.",
+    )
     parser.add_argument("--model-dtype", default=None,
                         help="Model dtype (float32/bfloat16)")
     parser.add_argument("--lista", type=int, default=None, help="LISTA refinement steps")
@@ -625,6 +633,8 @@ def main():
         overrides["model_dtype"] = args.model_dtype
     if args.lista is not None:
         overrides["n_lista_steps"] = args.lista
+    if args.split_mode is not None:
+        overrides["split_mode"] = args.split_mode
     if args.lambda_sup is not None:
         overrides["lambda_sup"] = args.lambda_sup
     if args.n_unsupervised is not None:

@@ -121,14 +121,33 @@ def evaluate(cfg: Config = None):
         set_seed(cfg.seed)
         perm = torch.randperm(n_total)
 
-    # v8.19.6 lever-7: when train.py wrote a position-subsampled perm,
-    # perm.numel() < n_total. Derive splits from perm size, not n_total,
-    # so val/test are taken from the same slice train.py used.
+    # If train.py wrote split_meta.pt (sequence-mode runs), use its
+    # boundaries — sequence splits don't generally align with
+    # int(train_fraction * n_perm). Token-mode runs don't write meta;
+    # fall through to fraction math.
     n_perm = perm.numel()
-    split_idx = int(cfg.train_fraction * n_perm)
-    remaining = n_perm - split_idx
-    val_size = remaining // 2
-    val_split = split_idx + val_size
+    split_meta = None
+    if cfg.split_meta_path.exists():
+        try:
+            split_meta = torch.load(cfg.split_meta_path, weights_only=False)
+        except Exception as e:
+            print(f"  split_meta load failed ({e}); using fraction math")
+            split_meta = None
+    if split_meta is not None:
+        split_idx = int(split_meta["n_train_flat"])
+        val_split = split_idx + int(split_meta["n_val_flat"])
+        print(f"  split_mode={split_meta['split_mode']} (from split_meta.pt): "
+              f"{split_meta.get('n_train_seqs', '?')} train / "
+              f"{split_meta.get('n_val_seqs', '?')} val / "
+              f"{split_meta.get('n_test_seqs', '?')} test sequences")
+    else:
+        # v8.19.6 lever-7: when train.py wrote a position-subsampled perm,
+        # perm.numel() < n_total. Derive splits from perm size, not n_total,
+        # so val/test are taken from the same slice train.py used.
+        split_idx = int(cfg.train_fraction * n_perm)
+        remaining = n_perm - split_idx
+        val_size = remaining // 2
+        val_split = split_idx + val_size
 
     val_idx = perm[split_idx:val_split]
     test_idx = perm[val_split:]

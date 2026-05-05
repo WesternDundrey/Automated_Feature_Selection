@@ -629,28 +629,92 @@ def train_supervised_sae(
     # as "feature did not fire" by the loss — which is wrong, they are
     # "not labeled". By keeping them out of `perm`, train/val/test
     # never see them and split_indices.pt is consistent across arms.
+    mask_flat = None
     if cfg.position_mask_path.exists():
         try:
             mask = torch.load(cfg.position_mask_path, weights_only=True)
-            mask_flat = mask.reshape(-1)
-            if mask_flat.numel() == n_total:
-                valid_idx = mask_flat.nonzero(as_tuple=True)[0]
-                perm = valid_idx[torch.randperm(valid_idx.numel())]
-                print(f"  position_mask applied: split restricted to "
-                      f"{perm.numel():,} of {n_total:,} flat positions "
-                      f"({perm.numel()*100/n_total:.1f}%)")
+            cand = mask.reshape(-1)
+            if cand.numel() == n_total:
+                mask_flat = cand
             else:
                 print(f"  position_mask shape {tuple(mask.shape)} "
-                      f"flatten ({mask_flat.numel()}) != n_total "
+                      f"flatten ({cand.numel()}) != n_total "
                       f"({n_total}); ignoring mask")
-                perm = torch.randperm(n_total)
         except Exception as e:
             print(f"  position_mask load failed ({e}); using full split")
-            perm = torch.randperm(n_total)
+
+    split_meta = None
+    if cfg.split_mode == "sequence":
+        # Sequence-level split. Whole sequences go to train|val|test;
+        # held-out test sequences are never seen during training.
+        # split_indices.pt is still a flat permutation, with positions
+        # ordered as [train_seqs' positions, val_seqs' positions,
+        # test_seqs' positions]. split_meta.pt records the boundaries
+        # so evaluate.py can recover the splits exactly (boundaries do
+        # not generally land at int(train_fraction * n_perm) when the
+        # position_mask is variable per sequence).
+        seq_perm = torch.randperm(N)
+        n_train_seqs = int(cfg.train_fraction * N)
+        remaining_seqs = N - n_train_seqs
+        n_val_seqs = remaining_seqs // 2
+        train_seqs = seq_perm[:n_train_seqs]
+        val_seqs = seq_perm[n_train_seqs:n_train_seqs + n_val_seqs]
+        test_seqs = seq_perm[n_train_seqs + n_val_seqs:]
+
+        def _seqs_to_flat(seqs):
+            chunks = []
+            for s in seqs.tolist():
+                positions = torch.arange(s * T, (s + 1) * T)
+                if mask_flat is not None:
+                    positions = positions[mask_flat[positions].bool()]
+                if positions.numel():
+                    # Shuffle within-sequence order to avoid pos-0
+                    # always coming first (matters for batched stats).
+                    positions = positions[torch.randperm(positions.numel())]
+                    chunks.append(positions)
+            return torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.long)
+
+        train_flat = _seqs_to_flat(train_seqs)
+        val_flat = _seqs_to_flat(val_seqs)
+        test_flat = _seqs_to_flat(test_seqs)
+        perm = torch.cat([train_flat, val_flat, test_flat])
+        n_train_flat = int(train_flat.numel())
+        n_val_flat = int(val_flat.numel())
+        n_test_flat = int(test_flat.numel())
+        split_meta = {
+            "split_mode": "sequence",
+            "n_train_flat": n_train_flat,
+            "n_val_flat": n_val_flat,
+            "n_test_flat": n_test_flat,
+            "n_train_seqs": int(n_train_seqs),
+            "n_val_seqs": int(n_val_seqs),
+            "n_test_seqs": int(N - n_train_seqs - n_val_seqs),
+            "train_seqs": train_seqs,
+            "val_seqs": val_seqs,
+            "test_seqs": test_seqs,
+        }
+        print(f"  split_mode=sequence: {n_train_seqs:,} train / "
+              f"{n_val_seqs:,} val / {N - n_train_seqs - n_val_seqs:,} test sequences")
+        print(f"  flat positions: {n_train_flat:,} train / "
+              f"{n_val_flat:,} val / {n_test_flat:,} test")
+        if mask_flat is not None:
+            valid_total = int(mask_flat.sum().item())
+            print(f"  position_mask applied: {perm.numel():,} of "
+                  f"{n_total:,} flat positions ({perm.numel()*100/n_total:.1f}%)")
+        train_idx = perm[:n_train_flat]
+        test_idx = perm[n_train_flat:]
     else:
-        perm = torch.randperm(n_total)
-    split_idx = int(cfg.train_fraction * perm.numel())
-    train_idx, test_idx = perm[:split_idx], perm[split_idx:]
+        # Token-level split (default; legacy behavior).
+        if mask_flat is not None:
+            valid_idx = mask_flat.nonzero(as_tuple=True)[0]
+            perm = valid_idx[torch.randperm(valid_idx.numel())]
+            print(f"  position_mask applied: split restricted to "
+                  f"{perm.numel():,} of {n_total:,} flat positions "
+                  f"({perm.numel()*100/n_total:.1f}%)")
+        else:
+            perm = torch.randperm(n_total)
+        split_idx = int(cfg.train_fraction * perm.numel())
+        train_idx, test_idx = perm[:split_idx], perm[split_idx:]
 
     # Save split indices for reproducible evaluation (avoids RNG coupling).
     # Note: when position_mask is active, perm.numel() < n_total — downstream
@@ -658,6 +722,13 @@ def train_supervised_sae(
     # `int(train_fraction * perm.numel())` so they remain consistent.
     if save_checkpoint:
         torch.save(perm, cfg.split_path)
+        if split_meta is not None:
+            torch.save(split_meta, cfg.split_meta_path)
+        elif cfg.split_meta_path.exists():
+            # Stale meta from a prior sequence-mode run would lie about
+            # this run's boundaries — remove it so evaluate falls back
+            # to fraction math.
+            cfg.split_meta_path.unlink()
 
     x_train, x_test = x_flat[train_idx], x_flat[test_idx]
     y_train, y_test = y_flat[train_idx], y_flat[test_idx]

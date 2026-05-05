@@ -100,6 +100,15 @@ class Config:
     seed: int = 42
     n_lista_steps: int = 0  # LISTA refinement iterations (0 = disabled)
 
+    # Split mode for train/val/test partition.
+    #   "token"    — random iid over (seq, pos) flat positions (default;
+    #                same sequence can appear in train AND test at
+    #                different positions, leaks within-context).
+    #   "sequence" — permute whole sequences; held-out test sequences are
+    #                never seen during training. Stronger generalization
+    #                claim; F1 will typically drop slightly vs token.
+    split_mode: str = "token"
+
     # ── Supervision mode ───────────────────────────────────────────
     # DEFAULT: "hinge" (per mentor's methodology note, `supervised_saes_hinge_loss.md`).
     # The R² regression observed in v8.11.2's end-to-end test was NOT
@@ -638,6 +647,10 @@ class Config:
             if os.environ.get("CUDA_VISIBLE_DEVICES", "") == "-1":
                 print("WARNING: CUDA disabled via env, falling back to CPU")
                 self.device = "cpu"
+        if self.split_mode not in ("token", "sequence"):
+            raise ValueError(
+                f"split_mode must be 'token' or 'sequence', got {self.split_mode!r}"
+            )
 
     @property
     def catalog_path(self) -> Path:
@@ -715,6 +728,10 @@ class Config:
     @property
     def split_path(self) -> Path:
         return self.output_dir / "split_indices.pt"
+
+    @property
+    def split_meta_path(self) -> Path:
+        return self.output_dir / "split_meta.pt"
 
     @property
     def weaknesses_path(self) -> Path:
