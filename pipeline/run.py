@@ -66,6 +66,17 @@ def main():
              "over flat positions; 'sequence' holds out whole sequences "
              "for a stronger generalization claim.",
     )
+    parser.add_argument(
+        "--irr-sample-size", type=int, default=None,
+        help="--step irr: number of features to subsample from the catalog "
+             "for the two-pass agreement run (default 30; use 0 or all-feature "
+             "count to score the full catalog).",
+    )
+    parser.add_argument(
+        "--agreement-n-sequences", type=int, default=None,
+        help="--step irr: number of sequences to use for the two-pass run "
+             "(default 100). Larger = tighter κ but slower.",
+    )
     parser.add_argument("--model-dtype", default=None,
                         help="Model dtype (float32/bfloat16)")
     parser.add_argument("--lista", type=int, default=None, help="LISTA refinement steps")
@@ -635,6 +646,10 @@ def main():
         overrides["n_lista_steps"] = args.lista
     if args.split_mode is not None:
         overrides["split_mode"] = args.split_mode
+    if args.irr_sample_size is not None:
+        overrides["irr_sample_size"] = args.irr_sample_size
+    if args.agreement_n_sequences is not None:
+        overrides["agreement_n_sequences"] = args.agreement_n_sequences
     if args.lambda_sup is not None:
         overrides["lambda_sup"] = args.lambda_sup
     if args.n_unsupervised is not None:
