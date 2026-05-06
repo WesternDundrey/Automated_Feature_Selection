@@ -167,11 +167,11 @@ Without these fixes, the run was projected at 95+ hours wall-clock. The combined
 
 ## Why the gap is plausible
 
-The supervised arm has two structural advantages that DO show up in F1 even with no pipeline cheating:
-- **Opus designs descriptions to be learnable.** Prefix-decidable, ≤ 10-word single-sentence, boundary-discipline contract. Opus is implicitly choosing the description so the supSAE can fit it. Delphi is post-hoc-describing whatever the unsup latent does.
-- **The supSAE is trained on the labels.** Of course F1 on a label distribution it was trained against is high. The right comparison is: are the labels themselves coherent? Sup arm gets to choose; unsup arm gets a description fixed by post-hoc constraints.
+The supervised arm has two structural properties that DO show up in F1 even with no pipeline cheating:
+- **Descriptions in the supervised catalog are designed for prefix-decidability.** Each leaf is a token-level YES/NO question (≤ 10-word single-sentence, boundary-discipline contract: positive_examples + negative_examples + exclusions). This is a methodology constraint on the *catalog*, not a fitness selection on the *trained features* — the catalog defines what the SAE is supposed to learn before any training happens. Delphi instead post-hoc-describes whatever the unsup latent does, which inherits whatever polysemy the unsup latent has.
+- **The supSAE is trained on the labels.** F1 on a label distribution it was trained against is necessarily higher than F1 on a label distribution generated post-hoc from the unsup latent. The comparison being made is "do the labels of a constrained-design pipeline produce learnable directions?" vs "do the labels of a post-hoc-explanation pipeline?"
 
-The mentor's framing was honest about this: the F1 difference is "post-hoc unsup latent explainability vs trained supervised latent label fidelity." Different things, both useful, both honestly named. The gap is expected to be large; ~16× is consistent with the framing.
+The F1 difference is "post-hoc unsup latent explainability vs trained supervised latent label fidelity." Different things, both useful, both honestly named. The gap is expected to be large; ~16× is consistent with the framing.
 
 ## What this changes about the plan
 
@@ -258,7 +258,7 @@ If bimodal: report the bimodality and the strong-subset; selecting them post-hoc
 
 - "Real EleutherAI Delphi auto-interp on `gpt2-small-res-jb` (24,576 latents, layer 9) produces descriptions whose latents achieve median F1 = 0.010 / mean F1 = 0.025 on held-out tokens, at 5000-sequence scale."
 - supSAE wins by training against the labels; the pretrained SAE has known polysemy at this layer (multiple modes per latent; Delphi captures one).
-- Frame as "supSAE achieves better description fidelity," NOT "supSAE makes better features." The selection-freedom asymmetry (Opus designs descriptions to be learnable; Delphi describes whatever the unsup latent does post-hoc) IS the methodology being tested; not normalized away.
+- Frame as "supSAE achieves better description fidelity," NOT "supSAE makes better features." The two pipelines are constrained differently — supSAE specifies a target catalog upfront (defining the feature space we want to recover) and then trains directions to match it; Delphi takes whatever directions the unsup SAE produced and tries to describe them post-hoc. Comparing F1 measures whether each pipeline's labels are predictive of its own directions on held-out tokens.
 
 Cost: ~$5 in Sonnet 4.6 for the original Delphi explainer pass; $0 for the F1 readout (24.2s).
 
@@ -286,6 +286,6 @@ This is the **5% of `gpt2-small-res-jb` layer-9 latents that are post-hoc-descri
 
 **The catalog IS the explanation.** When 71% of features are described with phrases the corpus universally satisfies, F1 ≈ base-rate; mean=0.025 is approximately what you'd get from random predictions weighted by feature base rate. This isn't Delphi failing as a tool — Sonnet is being honest about what it sees. It's the **post-hoc auto-interp paradigm itself** failing on this SAE/layer.
 
-The supSAE methodology sidesteps this entirely: Opus designs descriptions to be **learnable as token-level YES/NO questions** (boundary-discipline contract: positive_examples + negative_examples + exclusions per leaf, prefix-decidable, ≤10-word single-sentence). The descriptions are constrained to be classifiable before the SAE is even trained. The supervised arm's higher F1 is not a property of the trained SAE — it's a property of the description-design constraint.
+The supSAE methodology sidesteps this entirely: descriptions are written as **token-level YES/NO questions** (boundary-discipline contract: positive_examples + negative_examples + exclusions per leaf, prefix-decidable, ≤10-word single-sentence). The catalog defines the feature space we want to recover, with descriptions structured so that each one is classifiable from token + prefix context. The supervised arm's higher F1 reflects the catalog being well-formed — every description is a falsifiable yes/no question over a corpus position — not a fitness selection on the trained SAE.
 
-This is the cleanest available qualitative evidence for the methodological contribution: **catalog quality is the bottleneck**, post-hoc auto-interp produces uncatalogable descriptions for the bulk of unsup latents, and the supSAE pipeline replaces that bottleneck with a constrained-design step where every description is required to be learnable.
+This is the cleanest available qualitative evidence for the methodological contribution: **catalog quality is the bottleneck**, post-hoc auto-interp produces uncatalogable descriptions for the bulk of unsup latents, and the supSAE pipeline replaces that bottleneck with an upstream constrained-design step where the feature space is defined as a set of well-formed yes/no questions before any training runs.

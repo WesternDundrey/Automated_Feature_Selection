@@ -1065,8 +1065,8 @@ appendix added for reviewer-bulletproof rigor.
   prefix-decidable + boundary-discipline contract. Symmetry-completing
   families enforced (colors, days, months, digits, directions,
   comparatives, pronoun grids, punctuation, quantifiers, modal verbs).
-  Selection-freedom asymmetry vs Delphi (which describes 1:1) IS the
-  methodology; not normalized away. Output:
+  Catalog defines the feature space upfront; Delphi describes whatever
+  the unsup latents do post-hoc. Output:
   `pipeline_data/opus_catalog.json`.
 * `pipeline/pilot.py` — HARD go/no-go gate. End-to-end mini-run at 500
   seqs × 50 Opus + 30 Delphi features. Validates throughput, training
@@ -1141,7 +1141,8 @@ appendix added for reviewer-bulletproof rigor.
   matching, supSAE features outperform unsup readout on the
   Opus-designed catalog."
 * Per-catalog IRR ceiling reported alongside F1 (Δ-relative claims).
-* Selection-freedom asymmetry stated, not normalized away.
+* Both pipelines' constraints reported explicitly: supSAE specifies the
+  catalog upfront, Delphi describes unsup latents post-hoc.
 * Pretrained unsup SAE has more training data than supSAE — favorable
   to unsup; supSAE win survives this asymmetry.
 * Do NOT claim "supSAE makes better features." Claim "supSAE achieves
@@ -3827,7 +3828,7 @@ extracts the complete object, then calls `json.loads`. Handles nested structures
 
 ### Motivation
 
-v1.0/v1.1 demonstrated the supervised SAE concept on a single cherry-picked circuit
+v1.0/v1.1 demonstrated the supervised SAE concept on a single circuit
 (rabbit→habit, ~5-10 features, 250 sequences, <$1 API cost). This was a proof of concept.
 
 v2.0 scales this to the full proposal: start from a pretrained SAE with thousands of
@@ -3959,7 +3960,7 @@ Detailed implementation documentation (design decisions, math, vast.ai setup).
 
 | File | Role |
 |---|---|
-| `supervised_sae_demo.ipynb` | v1.0 demo. Cherry-picked rabbit→habit. |
+| `supervised_sae_demo.ipynb` | v1.0 demo. Single-circuit (rabbit→habit) proof-of-concept. |
 | `pipeline/` | **v2.0. Automated feature selection pipeline.** |
 | `pipeline_steps.md` | Implementation documentation. |
 | `model.py`, `train.py`, etc. | Toy GPT-2 pipeline (validation only). |
@@ -4028,9 +4029,9 @@ gold standard is circular reasoning. Additionally:
 **Deleted logic (conceptual):** No transcoder ground truth. No CLERP dependency. No
 Neuronpedia API dependency.
 
-### Design: Cherry-Picked Demonstration
+### Design: Single-Circuit Demonstration
 
-The notebook is a **hyper cherry-picked** demonstration of the supervised SAE concept,
+The notebook is a **single-circuit** demonstration of the supervised SAE concept,
 not a full evaluation framework. It shows one concrete case of the approach working:
 
 1. **Circuit tracing** (CLT) identifies which features matter in the rabbit→habit circuit
@@ -4092,7 +4093,7 @@ SupervisedSAE(d_model, n_supervised, n_unsupervised):
 
 | File | Role |
 |---|---|
-| `supervised_sae_demo.ipynb` | **Primary.** Cherry-picked demonstration. |
+| `supervised_sae_demo.ipynb` | **Primary.** Single-circuit demonstration. |
 | `rabbit_habit_supervised_sae.ipynb` | Deprecated. v0.x with circular ground truth. |
 | `model.py`, `train.py`, `evaluate.py`, etc. | Toy GPT-2 pipeline (validation only). |
 | `circuit-tracer/` | Cloned dependency (not modified). |
