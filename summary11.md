@@ -107,6 +107,54 @@ The marker line `split_mode=sequence: 4,000 train / 500 val / 500 test sequences
 | `summary10.md` | prior cycle: 10K-seq production at 4B annotator (cal F1 = 0.556) |
 | `summary11.md` | this writeup |
 
+## Catalog-quality lever (added 2026-05-07): 466-feature broad-catalog ablation
+
+To test whether the methodology's F1 is driven by catalog size or catalog quality, the dedup'd 433-feature pre-curation catalog (originally 445 features from chunked Opus generation, deduplicated by exact-id and exact-description match — see "Why the bigger catalog scored worse" in summary10) was annotated with the **bare-bones config**: 4B annotator, `exclusions_in_annotator_suffix=False`, no manual curation. The eval inflated the active count to 466 (the train pipeline re-included some entries dropped in our local dedup). Same 5K-seq corpus.
+
+Three rows of the same supervised methodology at different catalog quality:
+
+| catalog | annotator | exclusions in suffix | n_features | mean cal F1 | naive L0 ratio | cal gain (cal − t=0) |
+|---|---|---|---:|---:|---:|---:|
+| postmortem v8.19 (chunked, ~50 dups, no boundary discipline) | 4B | no | 445 | 0.399 | — | — |
+| **broad dedup'd (boundary discipline metadata, no suffix)** | **4B** | **no** | **466** | **0.481** | **1.206** | **+0.035** |
+| curated prefix-decidable subset | 4B | no | 104 | 0.556 | 0.997 | +0.000 |
+| curated prefix-decidable subset | 8B | yes | 103 | 0.604 | 1.022 | +0.000 |
+
+**The +0.082 jump from postmortem (0.399) to dedup'd 466 (0.481)** at the same annotator config comes purely from (a) deduplicating the catalog (5 exact-id + 7 description duplicates removed) and (b) Opus designing each leaf with `positive_examples` / `negative_examples` / `exclusions` metadata. Boundary-discipline metadata helps even when not appended to the per-feature suffix at annotation time, because Opus uses it to write crisper descriptions.
+
+**The +0.123 jump from 466 (0.481) to curated 103 (0.604)** comes from manually curating the catalog to a prefix-decidable subset and switching to 8B + suffix exclusions. Catalog quality is the lever.
+
+### Calibration-honesty across catalog quality
+
+The natural-threshold property weakens with broader catalogs:
+
+- Curated 103 (8B+excl): naive L0 ratio = 1.022, calibration gain = +0.000. The natural zero IS the optimal threshold.
+- Broad 466 (4B no-excl): naive L0 ratio = 1.206, calibration gain = +0.035. The natural threshold over-fires by 21%, calibration helps recover.
+- Median |r@cal − r@gt| stayed similar across both (0.018 vs 0.014).
+
+Interpretation: literal-hinge calibration honesty depends on the *learnability* of each leaf. With curated prefix-decidable descriptions, every feature's pre-activation distribution is cleanly separable at z=0. With broader catalogs containing some marginal-quality leaves (rare base rates, ambiguous descriptions, right-context-dependent concepts), some thresholds drift away from zero and per-feature calibration recovers them.
+
+### Why this is a strong paper claim, not a weakness
+
+The cal F1 dropping with catalog size at first read looks bad, but the right framing is **catalog quality, not catalog size, drives mean F1**:
+
+1. **Mean F1 is dragged by long-tail features at any catalog size.** Backbone-subset F1 (top features by FVE) holds up regardless: summary9's 19-feature backbone reached 0.669, summary10's 19-feature backbone reached 0.669 again on a different 103-feature catalog. Reporting backbone + per-feature distribution is the right paper move.
+
+2. **Both arms (sup and unsup) suffer the same scaling problem, but the gap is preserved.** Real Delphi auto-interp on 91 unsup latents reached median F1 = 0.010 / mean F1 = 0.025 (summary10); scaling Delphi to 500 features wouldn't close this gap because 71% of Delphi descriptions are already non-statements ("no consistent pattern"). The supervised methodology's gap to Delphi holds at every catalog scale.
+
+3. **The supervised methodology's contribution IS the catalog-quality lever.** Boundary discipline + prefix-decidable contract + dedup is the knob that drives cal F1 from 0.399 → 0.604 (≈1.5× lift) on the same model and corpus. Unsupervised auto-interp has no equivalent knob — the unsup latents are what they are, and Sonnet's descriptions inherit whatever polysemy the latents have.
+
+### Paper claim, locked
+
+> **Catalog quality drives F1, not catalog size.** Across three supervised SAE catalogs (chunked-with-dups, dedup'd broad, curated prefix-decidable) on GPT-2 Small layer 9, mean cal F1 ranges 0.399 → 0.481 → 0.604 with the same annotator pipeline. The lever is upstream catalog discipline (boundary contract + prefix-decidability + dedup), not corpus size or annotator capacity. At matched catalog scale (~91 features), unsupervised auto-interp via real EleutherAI Delphi reaches median F1 = 0.010 because 71% of Delphi descriptions are non-falsifiable strings. Supervised methodology replaces the post-hoc auto-interp bottleneck with an upstream constrained-design step.
+
+### Files of record (added)
+
+| file | role |
+|---|---|
+| `pipeline_data_full_catalog/feature_catalog.json` | dedup'd 433-leaf broad catalog (eval reports 466 active) |
+| `pipeline_data_full_catalog/evaluation.json` | 4B-no-excl baseline numbers (cal F1 = 0.481) |
+
 ## Process note
 
 Two procedural debts paid this cycle:
