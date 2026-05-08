@@ -1,5 +1,17 @@
 # Running the Supervised SAE Pipeline
 
+> **Reviewer / first-time visitor?** Start at [`README.md`](README.md) for the
+> repository map and [`TIMELINE.md`](TIMELINE.md) for the chronological research
+> story. This file documents how to actually launch the pipeline on a GPU host.
+> The latest production result is in [`summary11.md`](summary11.md).
+
+## Where the code lives
+
+The pipeline is `pipeline/`. Entry point is `pipeline/run.py`; configuration in
+`pipeline/config.py`; per-stage modules are `inventory.py` (catalog generation)
+→ `annotate.py` (token-level labeling) → `supervised_hinge.py` (training) →
+`evaluate.py` (F1 / R² / FVE) → `causal.py` (per-feature ablation KL).
+
 ## vast.ai Setup
 
 - **Template**: PyTorch (CUDA 13.x for Blackwell GPUs)
@@ -219,12 +231,46 @@ Generates IOI sentences with ground-truth labels, trains a supervised SAE on tho
 | `supervised_sae.pt` | 3 | Trained model |
 | `evaluation.json` | 4 | Metrics (F1, AUROC, FVE, cosine, baselines) |
 
+## Sequence-level held-out evaluation (added 2026-05-06)
+
+`--split-mode sequence` partitions train/val/test by **whole sequences** rather
+than by random (seq, position) pairs. The held-out test sequences are never
+seen during training, so the F1 measures cross-document generalization rather
+than generalization-to-new-position-in-seen-doc.
+
+```bash
+# Regenerate split + train + evaluate against an existing artifact dir
+python -m pipeline.run --output_dir pipeline_data --split-mode sequence --step train
+python -m pipeline.run --output_dir pipeline_data --split-mode sequence --step evaluate
+```
+
+`split_meta.pt` is written alongside `split_indices.pt` recording which whole
+sequences went to train / val / test. `evaluate.py` auto-detects the meta file
+and uses its boundaries; absent the file, it falls back to fraction math
+(legacy token-level split). See [`summary11.md`](summary11.md) for the
+sequence-split vs token-split result on the 8B+excl 5K artifact (Δ = −0.004 F1).
+
+## Annotator self-consistency (κ ceiling)
+
+```bash
+# Symlink the catalog if the file is named feature_catalog.json
+ln -sf feature_catalog.json $OUT_DIR/opus_catalog.json
+
+python -m pipeline.run --output_dir $OUT_DIR --step irr \
+    --irr-sample-size 103 \
+    --agreement-n-sequences 200
+```
+
+Two annotation passes with prompt perturbation; per-feature Cohen's κ between
+them is the F1 ceiling for the methodology. Output:
+`$OUT_DIR/irr_report.json`.
+
 ## Cost
 
 | Step | Model | Cost |
 |------|-------|------|
 | Inventory | Sonnet 4.6 (API) | ~$2 |
-| Annotation (local) | Qwen3-4B-Base (GPU) | $0 |
+| Annotation (local) | Qwen3-4B-Base or 8B-Base (GPU) | $0 |
 | Annotation (API) | Haiku 4.5 | ~$30 |
 
 Use `tmux` so SSH disconnects don't kill the run.
