@@ -20,7 +20,7 @@ If you've landed here from the paper, here is the orientation:
 | How to reproduce | [`RUNNING.md`](RUNNING.md) |
 | The full per-file change log | [`changes.md`](changes.md) |
 | The mentor's loss-design note | [`supervised_saes_hinge_loss.md`](supervised_saes_hinge_loss.md) |
-| What went wrong at scale (and what we fixed) | [`postmortem_v8.19_scaling.md`](postmortem_v8.19_scaling.md) |
+| What went wrong at scale (failure summary) | inline in [`changes.md`](changes.md) under v8.19 + the "Failed loss configurations" paragraph in the paper Discussion |
 
 ---
 
@@ -58,7 +58,6 @@ The actual research pipeline lives in **`pipeline/`**. Everything at the repo ro
 ├── tools/                     Standalone scripts (vllm_smoke benchmark, etc.)
 ├── changes.md                 Per-version-tag log of every code change.
 ├── summary*.md                Chronological research summaries (see TIMELINE.md).
-├── postmortem_v8.19_scaling.md What broke at scale + what we learned.
 ├── pipeline_steps.md          v2.0 implementation documentation.
 ├── phase1_validation.md       Early validation phase notes.
 ├── supervised_saes_hinge_loss.md  Mentor's note on loss design.
@@ -77,7 +76,7 @@ The actual research pipeline lives in **`pipeline/`**. Everything at the repo ro
 
 ## Quickstart
 
-Trained checkpoints are available on HuggingFace at `hijackedpuffin/final-sae`. Reproducing from scratch:
+Trained checkpoints are released via an anonymous HuggingFace mirror referenced in the paper's "Software, Data, and Reproducibility" section. Reproducing from scratch:
 
 ```bash
 # 1. clone + install (vast.ai instructions in RUNNING.md)
@@ -134,16 +133,22 @@ For full flag documentation, sequence-level held-out evaluation, IRR / causal / 
 
 ## Citing this work
 
-If you use this code or build on the methodology, please cite the paper (anonymous reference will be replaced in the camera-ready):
-
 ```
 Catalog-Driven Supervised Sparse Autoencoders: Specifying Token-Level
 Features Before Training Recovers What Unsupervised Dictionaries Miss.
 Anonymous. ICML 2026 Mech Interp Workshop submission.
 ```
 
+The non-anonymous URL and citation will appear in the camera-ready version.
+
 ---
 
 ## License
 
-To be added. Code released under MIT / Apache-2.0 (TBD); model weights under the corresponding HuggingFace license.
+To be added. Code under MIT / Apache-2.0 (TBD); model weights under the corresponding HuggingFace license.
+
+---
+
+## Anonymity statement
+
+This repository is shared in support of an ICML 2026 double-blind submission. References to author names, email addresses, GitHub or HuggingFace usernames, institutional affiliations, and grants are intentionally absent. The on-start script, raw GitHub URLs, and HuggingFace model name in the public copy of this repo are scrubbed; reviewers should reach the anonymized artifact via the paper's "Software, Data, and Reproducibility" section.

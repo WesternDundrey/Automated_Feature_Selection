@@ -5,7 +5,7 @@
 **Annotator:** Qwen3-8B-Base via vLLM v0.20.1 (upgrade from 4B in summary10).
 **Catalog:** Same 104 / 103 active leaves curated from the 445-feature Opus-judge run, plus per-leaf `exclusions` field appended to the annotator suffix.
 **Hardware:** 2× RTX 6000 Pro Blackwell (96 GB each), Granite Rapids host.
-**HuggingFace release:** [`hijackedpuffin/final-sae`](https://huggingface.co/hijackedpuffin/final-sae)
+**HuggingFace release:** anonymous mirror referenced in the ICML submission's "Software, Data, and Reproducibility" section.
 
 ## One-line headline
 

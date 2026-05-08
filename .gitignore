@@ -41,3 +41,11 @@ delphi/
 
 # Pilot sandbox (separate from production pipeline_data/)
 pipeline_data_pilot/
+
+# Local postmortem / scratch notes (not for the public repo)
+postmortem_*.md
+scratch_*.md
+notes_*.md
+
+# Claude Code local config (leaks personal paths)
+.claude/

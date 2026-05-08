@@ -1,18 +1,20 @@
 #!/bin/bash
 # vast.ai on-start script.
-# URL: https://raw.githubusercontent.com/WesternDundrey/Automated_Feature_Selection/main/setup.sh
+# Hosted at the anonymous repository mirror referenced in the ICML
+# submission's "Software, Data, and Reproducibility" section.
 # Set OPENROUTER_API_KEY in vast.ai template env vars.
 #
 # This script runs ONCE on instance start. It does NOT install python
 # packages — that's install.sh's job. This is the lightweight bootstrap:
 # tools, repo clone, model pre-download.
-#
-# v8.18.26: Delphi removed entirely; no Delphi clone here.
 
 apt-get update -qq && apt-get install -y -qq curl git tmux > /dev/null 2>&1
 
-# supsae repo
-git clone https://github.com/WesternDundrey/Automated_Feature_Selection.git /workspace/Automated_Feature_Selection
+# Clone the (anonymized) repository. Reviewers should set REPO_URL to the
+# anonymous mirror referenced in the paper. Camera-ready will use a
+# direct GitHub URL.
+: "${REPO_URL:?Set REPO_URL to the anonymous repository mirror}"
+git clone "$REPO_URL" /workspace/Automated_Feature_Selection
 cd /workspace/Automated_Feature_Selection
 
 # Pre-download annotator model so the first vLLM cold-start doesn't

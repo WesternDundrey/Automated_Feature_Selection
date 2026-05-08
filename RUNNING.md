@@ -17,7 +17,7 @@ The pipeline is `pipeline/`. Entry point is `pipeline/run.py`; configuration in
 - **Template**: PyTorch (CUDA 13.x for Blackwell GPUs)
 - **GPU**: RTX 5090 (32GB) or RTX 4090 (24GB)
 - **Disk**: 50GB
-- **On-start script**: `https://raw.githubusercontent.com/WesternDundrey/Automated_Feature_Selection/main/setup.sh`
+- **On-start script**: hosted at the anonymous repository mirror referenced in the paper's "Software, Data, and Reproducibility" section.
 
 The on-start script clones the repo and downloads Qwen3-4B-Base.
 

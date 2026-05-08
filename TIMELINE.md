@@ -33,7 +33,7 @@ Chronological reading order of the project's research summaries. Each entry's he
 [`summary10.md`](summary10.md), §"Full-scale Delphi result" — the qualitative audit explaining mechanistically why mean F1 = 0.025: 71% of Delphi descriptions are corpus-tautological non-statements.
 
 ### "I want to see the failures"
-[`postmortem_v8.19_scaling.md`](postmortem_v8.19_scaling.md) — the v8.19 scaling-run debacle: chunked Opus generation produced ~50 duplicate features, throughput collapsed under multi-EngineCore vLLM, ~$30-50 wasted compute. Section 7 has anti-tunneling clauses for the next debugging cycle.
+The v8.19 scaling-run debacle (chunked Opus generation produced ~50 duplicate features; throughput collapsed under multi-EngineCore vLLM; ~$30-50 wasted compute) is summarized inline in [`changes.md`](changes.md) under the v8.19 entries and in the paper's "Failed loss configurations" paragraph.
 
 ### "I want to read the code"
 Start at [`pipeline/run.py`](pipeline/run.py) (CLI dispatcher), then [`pipeline/config.py`](pipeline/config.py) (every flag), then the stage you care about (`inventory.py` → `annotate.py` → `supervised_hinge.py` → `evaluate.py`).
@@ -57,7 +57,7 @@ A reviewer wanting a one-sentence-per-version delta:
 - **v6 → v7**: frozen decoder default-on; amplification sweep; first cosine = 1.0 contract.
 - **v7 → v8**: discovery loop ships; methodology retrenchment from "better features" to "calibration-honest classification."
 - **v8 → v8.18**: boundary-discipline contract per leaf; literal hinge replaces hybrid as default; Delphi removed from supervised-arm gate (it was nerfing F1 by source-latent-faithfulness filtering).
-- **v8.18 → v8.20**: scaling to 5K → 10K seqs; vLLM throughput tuning + the v8.19 postmortem; min-support filter; corpus extension path.
+- **v8.18 → v8.20**: scaling to 5K → 10K seqs; vLLM throughput tuning after the v8.19 dedup / EngineCore failures; min-support filter; corpus extension path.
 - **v8.20 → v8.21**: 4B → 8B annotator; per-leaf exclusions in suffix; sequence-split eval added; HuggingFace release.
 
 The full per-file delta table for any v8.x → v8.y is in [`changes.md`](changes.md), grep for the version tag.
